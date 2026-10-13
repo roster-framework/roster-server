@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.roster/
+node_modules/
+dist/
+build/
+coverage/
+*.db*
+*.exe
+*.log
+*.out
+.DS_Store

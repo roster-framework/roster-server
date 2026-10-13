@@ -1,0 +1,22 @@
+# 작업 규칙
+
+- 구현 전 별도 [roster-docs 설계](https://github.com/roster-framework/roster-docs/blob/main/roster-core/design.md)와 [TODO](https://github.com/roster-framework/roster-docs/blob/main/roster-core/todo.md)를 읽고 외부 계약은 [API](https://github.com/roster-framework/roster-docs/blob/main/roster-core/api.md)에서 관리한다. 추가 보고서/버전별 설계 문서를 만들지 않는다.
+- 보관된 옛 Core와 Dashboard 코드를 새 Core에 복사하지 않는다. Runtime·Resource 서버는 활성 `roster-node-client/runtime`·`roster-node-client/resource`의 계약으로 연결한다.
+- 코어는 노드/operation/호출만 안다. agent/resource/human 종류 분기와 Codex/Claude 실행 코드를 넣지 않는다.
+- 실제 서버 연결과 wire 변환은 Connector 구현 책임이다. 공통 호출 서비스·상태 전이·이벤트 전달은 하나만 둔다.
+- Call/Result/State/Transition/Change/Event는 contracts의 동일 타입을 사용한다. 모듈별 상태 enum·변경 엔진·호출 엔진을 재정의하지 않는다.
+- application 아래 flat 파일을 추가하지 않는다. 변경은 책임 소유 모듈에 넣고 공개 계약으로 호출한다.
+- 새 기능은 기존 계약으로 표현 가능한지 먼저 확인한다. 불가능하면 설계를 수정하며 호출부별 예외 처리로 우회하지 않는다.
+- 입력 명세는 대상이 선언한다. 코어가 공급자 업무 의미를 하드코딩하지 않는다.
+- 구현 전 설계의 미결 항목을 해소한다. 빈 DB/큐/정책 계층을 선제적으로 추가하지 않는다.
+- 책임별 모듈 구조를 사용하며 파일별 테스트 대신 모듈 계약을 검증한다. 실행 검증은 Docker를 사용한다.
+- 완료한 논리 단위를 커밋한다. 비밀값/데이터/의존성/빌드 결과는 커밋하지 않는다.
+
+## 기능 재구현과 역할 분업
+
+- 보관된 옛 Core에서는 기능·사용 시나리오·외부 계약만 참고한다. 코드·폴더 구조·테스트를 복사하거나 옛 구현에 맞추지 않는다.
+- GPT 6.1 sol이 기능 우선순위, 도메인/계약, 변경 소유 모듈, 입력/출력, 상태/오류, 수락 조건을 확정한다. 기존 design/api/todo를 갱신한다.
+- GPT 6 luna는 확정된 작업지시의 허용 경로에서 구현한다. 기능 범위·계약·상태·버전·대체 설계를 임의로 결정하지 않는다. 모호함이나 지시와 코드의 충돌은 계획 담당에게 보고한다.
+- GPT 6.1 sol이 원문 계약과 코드/검증 근거로 독립 리뷰한다. 구현 담당의 결정 이유를 인수인계 근거로 삼지 않는다.
+- 각 역할은 새 컨텍스트에서 문서·계약·작업지시로만 인수인계한다. 리뷰 지적이 설계 변경을 요구하면 기획 담당이 먼저 문서를 수정한 후 구현 담당에게 재지시한다.
+- 기능 하나씩 완료 조건을 검증하고 커밋·푸시한다. 인벤토리의 전체 기능을 자동으로 범위에 넣거나 현재 PoC를 전체 이전 완료라고 표시하지 않는다.

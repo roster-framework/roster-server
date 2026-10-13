@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "noEmit": false,
+    "declaration": false,
+    "sourceMap": false,
+    "outDir": "build",
+    "rootDir": ".",
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["node", "react", "react-dom", "vite/client"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts"]
+}
