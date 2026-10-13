@@ -32,3 +32,16 @@ Relations draws declared subscriptions as dashed edges and explicit retained cau
 부분 실패와 오래된 데이터는 표시됩니다. Core 인스턴스가 바뀌면 메모리 기록이 재시작되었을 수 있음을 알립니다. Call 입력, Result 출력, Node binding, Event payload 및 대화 본문은 브라우저에 전달하지 않습니다.
 
 Partial failures and stale data remain visible. A changed Core instance is reported because its in-memory records may have restarted. Call inputs, Result outputs, Node bindings, Event payloads, and conversation bodies are not sent to the browser.
+
+## Community bundle CLI · 커뮤니티 번들 CLI
+
+Build this package with `npm run build`. The installed community package must contain `package.json` with `"roster":{"manifest":"roster-bundle.json"}` and a `roster-bundle.json` using the `roster-bundle/1` schema. Install an exact version in a separate provider workspace with `npm install --ignore-scripts --save-exact <name>@<version>`; this CLI reads its declaration but does not execute its code. Start the provider yourself, and keep its token in the Core process environment. A local bindings JSON file has the shape `{ "bindings": { "binding-ref": { "url": "http://127.0.0.1:7331", "target_id": "example", "token_env": "ROSTER_PROVIDER_TOKEN" } } }`. The value of `ROSTER_PROVIDER_TOKEN` stays outside the JSON and Git.
+
+이 CLI는 설치된 패키지의 선언만 읽습니다. Core 명세·기존 ID·바인딩을 먼저 검증하고, 운영자가 digest를 확인해 `--apply`를 지정해야 등록합니다. 공급자 코드는 별도 신뢰·실행 경계에 있습니다.
+
+```sh
+node build/src/cli.js bundle validate --package <installed-package-dir> --bindings <bindings.json> --core http://127.0.0.1:7350
+node build/src/cli.js bundle import --package <installed-package-dir> --bindings <bindings.json> --core http://127.0.0.1:7350 --apply --expected-digest <validated-sha256>
+```
+
+The CLI prints one JSON result. `planned`/`applied` exit 0; input or compatibility rejection exits 2, a started partial import exits 3, and pre-mutation communication failure exits 4. `unresolved` means the request may have reached Core; check the current Node/subscription IDs before deciding what to do next. 출력은 JSON 한 건이며, 전송 결과가 불명인 ID는 자동 재시도하거나 되돌리지 않습니다.

@@ -34,6 +34,15 @@ To register a Runtime or Resource Node, start [Roster Node Client](https://githu
 
 Call inspection uses `calls.submit`, `calls.get`, `calls.list`, `calls.inspect`, and `calls.abort`. A disconnected provider or timeout can leave a Call `unknown`; inspect the same receipt before any operator decision. Provider registration alone does not prove current reachability. 호출 조회에는 같은 CLI/HTTP/MCP 명령을 쓰며, 연결 단절·timeout은 실패 확정이 아닙니다. 등록은 현재 접속 가능성을 증명하지 않습니다.
 
+Community packages can declare Nodes and subscriptions for an operator to import. Install an exact package version in a dedicated provider workspace with `npm install --ignore-scripts --save-exact <name>@<version>`, and run its provider separately. From this repository, build `dashboard/`, then validate and explicitly apply the bundle with the CLI below. `<bindings.json>` maps the package's `binding_ref` names to provider origins, target IDs, and **environment variable names** (`token_env`), never credential values. `validate` returns a digest; copy that value into `import`. An import may be partial, so inspect its `applied` and `unresolved` IDs before any manual follow-up. The importer never runs package code or retries Calls.
+
+```sh
+node dashboard/build/src/cli.js bundle validate --package <installed-package-dir> --bindings <bindings.json> --core http://127.0.0.1:7350
+node dashboard/build/src/cli.js bundle import --package <installed-package-dir> --bindings <bindings.json> --core http://127.0.0.1:7350 --apply --expected-digest <validated-sha256>
+```
+
+커뮤니티 패키지는 선언된 Node·구독을 등록할 수 있습니다. 정확한 버전을 전용 작업 공간에 설치하고 공급자 서비스를 별도로 실행하세요. `validate`의 digest를 `import --expected-digest`에 지정해야 변경이 적용됩니다. 부분 적용 결과의 `applied`·`unresolved`를 확인한 뒤 수동으로 조정하세요. 가져오기 도구는 패키지 코드를 실행하거나 Call을 자동 재시도하지 않습니다.
+
 ## Verify / 검증
 
 Run module checks inside Docker from `core/` and `log/` separately. Docker에서 구성요소별로 검증합니다.

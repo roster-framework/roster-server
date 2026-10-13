@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { CLIENT_PROFILE, applyBundle, applyExitCode, coreOrigin, parseStrictJson, validateManifest, type BundlePlan } from "../src/bundle.js";
+import { createServer } from "node:http";
 import {
   CALL_STATES, confirmedCoreDisplayState, continuousCallTransitionPairs, coreInstanceChanged, hasContinuousJournal, keepHighestCallRevisions, mergeJournalEvidence, parseCallsQuery, parseListLimit, parseLogsQuery, projectCall, projectCalls, projectConversations, projectCore, projectLogs, projectNodeDetails, projectNodes, projectRelations, type SafeCall,
   validDashboardRequest,
@@ -220,4 +222,161 @@ test("gateway request guard requires a loopback peer and same-origin request", (
   assert.equal(validDashboardRequest({ ...good, host: "[invalid" }), false);
   assert.equal(validDashboardRequest({ ...good, fetchSite: "cross-site" }), false);
   assert.equal(validDashboardRequest({ ...good, origin: undefined, fetchSite: undefined }), false);
+});
+
+test("bundle validation accepts only declarative references and never resolves token values", () => {
+  const pkg = { name: "@sample/echo", version: "1.2.3", roster: { manifest: "roster-bundle.json" }, scripts: { postinstall: "must-not-run" } };
+  const manifest = { schema: "roster-bundle/1", name: "@sample/echo", version: "1.2.3", client_profile: CLIENT_PROFILE,
+    nodes: [{ id: "alpha", connector_id: "runtime", binding_ref: "alpha-binding" }, { id: "beta", connector_id: "runtime", binding_ref: "beta-binding" }],
+    subscriptions: [{ id: "alpha-to-beta", source: { namespace: "nodes", id: "alpha" }, event: "finished", target: { namespace: "nodes", id: "beta" }, operation: "run", input: { values: { request: "hello" } } }] };
+  const bindings = { bindings: {
+    "alpha-binding": { url: "http://127.0.0.1:7331", target_id: "agent-a", token_env: "RUNTIME_TOKEN" },
+    "beta-binding": { url: "https://runtime.example", target_id: "agent-b", token_env: "RUNTIME_TOKEN", watch: true },
+  } };
+  const accepted = validateManifest(pkg, manifest, bindings);
+  assert.equal(accepted.packageInfo.name, "@sample/echo");
+  assert.deepEqual(Object.keys(accepted.bindings), ["alpha-binding", "beta-binding"]);
+  assert.equal(JSON.stringify(accepted).includes("RUNTIME_TOKEN_VALUE"), false);
+  assert.equal(CLIENT_PROFILE, "roster-core-import/1");
+  for (const changed of [
+    { ...manifest, schema: "roster-bundle/2" },
+    { ...manifest, unknown: true },
+    { ...manifest, name: "other" },
+    { ...manifest, version: "^1.2.3" },
+    { ...manifest, subscriptions: [{ ...manifest.subscriptions[0], source: { namespace: "foreign", id: "alpha" } }] },
+    { ...manifest, subscriptions: [{ ...manifest.subscriptions[0], source: { namespace: "nodes", id: "missing" } }] },
+  ]) assert.throws(() => validateManifest(pkg, changed, bindings));
+  assert.throws(() => validateManifest(pkg, manifest, { bindings: { "alpha-binding": { ...bindings.bindings["alpha-binding"], token: "secret" }, "beta-binding": bindings.bindings["beta-binding"] } }));
+  assert.throws(() => validateManifest(pkg, manifest, { bindings: { "alpha-binding": { ...bindings.bindings["alpha-binding"], url: "http://provider.example" }, "beta-binding": bindings.bindings["beta-binding"] } }));
+});
+
+test("bundle CLI parser primitives reject duplicate JSON keys and non-loopback Core origins", () => {
+  assert.throws(() => parseStrictJson('{"name":"first","name":"second"}'));
+  assert.throws(() => parseStrictJson('{"a":[1,]}'));
+  assert.equal(coreOrigin("http://127.0.0.1:7350"), "http://127.0.0.1:7350");
+  assert.equal(coreOrigin("http://[::1]:7350"), "http://[::1]:7350");
+  for (const origin of ["https://127.0.0.1:7350", "http://example.com", "http://127.0.0.1:7350/path", "http://u:p@127.0.0.1:7350"]) assert.throws(() => coreOrigin(origin));
+});
+
+test("bundle CLI maps pre-apply communication failure and partial mutation to distinct exits", () => {
+  const result = (status: "planned" | "applied" | "partial" | "failed") => ({
+    schema: "roster-import-result/1" as const, status, package: { name: "example", version: "1.0.0" },
+    client_profile: CLIENT_PROFILE, digest: null, actions: [], applied: [], unresolved: [], failure: null,
+  });
+  assert.equal(applyExitCode(result("planned")), 0);
+  assert.equal(applyExitCode(result("applied")), 0);
+  assert.equal(applyExitCode(result("partial")), 3);
+  assert.equal(applyExitCode(result("failed")), 4);
+});
+
+test("bundle apply records only identity-matching Core command responses", async () => {
+  const server = createServer(async (request, response) => {
+    for await (const _chunk of request) { /* consume request body */ }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ id: "other-node", connector_id: "connector-a" }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const plan: BundlePlan = {
+      package: { name: "example-bundle", version: "1.0.0" },
+      manifest: { schema: "roster-bundle/1", name: "example-bundle", version: "1.0.0", client_profile: CLIENT_PROFILE, nodes: [], subscriptions: [] },
+      bindings: {}, digest: "digest",
+      actions: [{ command: "nodes.register", id: "wanted-node", input: { id: "wanted-node", connector_id: "connector-a" } }],
+    };
+    const result = await applyBundle(plan, `http://127.0.0.1:${address.port}`, Date.now() + 5_000);
+    assert.equal(result.status, "partial");
+    assert.deepEqual(result.applied, []);
+    assert.deepEqual(result.unresolved, [{ command: "nodes.register", id: "wanted-node" }]);
+    assert.deepEqual(result.failure, { stage: "apply", code: "core_response_invalid", id: "wanted-node" });
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("bundle apply does not report an unsent expired mutation as unresolved", async () => {
+  let requests = 0;
+  const server = createServer((_request, response) => { requests++; response.writeHead(200); response.end("{}"); });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const plan: BundlePlan = {
+      package: { name: "example-bundle", version: "1.0.0" },
+      manifest: { schema: "roster-bundle/1", name: "example-bundle", version: "1.0.0", client_profile: CLIENT_PROFILE, nodes: [], subscriptions: [] },
+      bindings: {}, digest: "digest",
+      actions: [{ command: "nodes.register", id: "wanted-node", input: { id: "wanted-node", connector_id: "connector-a" } }],
+    };
+    const result = await applyBundle(plan, `http://127.0.0.1:${address.port}`, Date.now() - 1);
+    assert.equal(result.status, "failed");
+    assert.deepEqual(result.applied, []);
+    assert.deepEqual(result.unresolved, []);
+    assert.equal(requests, 0);
+    assert.deepEqual(result.failure, { stage: "apply", code: "overall_timeout", id: "wanted-node" });
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("bundle apply cancels an oversized Core response and keeps the action unresolved", async () => {
+  let responseClosed = false;
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.on("close", () => { responseClosed = true; });
+    response.write(Buffer.alloc(2 * 1024 * 1024 + 1, 0x20));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const plan: BundlePlan = {
+      package: { name: "example-bundle", version: "1.0.0" },
+      manifest: { schema: "roster-bundle/1", name: "example-bundle", version: "1.0.0", client_profile: CLIENT_PROFILE, nodes: [], subscriptions: [] },
+      bindings: {}, digest: "digest",
+      actions: [{ command: "nodes.register", id: "wanted-node", input: { id: "wanted-node", connector_id: "connector-a" } }],
+    };
+    const result = await applyBundle(plan, `http://127.0.0.1:${address.port}`, Date.now() + 5_000);
+    assert.equal(result.status, "partial");
+    assert.deepEqual(result.unresolved, [{ command: "nodes.register", id: "wanted-node" }]);
+    assert.deepEqual(result.failure, { stage: "apply", code: "core_response_invalid", id: "wanted-node" });
+    for (let attempt = 0; attempt < 20 && !responseClosed; attempt++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(responseClosed, true);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("bundle apply cancels redirect and error response bodies", async () => {
+  const statuses = [302, 400, 500];
+  const closed = statuses.map(() => false);
+  let requestIndex = 0;
+  const server = createServer((_request, response) => {
+    const index = requestIndex++;
+    response.writeHead(statuses[index]!);
+    response.on("close", () => { closed[index] = true; });
+    response.write(Buffer.alloc(64 * 1024, 0x20));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const plan: BundlePlan = {
+      package: { name: "example-bundle", version: "1.0.0" },
+      manifest: { schema: "roster-bundle/1", name: "example-bundle", version: "1.0.0", client_profile: CLIENT_PROFILE, nodes: [], subscriptions: [] },
+      bindings: {}, digest: "digest",
+      actions: [{ command: "nodes.register", id: "wanted-node", input: { id: "wanted-node", connector_id: "connector-a" } }],
+    };
+    const expected = ["redirect_forbidden", "core_rejected", "core_unavailable"];
+    for (let index = 0; index < statuses.length; index++) {
+      const result = await applyBundle(plan, `http://127.0.0.1:${address.port}`, Date.now() + 5_000);
+      assert.equal(result.status, "partial");
+      assert.equal(result.failure?.code, expected[index]);
+      assert.deepEqual(result.unresolved, index === 2 ? [{ command: "nodes.register", id: "wanted-node" }] : []);
+      for (let attempt = 0; attempt < 20 && !closed[index]; attempt++) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(closed[index], true);
+    }
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
 });
