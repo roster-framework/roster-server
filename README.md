@@ -28,7 +28,7 @@ To start both prepared services with one command, build the Core binary from `co
 node scripts/launch.mjs --config ../local-config/server.json
 ```
 
-The config uses `schema: "roster-launch/1"`, `data_root`, `env_file`, `core_binary`, and `dashboard_entry` (the absolute path to `dashboard/build/src/gateway.js`). The env file has the shape `{ "env": {} }` for an empty Core; add only approved Core token environment names and list them in `core_token_env` if you will import Nodes later. Core and dashboard stay on loopback ports 7350 and 7360. The launcher checks readiness, owns only its child processes, and keeps its data/lock outside Git. 두 서비스를 한 번에 시작하려면 위 빌드 산출물과 저장소 밖의 설정·환경 파일을 준비하세요. 자격 값은 저장소나 설정 본문에 넣지 마세요.
+The config uses `schema: "roster-launch/1"`, `data_root`, `env_file`, `core_binary`, and `dashboard_entry` (the absolute path to `dashboard/build/src/gateway.js`). The env file has the shape `{ "env": {} }` for an empty Core; add only approved Core token environment names and list them in `core_token_env` if you will import Nodes later. Core and dashboard stay on loopback ports 7350 and 7360. The launcher checks readiness, owns only its child processes, and keeps its data/lock outside Git. Its grouped startup and shutdown have been verified in Linux Docker; native Windows ACL and signal behavior remain unverified. 두 서비스를 한 번에 시작하려면 위 빌드 산출물과 저장소 밖의 설정·환경 파일을 준비하세요. 자격 값은 저장소나 설정 본문에 넣지 마세요.
 
 In another terminal, query the same Core through its CLI. `catalog`, HTTP commands, and MCP use the same command registry. 다른 터미널에서 같은 Core를 CLI로 조회할 수 있습니다.
 
