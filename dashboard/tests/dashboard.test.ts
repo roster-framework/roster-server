@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  CALL_STATES, confirmedCoreDisplayState, coreInstanceChanged, keepHighestCallRevisions, parseCallsQuery, projectCall, projectCalls, projectCore, projectNodes, type SafeCall,
+  CALL_STATES, confirmedCoreDisplayState, continuousCallTransitionPairs, coreInstanceChanged, hasContinuousJournal, keepHighestCallRevisions, mergeJournalEvidence, parseCallsQuery, parseListLimit, parseLogsQuery, projectCall, projectCalls, projectConversations, projectCore, projectLogs, projectNodeDetails, projectNodes, projectRelations, type SafeCall,
   validDashboardRequest,
 } from "../src/projection.js";
 
@@ -133,6 +133,83 @@ test("call query allowlist rejects duplicates, unknown fields, bad states, and e
     assert.throws(() => parseCallsQuery(new URLSearchParams(query)));
   }
   assert.ok(CALL_STATES.includes("unknown"));
+});
+
+test("relation projections expose only declared Node, subscription, and conversation fields", () => {
+  const node = projectNodeDetails([{ id: "node-a", connector_id: "connector-a", binding: { secret: "hidden" },
+    operations: { render: { input_schema: { secret: true }, capabilities: { abort: true, inspect: false, resume: false } } },
+    events: { rendered: { schema_secret: true } } }])[0]!;
+  assert.deepEqual(node.operations, [{ name: "render", capabilities: { abort: true, inspect: false, resume: false } }]);
+  assert.deepEqual(node.events, ["rendered"]);
+  assert.equal(JSON.stringify(node).includes("secret"), false);
+
+  const relation = projectRelations([{ subject: { namespace: "subscriptions", id: "sub-a" }, revision: 3,
+    value: { id: "sub-a", source: { namespace: "nodes", id: "node-a" }, event: "rendered",
+      target: { namespace: "nodes", id: "node-b" }, operation: "consume", input: { secret: true } } }])[0]!;
+  assert.equal(relation.removed, false);
+  assert.equal(relation.revision, 3);
+  assert.equal(JSON.stringify(relation).includes("secret"), false);
+
+  const conversation = projectConversations([{ revision: 2, value: { id: "conversation-a", title: "private title",
+    participants: [{ ref: { namespace: "nodes", id: "node-a" }, receiver: {
+      target: { namespace: "nodes", id: "node-b" }, operation: "reply", input: { secret: true },
+    } }] } }])[0]!;
+  assert.equal(conversation.participants[0]?.receiver?.operation, "reply");
+  assert.equal(JSON.stringify(conversation).includes("private"), false);
+  assert.equal(JSON.stringify(conversation).includes("secret"), false);
+});
+
+test("log projection keeps safe envelope, validates only state.changed evidence, and rejects unsafe queries", () => {
+  const event = (id: string, payload: unknown, sequence: number) => ({
+    sequence, event: { id, source: { namespace: "calls", id: "call-a" }, name: "state.changed",
+      category: "observation", occurred_at: "2026-10-13T00:00:00Z", call_id: "call-a",
+      payload, private_field: "never project" },
+  });
+  const page = projectLogs({ entries: [
+    event("event-a", { state: "running", before_revision: 4, after_revision: 5, reason: "private" }, 5),
+    event("event-b", { state: "running", before_revision: 5, after_revision: 8, reason: "private" }, 6),
+    event("event-c", { state: "running", before_revision: Number.MAX_SAFE_INTEGER + 1, after_revision: Number.MAX_SAFE_INTEGER + 2 }, 7),
+    { sequence: { dashboard_unsafe_integer: true, source: "9007199254740993" }, event: { id: "event-d", source: { namespace: "nodes", id: "node-a" },
+      name: "registered", category: "lifecycle", occurred_at: "2026-10-13T00:00:00Z", payload: { secret: true } } },
+  ], next_cursor: "opaque:cursor"}, 10);
+  assert.deepEqual(page.entries[0]?.transition_observation, { state: "running", before_revision: 4, after_revision: 5 });
+  assert.equal(page.entries[1]?.projection_error, "invalid_state_observation");
+  assert.equal(page.entries[2]?.projection_error, "invalid_state_observation");
+  assert.equal(page.entries[3]?.sequence, "9007199254740993");
+  assert.equal(JSON.stringify(page).includes("private"), false);
+  assert.equal(JSON.stringify(page).includes("secret"), false);
+  assert.equal(page.next_cursor, "opaque:cursor");
+  assert.equal(parseListLimit(new URLSearchParams("limit=100"), ["limit"], 50, 100), 100);
+  for (const query of ["limit=101", "limit=2&limit=3", "unknown=x"]) assert.throws(() => parseListLimit(new URLSearchParams(query), ["limit"], 50, 100));
+  assert.equal(parseLogsQuery(new URLSearchParams("call_id=call-a&limit=200")).call_id, "call-a");
+  for (const query of ["call_id=x&call_id=y", "limit=201", "other=x", "after=" + "é".repeat(600)]) assert.throws(() => parseLogsQuery(new URLSearchParams(query)));
+});
+
+test("journal transition evidence rejects invalid, conflicting, gapped, expired, and partial records", () => {
+  const event = (id: string, sequence: number | null, before: number, after: number, state = "running", callId = "call-a", sourceId = callId) => ({
+    sequence, event: { id, source: { namespace: "calls", id: sourceId }, name: "state.changed", category: "observation",
+      occurred_at: "2026-10-13T00:00:00Z", call_id: callId, payload: { state, before_revision: before, after_revision: after } },
+  });
+  const project = (...entries: ReturnType<typeof event>[]) => projectLogs({ next_cursor: "", entries }).entries;
+  const valid = project(event("event-1", 1, 1, 2), event("event-2", 2, 2, 3));
+  assert.equal(continuousCallTransitionPairs(valid, "call-a", true).length, 1);
+  assert.equal(continuousCallTransitionPairs(valid, "call-a", false).length, 0);
+  assert.equal(continuousCallTransitionPairs(valid, "call-a", true, ["event-1"]).length, 0);
+  assert.equal(hasContinuousJournal(project(event("event-1", 1, 1, 2), event("event-2", 3, 2, 3))), false);
+  assert.equal(continuousCallTransitionPairs(project(event("event-1", 1, 1, 2), event("event-2", 3, 2, 3)), "call-a", true).length, 0);
+  const invalidBreak = project(event("event-1", 1, 1, 2), event("event-bad", 2, 2, 4, "running", "other-call", "call-a"), event("event-2", 3, 2, 3));
+  assert.equal(continuousCallTransitionPairs(invalidBreak, "call-a", true).length, 0);
+  const repeatedRevision = project(event("event-1", 1, 1, 2), event("event-2", 2, 1, 2));
+  assert.equal(continuousCallTransitionPairs(repeatedRevision, "call-a", true).length, 0);
+  const ambiguousRevision = project(event("a", 1, 4, 5, "running"), event("b", 2, 4, 5, "failed"), event("c", 3, 5, 6, "waiting"));
+  assert.equal(continuousCallTransitionPairs(ambiguousRevision, "call-a", true).length, 0);
+  const unknownSequence = project(event("a", 1, 4, 5), event("unknown", null, 5, 6), event("c", 3, 6, 7));
+  assert.equal(continuousCallTransitionPairs(unknownSequence, "call-a", true).length, 0);
+  const rollingWindow = project(event("older", 800, 0, 1), event("event-1", 801, 1, 2), event("event-2", 802, 2, 3));
+  assert.equal(continuousCallTransitionPairs(rollingWindow.slice(1), "call-a", true).length, 1);
+  const conflicting = mergeJournalEvidence(valid, [{ ...valid[0]!, event: { ...valid[0]!.event, name: "different" } }]);
+  assert.deepEqual(conflicting.conflictIds, ["event-1"]);
+  assert.equal(continuousCallTransitionPairs(valid, "call-a", true, conflicting.conflictIds).length, 0);
 });
 
 test("gateway request guard requires a loopback peer and same-origin request", () => {

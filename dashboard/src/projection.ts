@@ -48,6 +48,31 @@ export interface SafeNode {
   connector_id: string;
 }
 
+export interface SafeNodeDetail extends SafeNode {
+  operations: { name: string; capabilities: { abort: boolean; inspect: boolean; resume: boolean } }[];
+  events: string[];
+}
+
+export interface SafeRef { namespace: string; id: string }
+export interface SafeRelation {
+  id: string; revision: number; removed: boolean; source: SafeRef; event: string;
+  target: SafeRef; operation: string;
+}
+export interface SafeConversation {
+  id: string; revision: number; closed: boolean;
+  participants: { ref: SafeRef; receiver?: { target: SafeRef; operation: string } }[];
+}
+export interface SafeLogEntry {
+  sequence: number | string | null;
+  event: { id: string; source: SafeRef; name: string; category: string; occurred_at: string;
+    call_id?: string; correlation_id?: string; causation_id?: string; conversation_id?: string };
+  transition_observation?: { state: CallState; before_revision: number; after_revision: number };
+  projection_error?: "invalid_state_observation";
+}
+export interface ListResponse<T> { meta: ApiMeta; items: T[] | null }
+export interface LogsResponse { meta: ApiMeta; entries: SafeLogEntry[] | null; next_cursor: string; cursor_expired: boolean }
+export interface JournalEvidence { entries: SafeLogEntry[]; conflictIds: string[]; truncated: boolean }
+
 export interface SafeCall {
   subject: { namespace: string; id: string };
   revision: number;
@@ -232,6 +257,25 @@ function revision(value: unknown): number {
   return value;
 }
 
+function sequence(value: unknown): number | string | null {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    const unsafe = value as Record<string, unknown>;
+    if (unsafe.dashboard_unsafe_integer === true && typeof unsafe.source === "string" && /^(0|[1-9][0-9]*)$/u.test(unsafe.source)) return unsafe.source;
+  }
+  return null;
+}
+
+function ref(value: unknown): SafeRef {
+  const source = record(value);
+  return { namespace: id(source.namespace), id: id(source.id) };
+}
+
+function boolean(value: unknown): boolean {
+  if (typeof value !== "boolean") throw new ProjectionError();
+  return value;
+}
+
 function timestamp(value: unknown): string {
   const parsed = boundedText(value, 40);
   if (!Number.isFinite(Date.parse(parsed))) throw new ProjectionError();
@@ -282,6 +326,188 @@ export function projectNodes(value: unknown, limit = Number.MAX_SAFE_INTEGER): S
     })
     .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
     .slice(0, limit);
+}
+
+export function projectNodeDetails(value: unknown, limit = 100): SafeNodeDetail[] {
+  if (!Array.isArray(value)) throw new ProjectionError();
+  return value.map((entry) => {
+    const node = record(entry);
+    const operations = record(node.operations);
+    const events = record(node.events);
+    const projectedOperations = Object.entries(operations).map(([name, descriptor]) => {
+      const item = record(descriptor);
+      const capabilities = record(item.capabilities);
+      return { name: operation(name), capabilities: {
+        abort: boolean(capabilities.abort), inspect: boolean(capabilities.inspect), resume: boolean(capabilities.resume),
+      } };
+    }).sort((a, b) => a.name.localeCompare(b.name));
+    const projectedEvents = Object.keys(events).map(operation).sort();
+    return { id: id(node.id), connector_id: id(node.connector_id), operations: projectedOperations, events: projectedEvents };
+  }).sort((a, b) => a.id.localeCompare(b.id)).slice(0, limit);
+}
+
+export function projectRelations(value: unknown, limit = 100): SafeRelation[] {
+  if (!Array.isArray(value)) throw new ProjectionError();
+  return value.map((entry) => {
+    const snapshot = record(entry);
+    const item = record(snapshot.value);
+    return { id: id(item.id), revision: revision(snapshot.revision), removed: item.removed === undefined ? false : boolean(item.removed),
+      source: ref(item.source), event: operation(item.event), target: ref(item.target), operation: operation(item.operation) };
+  }).sort((a, b) => a.id.localeCompare(b.id)).slice(0, limit);
+}
+
+export function projectConversations(value: unknown, limit = 50): SafeConversation[] {
+  if (!Array.isArray(value)) throw new ProjectionError();
+  return value.map((entry) => {
+    const snapshot = record(entry);
+    const item = record(snapshot.value);
+    if (!Array.isArray(item.participants)) throw new ProjectionError();
+    const participants = item.participants.map((entry) => {
+      const participant = record(entry);
+      const projected: SafeConversation["participants"][number] = { ref: ref(participant.ref) };
+      if (participant.receiver !== undefined && participant.receiver !== null) {
+        const receiver = record(participant.receiver);
+        projected.receiver = { target: ref(receiver.target), operation: operation(receiver.operation) };
+      }
+      return projected;
+    });
+    return { id: id(item.id), revision: revision(snapshot.revision), closed: item.closed === undefined ? false : boolean(item.closed), participants };
+  }).sort((a, b) => a.id.localeCompare(b.id)).slice(0, limit);
+}
+
+export function projectLogs(value: unknown, limit = 100): { entries: SafeLogEntry[]; next_cursor: string } {
+  const page = record(value);
+  if (!Array.isArray(page.entries)) throw new ProjectionError();
+  const nextCursor = boundedText(page.next_cursor, 1024, true);
+  const entries = page.entries.slice(0, limit).map((entry) => {
+    const row = record(entry);
+    const envelope = record(row.event);
+    const event: SafeLogEntry["event"] = {
+      id: id(envelope.id), source: ref(envelope.source), name: operation(envelope.name),
+      category: boundedText(envelope.category, 32), occurred_at: timestamp(envelope.occurred_at),
+    };
+    for (const key of ["call_id", "correlation_id", "causation_id", "conversation_id"] as const) {
+      const value = optionalId(envelope, key);
+      if (value !== undefined) event[key] = value;
+    }
+    const projected: SafeLogEntry = { sequence: sequence(row.sequence), event };
+    if (envelope.category === "observation" && envelope.name === "state.changed" && event.source.namespace === "calls") {
+      if (event.source.id !== event.call_id) projected.projection_error = "invalid_state_observation";
+      else try {
+        const payload = record(envelope.payload);
+        const before = revision(payload.before_revision);
+        const after = revision(payload.after_revision);
+        if (after !== before + 1) throw new ProjectionError();
+        projected.transition_observation = { state: state(payload.state), before_revision: before, after_revision: after };
+      } catch { projected.projection_error = "invalid_state_observation"; }
+    }
+    return projected;
+  });
+  return { entries, next_cursor: nextCursor };
+}
+
+export function mergeJournalEvidence(previous: SafeLogEntry[], incoming: SafeLogEntry[], previousConflictIds: string[] = []): JournalEvidence {
+  const byId = new Map(previous.map((entry) => [entry.event.id, entry]));
+  const conflictIds = new Set(previousConflictIds);
+  let added = 0;
+  for (const entry of incoming) {
+    const existing = byId.get(entry.event.id);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(entry)) conflictIds.add(entry.event.id);
+    else if (!existing) { byId.set(entry.event.id, entry); added++; }
+  }
+  const entries = [...byId.values()].slice(-200);
+  const retainedIds = new Set(entries.map((entry) => entry.event.id));
+  return { entries, conflictIds: [...conflictIds].filter((id) => retainedIds.has(id)), truncated: previous.length + added > 200 };
+}
+
+export function hasContinuousJournal(entries: SafeLogEntry[]): boolean {
+  if (entries.some((entry) => entry.sequence === null)) return false;
+  const sorted = [...entries].sort((a, b) => compareJournalSequence(a.sequence!, b.sequence!));
+  for (let index = 1; index < sorted.length; index++) {
+    const previous = BigInt(String(sorted[index - 1]!.sequence));
+    const current = BigInt(String(sorted[index]!.sequence));
+    if (current !== previous + 1n) return false;
+  }
+  return true;
+}
+
+export function continuousCallTransitionPairs(entries: SafeLogEntry[], callId: string, journalAvailable: boolean, conflictIds: string[] = []): Array<[SafeLogEntry, SafeLogEntry]> {
+  if (!journalAvailable) return [];
+  const candidates = entries.filter((entry) => entry.event.name === "state.changed" && entry.event.category === "observation" &&
+    (entry.event.call_id === callId || (entry.event.source.namespace === "calls" && entry.event.source.id === callId)));
+  if (candidates.some((entry) => entry.sequence === null)) return [];
+  const ordered = [...entries].filter((entry) => entry.sequence !== null).sort((a, b) => compareJournalSequence(a.sequence!, b.sequence!));
+  const relevant = candidates.sort((a, b) => compareJournalSequence(a.sequence!, b.sequence!));
+  const conflicts = new Set(conflictIds);
+  const beforeRevisions = new Set<number>(); const afterRevisions = new Set<number>();
+  for (const entry of relevant) {
+    const observation = entry.transition_observation;
+    if (!observation) continue;
+    if (beforeRevisions.has(observation.before_revision) || afterRevisions.has(observation.after_revision)) return [];
+    beforeRevisions.add(observation.before_revision); afterRevisions.add(observation.after_revision);
+  }
+  const pairs: Array<[SafeLogEntry, SafeLogEntry]> = [];
+  for (let index = 1; index < relevant.length; index++) {
+    const previous = relevant[index - 1]!; const next = relevant[index]!;
+    const before = previous.transition_observation; const after = next.transition_observation;
+    if (previous.projection_error || next.projection_error || !before || !after || before.after_revision !== after.before_revision) continue;
+    const from = BigInt(String(previous.sequence)); const to = BigInt(String(next.sequence));
+    if (to <= from) continue;
+    const interval = ordered.filter((entry) => BigInt(String(entry.sequence)) >= from && BigInt(String(entry.sequence)) <= to);
+    let continuous = interval.length === Number(to - from + 1n);
+    for (let position = 1; continuous && position < interval.length; position++) {
+      if (BigInt(String(interval[position]!.sequence)) !== BigInt(String(interval[position - 1]!.sequence)) + 1n) continuous = false;
+    }
+    if (!continuous || interval.some((entry) => conflicts.has(entry.event.id))) continue;
+    pairs.push([previous, next]);
+  }
+  return pairs;
+}
+
+function compareJournalSequence(left: number | string, right: number | string): number {
+  const a = BigInt(String(left)); const b = BigInt(String(right));
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+export function parseListLimit(params: URLSearchParams, allowed: string[] = ["limit"], fallback = 50, maximum = 100): number {
+  const values = new Map<string, string>();
+  for (const [key, value] of params) {
+    if (!allowed.includes(key) || values.has(key)) throw new Error("invalid_query");
+    values.set(key, value);
+  }
+  const raw = values.get("limit");
+  if (raw === undefined) return fallback;
+  if (!/^[0-9]+$/u.test(raw)) throw new Error("invalid_query");
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) throw new Error("invalid_query");
+  return parsed;
+}
+
+export function parseLogsQuery(params: URLSearchParams): { call_id?: string; correlation_id?: string; conversation_id?: string; after?: string; limit: number } {
+  const allowed = new Set(["call_id", "correlation_id", "conversation_id", "after", "limit"]);
+  const values = new Map<string, string>();
+  for (const [key, value] of params) {
+    if (!allowed.has(key) || values.has(key)) throw new Error("invalid_query");
+    values.set(key, value);
+  }
+  const query: { call_id?: string; correlation_id?: string; conversation_id?: string; after?: string; limit: number } = { limit: 100 };
+  for (const key of ["call_id", "correlation_id", "conversation_id"] as const) {
+    const value = values.get(key);
+    if (value !== undefined) query[key] = id(value);
+  }
+  const after = values.get("after");
+  if (after !== undefined) {
+    if (new TextEncoder().encode(after).byteLength > 1024 || /[\u0000-\u001f\u007f]/u.test(after)) throw new Error("invalid_query");
+    query.after = after;
+  }
+  const limit = values.get("limit");
+  if (limit !== undefined) {
+    if (!/^[0-9]+$/u.test(limit)) throw new Error("invalid_query");
+    const parsed = Number(limit);
+    if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 200) throw new Error("invalid_query");
+    query.limit = parsed;
+  }
+  return query;
 }
 
 export function projectCall(value: unknown): SafeCall {

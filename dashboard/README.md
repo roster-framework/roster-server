@@ -17,15 +17,17 @@ npm run build
 npm start
 ```
 
-서버는 loopback에만 바인딩합니다. 다른 로컬 포트가 필요하면 `PORT`를 설정하세요. 브라우저 API는 동일 origin의 `GET /api/overview`와 `GET /api/calls`만 제공합니다.
+서버는 loopback에만 바인딩합니다. 다른 로컬 포트가 필요하면 `PORT`를 설정하세요. 왼쪽의 Home·Calls·Relations 탭에서 작업실, 호출 목록, Node/구독/호출 관계를 확인합니다. 브라우저 API는 동일 origin의 `GET /api/overview`, `/api/calls`, `/api/nodes`, `/api/relations`, `/api/conversations`, `/api/logs`를 제공합니다.
 
-The server binds only to loopback. Set `PORT` to choose another local port. The browser API exposes only same-origin `GET /api/overview` and `GET /api/calls`.
+The server binds only to loopback. Set `PORT` to choose another local port. Use the Home, Calls, and Relations tabs to inspect the workspace, Call ledger, and Node/subscription/Call graph. The browser API exposes same-origin, read-only `GET /api/overview`, `/api/calls`, `/api/nodes`, `/api/relations`, `/api/conversations`, and `/api/logs`.
 
 ## 범위 · Scope
 
 홈 화면은 Core의 준비 상태, 등록된 Node, 현재 Call을 구분해 보여줍니다. Node 등록은 실행 가능 상태나 온라인 상태를 뜻하지 않습니다. Call 상태는 Core가 관측한 최신 스냅샷이며 업무 성공을 추정하지 않습니다.
 
 Home separates Core readiness, registered Nodes, and current Calls. Registration does not indicate that a Node is available or online. Call state is Core's latest observed snapshot and does not infer business success.
+
+Relations draws declared subscriptions as dashed edges and explicit retained causation as solid edges. Correlation groups do not imply order. Select a Call to inspect retained state observations; gaps, conflicting reports, and expired journal cursors remain visible as insufficient evidence. 관계 화면은 선언된 구독과 관측된 원인을 구분합니다. 상관 그룹은 실행 순서를 뜻하지 않으며, 기록 누락·상충·만료는 상태 전이 근거 부족으로 표시됩니다.
 
 부분 실패와 오래된 데이터는 표시됩니다. Core 인스턴스가 바뀌면 메모리 기록이 재시작되었을 수 있음을 알립니다. Call 입력, Result 출력, Node binding, Event payload 및 대화 본문은 브라우저에 전달하지 않습니다.
 

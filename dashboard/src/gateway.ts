@@ -4,10 +4,16 @@ import { extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   parseCallsQuery,
+  parseListLimit,
+  parseLogsQuery,
   projectCall,
   projectCalls,
+  projectConversations,
   projectCore,
+  projectLogs,
+  projectNodeDetails,
   projectNodes,
+  projectRelations,
   validDashboardRequest,
   type ApiMeta,
   type CallsResponse,
@@ -59,7 +65,15 @@ function callCore(command: string, args: unknown): Promise<unknown> {
     const joined = new Uint8Array(size);
     let offset = 0;
     for (const chunk of chunks) { joined.set(chunk, offset); offset += chunk.byteLength; }
-    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(joined)) as unknown;
+    const reviver = ((key: string, value: unknown, context?: { source?: string }) => {
+      if ((key === "sequence" || key === "before_revision" || key === "after_revision") &&
+          typeof value === "number" && !Number.isSafeInteger(value) && context?.source &&
+          /^(0|[1-9][0-9]*)$/u.test(context.source)) {
+        return { dashboard_unsafe_integer: true, source: context.source };
+      }
+      return value;
+    }) as Parameters<typeof JSON.parse>[1];
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(joined), reviver) as unknown;
   });
 }
 
@@ -135,6 +149,62 @@ async function calls(query: ReturnType<typeof parseCallsQuery>): Promise<CallsRe
   }
 }
 
+async function nodes(): Promise<{ meta: ApiMeta; nodes: ReturnType<typeof projectNodeDetails> | null }> {
+  try {
+    const raw = await callCore("nodes.list", {});
+    if (!Array.isArray(raw)) throw new Error("core_projection_invalid");
+    const projected = projectNodeDetails(raw, 100);
+    return { meta: meta({}, projected.length, raw.length > projected.length), nodes: projected };
+  } catch (error) {
+    const errors = { nodes: errorCode(error) === "core_unavailable" ? "core_projection_invalid" : errorCode(error) };
+    return { meta: meta(errors, 0, false), nodes: null };
+  }
+}
+
+async function relations(): Promise<{ meta: ApiMeta; relations: ReturnType<typeof projectRelations> | null }> {
+  try {
+    const raw = await callCore("subscriptions.list", {});
+    if (!Array.isArray(raw)) throw new Error("core_projection_invalid");
+    const projected = projectRelations(raw, 100);
+    return { meta: meta({}, projected.length, raw.length > projected.length), relations: projected };
+  } catch (error) {
+    const errors = { relations: errorCode(error) === "core_unavailable" ? "core_projection_invalid" : errorCode(error) };
+    return { meta: meta(errors, 0, false), relations: null };
+  }
+}
+
+async function conversations(limit: number): Promise<{ meta: ApiMeta; conversations: ReturnType<typeof projectConversations> | null }> {
+  try {
+    const raw = await callCore("conversations.list", {});
+    if (!Array.isArray(raw)) throw new Error("core_projection_invalid");
+    const projected = projectConversations(raw, limit);
+    return { meta: meta({}, projected.length, raw.length > projected.length), conversations: projected };
+  } catch (error) {
+    const errors = { conversations: errorCode(error) === "core_unavailable" ? "core_projection_invalid" : errorCode(error) };
+    return { meta: meta(errors, 0, false), conversations: null };
+  }
+}
+
+async function logs(query: ReturnType<typeof parseLogsQuery>): Promise<{
+  meta: ApiMeta; entries: ReturnType<typeof projectLogs>["entries"] | null; next_cursor: string; cursor_expired: boolean;
+}> {
+  const args: Record<string, string | number> = { limit: query.limit };
+  if (query.call_id) args.call_id = query.call_id;
+  if (query.correlation_id) args.correlation_id = query.correlation_id;
+  if (query.conversation_id) args.conversation_id = query.conversation_id;
+  if (query.after !== undefined) args.after = query.after;
+  try {
+    const page = projectLogs(await callCore("logs.query", args), query.limit);
+    return { meta: meta({}, page.entries.length, page.entries.length >= query.limit), entries: page.entries,
+      next_cursor: page.next_cursor, cursor_expired: false };
+  } catch (error) {
+    const code = errorCode(error);
+    const expired = code === "core_http_410";
+    const errors = { logs: expired ? "cursor_expired" : code === "core_unavailable" ? "core_projection_invalid" : code };
+    return { meta: meta(errors, 0, false), entries: null, next_cursor: "", cursor_expired: expired };
+  }
+}
+
 async function serveStatic(pathname: string, response: ServerResponse): Promise<void> {
   let relative: string;
   try { relative = pathname === "/" ? "index.html" : decodeURIComponent(pathname.slice(1)); }
@@ -172,6 +242,24 @@ const server = createServer(async (request: IncomingMessage, response: ServerRes
   }
   if (request.method === "GET" && url.pathname === "/api/calls") {
     try { sendJson(response, 200, await calls(parseCallsQuery(url.searchParams))); }
+    catch { sendJson(response, 400, { error: "invalid_query" }); }
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/nodes") {
+    if (url.search !== "") { sendJson(response, 400, { error: "invalid_query" }); return; }
+    sendJson(response, 200, await nodes()); return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/relations") {
+    if (url.search !== "") { sendJson(response, 400, { error: "invalid_query" }); return; }
+    sendJson(response, 200, await relations()); return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/conversations") {
+    try { sendJson(response, 200, await conversations(parseListLimit(url.searchParams, ["limit"], 50, 100))); }
+    catch { sendJson(response, 400, { error: "invalid_query" }); }
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/logs") {
+    try { sendJson(response, 200, await logs(parseLogsQuery(url.searchParams))); }
     catch { sendJson(response, 400, { error: "invalid_query" }); }
     return;
   }

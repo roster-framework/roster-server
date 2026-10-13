@@ -1,8 +1,8 @@
 # Roster Server / 로스터 서버
 
-Run a central Go Core with a local dashboard. The Core calls declared Node operations through one Call contract; the dashboard shows registered Nodes and observed Call states. An optional log service lives in `log/`.
+Run a central Go Core with a local dashboard. The Core calls declared Node operations through one Call contract; the dashboard shows registered Nodes, observed Call states, and read-only relations. An optional log service lives in `log/`.
 
-중앙 Go Core와 로컬 대시보드를 실행합니다. Core는 선언된 Node operation을 공통 Call 계약으로 호출하고, 대시보드는 등록된 Node와 관측된 Call 상태를 보여 줍니다. 선택형 로그 서비스는 `log/`에 있습니다.
+중앙 Go Core와 로컬 대시보드를 실행합니다. Core는 선언된 Node operation을 공통 Call 계약으로 호출하고, 대시보드는 등록된 Node·관측된 Call 상태·읽기 전용 관계를 보여 줍니다. 선택형 로그 서비스는 `log/`에 있습니다.
 
 ## Run locally / 로컬 실행
 
