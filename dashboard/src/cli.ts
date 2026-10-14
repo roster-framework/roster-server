@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { applyBundle, applyExitCode, BundleError, CLIENT_PROFILE, coreOrigin, planResult, prepareBundle, readPackageIdentity, RESULT_SCHEMA, type ImportResult } from "./bundle.js";
+import { runDeployment } from "./deployment.js";
 
 interface Arguments { command: "validate" | "import"; packagePath: string; bindingsPath: string; core: string; apply: boolean; expectedDigest: string | null }
 function parseArguments(argv: string[]): Arguments {
@@ -49,8 +50,18 @@ export async function runBundleCli(argv: string[]): Promise<number> {
   return code;
 }
 
-void runBundleCli(process.argv.slice(2)).then((code) => { process.exitCode = code; }).catch(() => {
-  process.stdout.write(JSON.stringify({ schema: RESULT_SCHEMA, status: "failed", package: { name: "", version: "" }, client_profile: CLIENT_PROFILE,
-    digest: null, actions: [], applied: [], unresolved: [], failure: { stage: "input", code: "input_invalid" } }) + "\n");
-  process.exitCode = 2;
-});
+const argv = process.argv.slice(2);
+if (argv[0] === "deployment") {
+  void runDeployment(argv.slice(1)).then(({ code, result }) => {
+    process.stdout.write(JSON.stringify(result) + "\n"); process.exitCode = code;
+  }).catch(() => {
+    process.stdout.write(JSON.stringify({ schema: "roster-deployment-result/1", deployment_id: "", status: "failed", digest: null, applied: [], unresolved: [], code: "deployment_invalid" }) + "\n");
+    process.exitCode = 2;
+  });
+} else {
+  void runBundleCli(argv).then((code) => { process.exitCode = code; }).catch(() => {
+    process.stdout.write(JSON.stringify({ schema: RESULT_SCHEMA, status: "failed", package: { name: "", version: "" }, client_profile: CLIENT_PROFILE,
+      digest: null, actions: [], applied: [], unresolved: [], failure: { stage: "input", code: "input_invalid" } }) + "\n");
+    process.exitCode = 2;
+  });
+}

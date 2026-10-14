@@ -64,6 +64,15 @@ node dashboard/build/src/cli.js bundle validate --package <installed-package-dir
 node dashboard/build/src/cli.js bundle import --package <installed-package-dir> --bindings <bindings.json> --core http://127.0.0.1:7350 --apply --expected-digest <validated-sha256>
 ```
 
+## Runtime agent와 Core bundle 구성
+
+배치 CLI는 Runtime ManagedAgent version, 기존 skill/MCP/Resource 참조를 먼저 확인한 뒤 Runtime CAS 설정과 참조된 Core bundle을 적용합니다. 공급자를 설치하거나 모델을 호출하지 않습니다. `roster-deployment/1` JSON 예시와 명령은 한국어·영어 [Dashboard 안내](dashboard/README.md)를 참고하세요.
+
+```sh
+node dashboard/build/src/cli.js deployment validate --file <deployment.json>
+node dashboard/build/src/cli.js deployment apply --file <deployment.json> --expected-digest <validated-sha256>
+```
+
 ## 검증
 
 `core/`와 `log/`에서 각각 Docker 모듈 검사를 실행합니다.

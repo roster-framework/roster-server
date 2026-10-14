@@ -3,6 +3,10 @@ import assert from "node:assert/strict";
 import { CLIENT_PROFILE, applyBundle, applyExitCode, coreOrigin, parseStrictJson, validateManifest, type BundlePlan } from "../src/bundle.js";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { runDeployment } from "../src/deployment.js";
 import {
   CALL_STATES, MutationInputError, confirmedCoreDisplayState, continuousCallTransitionPairs, coreInstanceChanged, hasContinuousJournal, keepHighestCallRevisions, mergeJournalEvidence, mutationResponseIsCurrent, subscriptionCanvasExtent, parseCallsQuery, parseListLimit, parseLogsQuery, parseSubscriptionCreateInput, parseSubscriptionRemoveInput, projectCall, projectCalls, projectConversations, projectCore, projectLogs, projectNodeDetails, projectNodes, projectRelations, type SafeCall,
   validDashboardRequest,
@@ -386,6 +390,236 @@ test("bundle CLI parser primitives reject duplicate JSON keys and non-loopback C
   assert.equal(coreOrigin("http://127.0.0.1:7350"), "http://127.0.0.1:7350");
   assert.equal(coreOrigin("http://[::1]:7350"), "http://[::1]:7350");
   for (const origin of ["https://127.0.0.1:7350", "http://example.com", "http://127.0.0.1:7350/path", "http://u:p@127.0.0.1:7350"]) assert.throws(() => coreOrigin(origin));
+});
+
+test("deployment CLI rejects unknown and duplicate JSON fields without network or mutation", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "roster-deployment-invalid-"));
+  try {
+    const unknown = path.join(directory, "unknown.json");
+    await writeFile(unknown, JSON.stringify({ schema: "roster-deployment/1", id: "sample", runtime: { origin: "http://127.0.0.1:1", token_env: "RUNTIME_TOKEN" }, core: { origin: "http://127.0.0.1:2" }, profiles: {}, agents: [], resources: [], bundle: { package_dir: "pkg", bindings_file: "bindings.json" }, install: true }));
+    const unknownResult = await runDeployment(["validate", "--file", unknown]);
+    assert.equal(unknownResult.code, 2);
+    assert.equal(unknownResult.result.status, "failed");
+    assert.equal(unknownResult.result.code, "deployment_invalid");
+
+    const duplicate = path.join(directory, "duplicate.json");
+    await writeFile(duplicate, '{"schema":"roster-deployment/1","schema":"roster-deployment/1"}');
+    const duplicateResult = await runDeployment(["validate", "--file", duplicate]);
+    assert.equal(duplicateResult.code, 2);
+    assert.equal(duplicateResult.result.code, "json_invalid");
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("deployment CLI rejects prompt escape and missing tokens without exposing declaration values", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "roster-deployment-safe-"));
+  const previousToken = process.env.ROSTER_TEST_MISSING_TOKEN;
+  try {
+    const base = { schema: "roster-deployment/1", id: "sample", runtime: { origin: "http://127.0.0.1:1", token_env: "ROSTER_TEST_MISSING_TOKEN" }, core: { origin: "http://127.0.0.1:2" },
+      profiles: { echo: { name: "Echo", kind: "echo" } }, agents: [{ id: "echo-agent", expected_version: 0, profile_ref: "echo", config: {}, prompt_ref: "../outside.txt", skill_refs: [], mcp_refs: [], resource_refs: [] }], resources: [], bundle: { package_dir: "pkg", bindings_file: "bindings.json" } };
+    const promptEscape = path.join(directory, "escape.json"); await writeFile(promptEscape, JSON.stringify(base));
+    process.env.ROSTER_TEST_MISSING_TOKEN = "secret-fixture-value";
+    const escaped = await runDeployment(["validate", "--file", promptEscape]);
+    assert.equal(escaped.code, 2); assert.equal(escaped.result.code, "path_invalid");
+
+    const bundleEscape = path.join(directory, "bundle-escape.json");
+    await writeFile(bundleEscape, JSON.stringify({ ...base, agents: [{ ...base.agents[0], prompt_ref: undefined }], bundle: { package_dir: "../pkg", bindings_file: "bindings.json" } }));
+    const escapedBundle = await runDeployment(["validate", "--file", bundleEscape]);
+    assert.equal(escapedBundle.code, 2); assert.equal(escapedBundle.result.code, "path_invalid");
+
+    const missingToken = path.join(directory, "missing-token.json");
+    await writeFile(missingToken, JSON.stringify({ ...base, agents: [{ ...base.agents[0], prompt_ref: undefined }] }));
+    delete process.env.ROSTER_TEST_MISSING_TOKEN;
+    const missing = await runDeployment(["validate", "--file", missingToken]);
+    assert.equal(missing.code, 2); assert.equal(missing.result.code, "token_missing");
+    const output = JSON.stringify(missing.result);
+    assert.equal(output.includes("ROSTER_TEST_MISSING_TOKEN"), false);
+    assert.equal(output.includes("Bearer"), false);
+  } finally { if (previousToken === undefined) delete process.env.ROSTER_TEST_MISSING_TOKEN; else process.env.ROSTER_TEST_MISSING_TOKEN = previousToken; await rm(directory, { recursive: true, force: true }); }
+});
+
+function deploymentCoreCatalog(): unknown[] {
+  const empty = { type: "object", additionalProperties: false };
+  const node = { type: "object", properties: { id: { type: "string" }, connector_id: { type: "string" }, binding: true,
+    operations: { type: "object", additionalProperties: { type: "object", properties: { name: { type: "string" }, input_schema: true, output_schema: true,
+      capabilities: { type: "object", properties: { abort: { type: "boolean" }, inspect: { type: "boolean" }, resume: { type: "boolean" } }, required: ["abort", "inspect", "resume"], additionalProperties: false } },
+    required: ["name", "input_schema", "capabilities"], additionalProperties: false } }, events: { type: "object", additionalProperties: true } },
+    required: ["id", "connector_id", "operations", "events"], additionalProperties: false };
+  const pair = { type: "object", properties: { namespace: { type: "string" }, id: { type: "string" } }, required: ["namespace", "id"], additionalProperties: false };
+  const input = { type: "object", properties: { values: { type: "object", additionalProperties: true }, pointers: { type: "object", additionalProperties: { type: "string" } } }, additionalProperties: false };
+  const subscription = { type: "object", properties: { id: { type: "string" }, source: pair, event: { type: "string" }, target: pair, operation: { type: "string" }, input, removed: { type: "boolean" } },
+    required: ["id", "source", "event", "target", "operation", "input"], additionalProperties: false };
+  const snapshot = { type: "object", properties: { subject: pair, revision: { type: "integer", minimum: 0 }, value: subscription }, required: ["subject", "revision", "value"], additionalProperties: false };
+  const registerInput = { type: "object", properties: { id: { type: "string" }, connector_id: { type: "string" }, binding: true }, required: ["id", "connector_id", "binding"], additionalProperties: false };
+  const subscriptionCreate = { type: "object", properties: { id: { type: "string" }, source: pair, event: { type: "string" }, target: pair, operation: { type: "string" }, input, removed: { type: "boolean" } },
+    required: ["id", "source", "event", "target", "operation", "input"], additionalProperties: false };
+  return [
+    { name: "nodes.list", input_schema: empty, output_schema: { type: ["null", "array"], items: node } },
+    { name: "nodes.register", input_schema: registerInput, output_schema: node },
+    { name: "subscriptions.list", input_schema: empty, output_schema: { type: ["null", "array"], items: snapshot } },
+    { name: "subscriptions.create", input_schema: subscriptionCreate, output_schema: snapshot },
+  ];
+}
+
+test("deployment validate is read-only and apply confirms Runtime CAS before reusing Core bundle actions", async () => {
+  const work = await mkdtemp(path.join(os.tmpdir(), "roster-deployment-plan-"));
+  const saved = { runtime: process.env.ROSTER_DEPLOY_TEST_RUNTIME, resource: process.env.ROSTER_DEPLOY_TEST_RESOURCE };
+  process.env.ROSTER_DEPLOY_TEST_RUNTIME = "runtime-fixture-secret"; process.env.ROSTER_DEPLOY_TEST_RESOURCE = "resource-fixture-secret";
+  const storedAgents: Record<string, unknown>[] = []; const runtimeWrites: unknown[] = []; const coreWrites: string[] = []; const coreReads: string[] = []; let resourceReads = 0; let dropRuntimeReply = false; let dropCoreReply = false; let runtimePreflightStatus = 200; let corePreflightStatus = 200;
+  const runtime = createServer(async (request, response) => {
+    if (request.headers.authorization !== "Bearer runtime-fixture-secret") { response.writeHead(401).end(); return; }
+    if (request.method === "GET" && request.url === "/admin") {
+      response.writeHead(runtimePreflightStatus, { "content-type": "application/json" });
+      if (runtimePreflightStatus !== 200) { response.end("{}"); return; }
+      response.end(JSON.stringify({ manifest: { protocol: "roster/0.1", runtime_id: "runtime-fixture", agents: storedAgents.map((agent) => ({ id: agent.id })) }, managed_agents: storedAgents, skill_catalog: { mode: "files", skills: [{ id: "skill-a", ready: true }] } })); return;
+    }
+    if (request.method === "GET" && request.url === "/mcp-catalogue") {
+      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ protocol: "roster-mcp-catalogue/1", runtime_id: "runtime-fixture", connections: [{ connection_id: "mcp-a", revision: "00000000-0000-4000-8000-000000000001", state: "active", tools: [] }] })); return;
+    }
+    if (request.method === "PUT" && request.url === "/admin/agents") {
+      const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk)); const config = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      runtimeWrites.push(config); const savedAgent = { ...config, version: (config.version as number) + 1 };
+      const existing = storedAgents.findIndex((agent) => agent.id === config.id); if (existing >= 0) storedAgents[existing] = savedAgent; else storedAgents.push(savedAgent);
+      if (dropRuntimeReply) { response.destroy(); return; }
+      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ protocol: "roster/0.1", runtime_id: "runtime-fixture", agents: [{ id: config.id }] })); return;
+    }
+    response.writeHead(404).end();
+  });
+  const resource = createServer((request, response) => {
+    resourceReads++;
+    if (request.headers.authorization !== "Bearer resource-fixture-secret" || request.url !== "/v1/resources/notes") { response.writeHead(404).end(); return; }
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ id: "notes", version: 2, operations: ["read"] }));
+  });
+  const core = createServer(async (request, response) => {
+    coreReads.push(`${request.method} ${request.url}`);
+    if (request.method === "GET" && request.url === "/api/catalog") { response.writeHead(corePreflightStatus, { "content-type": "application/json" }); response.end(corePreflightStatus === 200 ? JSON.stringify(deploymentCoreCatalog()) : "{}"); return; }
+    if (request.method === "POST" && ["/api/commands/nodes.list", "/api/commands/subscriptions.list"].includes(request.url ?? "")) { for await (const _chunk of request) { /* consume request body */ } response.writeHead(200, { "content-type": "application/json" }).end("[]"); return; }
+    const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk)); const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    if (request.method === "POST" && request.url?.startsWith("/api/commands/")) {
+      const command = request.url.slice("/api/commands/".length); coreWrites.push(command);
+      if (dropCoreReply && command === "subscriptions.create") { response.destroy(); return; }
+      const value = command === "nodes.register" ? { id: body.id, connector_id: body.connector_id } : { subject: { namespace: "subscriptions", id: body.id }, revision: 1, value: { id: body.id } };
+      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(value)); return;
+    }
+    response.writeHead(404).end();
+  });
+  const listen = async (server: ReturnType<typeof createServer>): Promise<number> => { await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve)); const address = server.address(); assert.ok(address && typeof address !== "string"); return address.port; };
+  const close = async (server: ReturnType<typeof createServer>) => { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); };
+  try {
+    const runtimePort = await listen(runtime); const resourcePort = await listen(resource); const corePort = await listen(core);
+    const packageDir = path.join(work, "bundle"); await mkdir(packageDir);
+    await writeFile(path.join(packageDir, "package.json"), JSON.stringify({ name: "@fixture/deployment", version: "1.0.0", roster: { manifest: "roster-bundle.json" } }));
+    await writeFile(path.join(packageDir, "roster-bundle.json"), JSON.stringify({ schema: "roster-bundle/1", name: "@fixture/deployment", version: "1.0.0", client_profile: "roster-core-import/1",
+      nodes: [{ id: "notes-node", connector_id: "resource", binding_ref: "notes" }, { id: "echo-node", connector_id: "runtime", binding_ref: "echo" }],
+      subscriptions: [{ id: "notes-to-echo", source: { namespace: "nodes", id: "notes-node" }, event: "changed", target: { namespace: "nodes", id: "echo-node" }, operation: "run", input: {} }] }));
+    const declaration = path.join(work, "deployment.json");
+    await writeFile(path.join(work, "bindings.json"), JSON.stringify({ bindings: {
+      notes: { url: `http://127.0.0.1:${resourcePort}`, target_id: "notes", token_env: "ROSTER_DEPLOY_TEST_RESOURCE" },
+      echo: { url: `http://127.0.0.1:${runtimePort}`, target_id: "echo-agent", token_env: "ROSTER_DEPLOY_TEST_RUNTIME" },
+    } }));
+    await writeFile(path.join(work, "bindings-mismatch.json"), JSON.stringify({ bindings: {
+      notes: { url: `http://127.0.0.1:${resourcePort}`, target_id: "different-resource", token_env: "ROSTER_DEPLOY_TEST_RESOURCE" },
+      echo: { url: `http://127.0.0.1:${runtimePort}`, target_id: "echo-agent", token_env: "ROSTER_DEPLOY_TEST_RUNTIME" },
+    } }));
+    await writeFile(path.join(work, "prompt.md"), "Echo safely.");
+    await writeFile(declaration, JSON.stringify({ schema: "roster-deployment/1", id: "fixture", runtime: { origin: `http://127.0.0.1:${runtimePort}`, token_env: "ROSTER_DEPLOY_TEST_RUNTIME" },
+      core: { origin: `http://127.0.0.1:${corePort}` }, profiles: { echo: { name: "Echo Agent", kind: "echo" } },
+      agents: [{ id: "echo-agent", expected_version: 0, profile_ref: "echo", config: {}, prompt_ref: "./prompt.md", skill_refs: ["skill-a"], mcp_refs: ["mcp-a"], resource_refs: ["notes"] }],
+      resources: [{ id: "notes", origin: `http://127.0.0.1:${resourcePort}`, token_env: "ROSTER_DEPLOY_TEST_RESOURCE", expected_version: 2, node_id: "notes-node" }],
+      bundle: { package_dir: "./bundle", bindings_file: "./bindings.json" } }));
+
+    const mismatchedBinding = path.join(work, "binding-mismatch-deployment.json");
+    await writeFile(mismatchedBinding, JSON.stringify({ ...JSON.parse(await readFile(declaration, "utf8")), bundle: { package_dir: "./bundle", bindings_file: "./bindings-mismatch.json" } }));
+    const mismatch = await runDeployment(["validate", "--file", mismatchedBinding]);
+    assert.equal(mismatch.code, 2, `${JSON.stringify(mismatch.result)} ${coreReads.join(",")}`); assert.equal(mismatch.result.code, "resource_node_mismatch");
+    assert.equal(runtimeWrites.length, 0); assert.equal(coreWrites.length, 0);
+
+    runtimePreflightStatus = 503;
+    const runtimeUnavailable = await runDeployment(["validate", "--file", declaration]);
+    runtimePreflightStatus = 200;
+    assert.equal(runtimeUnavailable.code, 2); assert.equal(runtimeUnavailable.result.code, "runtime_unavailable");
+    corePreflightStatus = 503;
+    const coreUnavailable = await runDeployment(["validate", "--file", declaration]);
+    corePreflightStatus = 200;
+    assert.equal(coreUnavailable.code, 2); assert.equal(coreUnavailable.result.code, "core_unavailable");
+
+    // Contract cases for @roster/contracts 0.49.0 ManagedAgent, ModelProvider,
+    // AgentEngine, ModelParameters, and ToolApprovalPolicy; invalid second
+    // agents must be rejected before the valid first agent can be applied.
+    const badAgentConfigs: Array<Record<string, unknown>> = [
+      { name: "Bad kind", kind: "unsupported" },
+      { name: "Bad provider", kind: "llm", provider: "../unsafe" },
+      { name: "Bad engine", kind: "llm", engine: "shell" },
+      { name: "Empty statuses", kind: "echo", statuses: [] },
+      { name: "Nested model controls", kind: "llm", model_parameters: { api_key: "not-allowed" } },
+      { name: "Bad approval", kind: "echo", tool_approval: { mode: "selected", tools: [] } },
+    ];
+    for (let index = 0; index < badAgentConfigs.length; index++) {
+      const invalidFile = path.join(work, `invalid-agent-${index}.json`);
+      const base = JSON.parse(await readFile(declaration, "utf8")) as Record<string, unknown>;
+      const invalid = { ...base, profiles: { echo: (base.profiles as Record<string, unknown>).echo, invalid: badAgentConfigs[index] }, agents: [
+        ...(base.agents as Array<Record<string, unknown>>),
+        { id: `bad-agent-${index}`, expected_version: 0, profile_ref: "invalid", config: {}, skill_refs: [], mcp_refs: [], resource_refs: [] },
+      ] };
+      await writeFile(invalidFile, JSON.stringify(invalid));
+      const beforeWrites: number = runtimeWrites.length; const beforeCoreWrites: number = coreWrites.length;
+      const result = await runDeployment(["validate", "--file", invalidFile]);
+      assert.equal(result.code, 2, JSON.stringify(result.result)); assert.equal(result.result.code, "agent_config_invalid");
+      assert.equal(runtimeWrites.length, beforeWrites); assert.equal(coreWrites.length, beforeCoreWrites);
+    }
+    const unicodePrompt = path.join(work, "unicode-prompt.md"); await writeFile(unicodePrompt, "😀".repeat(10_001));
+    const unicodeFile = path.join(work, "unicode-prompt.json");
+    await writeFile(unicodeFile, JSON.stringify({ ...JSON.parse(await readFile(declaration, "utf8")), agents: [
+      { ...((JSON.parse(await readFile(declaration, "utf8")) as Record<string, unknown>).agents as Array<Record<string, unknown>>)[0], prompt_ref: "./unicode-prompt.md" },
+    ] }));
+    const unicodeResult = await runDeployment(["validate", "--file", unicodeFile]);
+    assert.equal(unicodeResult.code, 2); assert.equal(unicodeResult.result.code, "prompt_size_limit");
+    assert.equal(runtimeWrites.length, 0); assert.equal(coreWrites.length, 0);
+
+    const planned = await runDeployment(["validate", "--file", declaration]);
+    assert.equal(planned.code, 0); assert.equal(planned.result.status, "planned"); assert.match(planned.result.digest ?? "", /^[a-f0-9]{64}$/u);
+    assert.equal(runtimeWrites.length, 0); assert.equal(coreWrites.length, 0);
+    assert.equal(JSON.stringify(planned.result).includes("Echo safely."), false);
+    const rejectedDigest = await runDeployment(["apply", "--file", declaration, "--expected-digest", "0".repeat(64)]);
+    assert.equal(rejectedDigest.code, 2); assert.equal(rejectedDigest.result.code, "digest_mismatch"); assert.equal(runtimeWrites.length, 0); assert.equal(coreWrites.length, 0);
+
+    const applied = await runDeployment(["apply", "--file", declaration, "--expected-digest", planned.result.digest!]);
+    assert.equal(applied.code, 0, JSON.stringify(applied.result)); assert.equal(applied.result.status, "applied");
+    assert.deepEqual(runtimeWrites[0] && (runtimeWrites[0] as Record<string, unknown>).instructions, "Echo safely.");
+    assert.equal((runtimeWrites[0] as Record<string, unknown>).version, 0);
+    assert.deepEqual(coreWrites, ["nodes.register", "nodes.register", "subscriptions.create"]);
+    assert.equal(applied.result.applied.filter((item) => item.service === "runtime")[0]?.revision, 1);
+    const output = JSON.stringify(applied.result);
+    assert.equal(output.includes("runtime-fixture-secret"), false); assert.equal(output.includes("resource-fixture-secret"), false); assert.equal(output.includes("Echo safely."), false);
+
+    const lostReplyFile = path.join(work, "lost-reply.json");
+    const baseDeclaration = JSON.parse(await readFile(declaration, "utf8")) as Record<string, unknown>;
+    const baseAgent = (baseDeclaration.agents as Array<Record<string, unknown>>)[0]!;
+    await writeFile(lostReplyFile, JSON.stringify({ ...baseDeclaration, id: "lost-reply", agents: [{ ...baseAgent, id: "echo-agent-lost" }] }));
+    const lostPlan = await runDeployment(["validate", "--file", lostReplyFile]); assert.equal(lostPlan.code, 0);
+    dropRuntimeReply = true;
+    const lost = await runDeployment(["apply", "--file", lostReplyFile, "--expected-digest", lostPlan.result.digest!]);
+    dropRuntimeReply = false;
+    assert.equal(lost.code, 4); assert.equal(lost.result.status, "partial");
+    assert.deepEqual(lost.result.unresolved, [{ service: "runtime", id: "echo-agent-lost" }]);
+    assert.equal(storedAgents.some((agent) => agent.id === "echo-agent-lost" && agent.version === 1), true);
+    assert.deepEqual(coreWrites, ["nodes.register", "nodes.register", "subscriptions.create"]);
+
+    const coreLostReplyFile = path.join(work, "core-lost-reply.json");
+    await writeFile(coreLostReplyFile, JSON.stringify({ ...baseDeclaration, id: "core-lost-reply", agents: [{ ...baseAgent, id: "echo-agent-core-lost" }] }));
+    const coreLostPlan = await runDeployment(["validate", "--file", coreLostReplyFile]); assert.equal(coreLostPlan.code, 0);
+    dropCoreReply = true;
+    const coreLost = await runDeployment(["apply", "--file", coreLostReplyFile, "--expected-digest", coreLostPlan.result.digest!]);
+    dropCoreReply = false;
+    assert.equal(coreLost.code, 4); assert.equal(coreLost.result.status, "partial");
+    assert.deepEqual(coreLost.result.unresolved, [{ service: "core", id: "notes-to-echo" }]);
+    assert.equal(storedAgents.some((agent) => agent.id === "echo-agent-core-lost" && agent.version === 1), true);
+    assert.ok(resourceReads >= 6);
+  } finally {
+    await close(runtime); await close(resource); await close(core);
+    if (saved.runtime === undefined) delete process.env.ROSTER_DEPLOY_TEST_RUNTIME; else process.env.ROSTER_DEPLOY_TEST_RUNTIME = saved.runtime;
+    if (saved.resource === undefined) delete process.env.ROSTER_DEPLOY_TEST_RESOURCE; else process.env.ROSTER_DEPLOY_TEST_RESOURCE = saved.resource;
+    await rm(work, { recursive: true, force: true });
+  }
 });
 
 test("bundle CLI maps pre-apply communication failure and partial mutation to distinct exits", () => {

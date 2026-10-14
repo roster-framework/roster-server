@@ -64,6 +64,15 @@ node dashboard/build/src/cli.js bundle validate --package <installed-package-dir
 node dashboard/build/src/cli.js bundle import --package <installed-package-dir> --bindings <bindings.json> --core http://127.0.0.1:7350 --apply --expected-digest <validated-sha256>
 ```
 
+## Provision a Runtime agent and Core bundle
+
+The deployment CLI validates Runtime ManagedAgent versions and existing skill/MCP/Resource references before applying Runtime CAS updates and then the referenced Core bundle. It does not provision providers or invoke a model. See the bilingual [Dashboard guide](dashboard/README.md) for the `roster-deployment/1` JSON example and commands.
+
+```sh
+node dashboard/build/src/cli.js deployment validate --file <deployment.json>
+node dashboard/build/src/cli.js deployment apply --file <deployment.json> --expected-digest <validated-sha256>
+```
+
 ## Verify
 
 Run module checks from `core/` and `log/` separately in Docker:

@@ -46,3 +46,39 @@ node build/src/cli.js bundle import --package <installed-package-dir> --bindings
 ```
 
 The CLI prints one JSON result. `planned`/`applied` exit 0; input or compatibility rejection exits 2, a started partial import exits 3, and pre-mutation communication failure exits 4. `unresolved` means the request may have reached Core; check the current Node/subscription IDs before deciding what to do next. 출력은 JSON 한 건이며, 전송 결과가 불명인 ID는 자동 재시도하거나 되돌리지 않습니다.
+
+## Deployment JSON · 배치 JSON
+
+Use a `roster-deployment/1` file to configure existing Runtime ManagedAgents with compare-and-swap versions and then import the referenced Core bundle. `validate` performs read-only preflight and prints a digest. Review that digest, then pass it to `apply`; the apply command repeats preflight and stops before mutation if the digest changed. Prompt and bundle paths are relative to the declaration file. Runtime and Resource credentials are read by environment variable name and are never printed. This does not install providers, run package code, invoke a model, retry, or roll back. `planned`/`applied` exit 0, preflight or digest rejection exits 2, confirmed rejection/partial application exits 3, and unknown mutation outcome exits 4. Inspect `applied` and `unresolved` in the JSON result after a partial or unknown outcome.
+
+`roster-deployment/1` 파일로 기존 Runtime ManagedAgent를 compare-and-swap version으로 설정한 뒤 참조된 Core bundle을 가져옵니다. `validate`는 변경 없이 사전 검증하고 digest를 출력합니다. digest를 확인한 뒤 `apply`에 전달하세요. `apply`도 사전 검증을 다시 수행하며 digest가 바뀌면 mutation 전에 중단합니다. prompt와 bundle 경로는 선언 파일 기준 상대 경로입니다. Runtime·Resource 자격은 환경변수 이름으로 읽고 출력하지 않습니다. 공급자를 설치하거나 패키지 코드를 실행하거나 모델을 호출하지 않으며, 자동 재시도·롤백도 없습니다. `planned`/`applied`는 종료 코드 0, 사전 검증·digest 거절은 2, 확인된 거절·부분 적용은 3, mutation 결과 불명은 4입니다. 부분 적용 또는 결과 불명 뒤에는 JSON의 `applied`와 `unresolved`를 확인하세요.
+
+Minimal declaration example (the referenced bundle files must already exist; put the Runtime token value in the operator environment, never in this JSON):
+
+최소 선언 예시입니다. 참조하는 bundle 파일을 미리 준비하고 Runtime token 값은 이 JSON이 아닌 운영자 환경에 설정하세요.
+
+```json
+{
+  "schema": "roster-deployment/1",
+  "id": "local-echo",
+  "runtime": { "origin": "http://127.0.0.1:7331", "token_env": "ROSTER_TOKEN" },
+  "core": { "origin": "http://127.0.0.1:7350" },
+  "profiles": { "echo": { "name": "Echo Agent", "kind": "echo" } },
+  "agents": [{
+    "id": "echo-agent",
+    "expected_version": 0,
+    "profile_ref": "echo",
+    "config": {},
+    "skill_refs": [],
+    "mcp_refs": [],
+    "resource_refs": []
+  }],
+  "resources": [],
+  "bundle": { "package_dir": "./bundle", "bindings_file": "./bindings.json" }
+}
+```
+
+```sh
+node build/src/cli.js deployment validate --file ../deployment.json
+node build/src/cli.js deployment apply --file ../deployment.json --expected-digest <validated-sha256>
+```
