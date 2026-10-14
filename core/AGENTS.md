@@ -1,6 +1,6 @@
 # 작업 규칙
 
-- 구현 전 별도 [roster-docs 설계](https://github.com/roster-framework/roster-docs/blob/main/roster-core/design.md)와 [TODO](https://github.com/roster-framework/roster-docs/blob/main/roster-core/todo.md)를 읽고 외부 계약은 [API](https://github.com/roster-framework/roster-docs/blob/main/roster-core/api.md)에서 관리한다. 추가 보고서/버전별 설계 문서를 만들지 않는다.
+- 구현 전 접근 권한이 있는 내부 roster-docs의 roster-core 설계·API·TODO를 읽는다. 공개 기여자는 이 저장소의 README·소스 계약을 기준으로 Issue/PR에서 변경을 제안한다. 추가 보고서/버전별 설계 문서를 만들지 않는다.
 - 보관된 옛 Core와 Dashboard 코드를 새 Core에 복사하지 않는다. Runtime·Resource 서버는 활성 `roster-node-client/runtime`·`roster-node-client/resource`의 계약으로 연결한다.
 - 코어는 노드/operation/호출만 안다. agent/resource/human 종류 분기와 Codex/Claude 실행 코드를 넣지 않는다.
 - 실제 서버 연결과 wire 변환은 Connector 구현 책임이다. 공통 호출 서비스·상태 전이·이벤트 전달은 하나만 둔다.

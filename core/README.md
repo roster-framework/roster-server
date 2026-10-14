@@ -28,4 +28,4 @@ docker run --rm --mount type=bind,source="${PWD}",target=/src,readonly -w /src g
 
 서버를 함께 실행하는 격리 검증은 `scripts/verify-isolated.ps1`의 `-RuntimeRepository`, `-ResourceRepository`, `-WorkDirectory`, `-CacheDirectory` 인자를 사용합니다. 테스트용 자격과 데이터 디렉터리를 별도로 지정합니다.
 
-설계와 상태 다이어그램, [API](https://github.com/roster-framework/roster-docs/blob/main/roster-core/api.md), [TODO](https://github.com/roster-framework/roster-docs/blob/main/roster-core/todo.md)는 별도 [roster-docs](https://github.com/roster-framework/roster-docs/blob/main/roster-core/design.md)에서 관리합니다. Checkpoint/restore와 self-host 검증은 미완성 WIP이며 현재 제공 범위로 표시하지 않습니다.
+설계·상태 다이어그램·API·TODO는 별도 내부 문서에서 관리합니다. 공개 사용법은 이 README와 소스 계약을 따릅니다. Checkpoint/restore와 self-host 검증은 미완성 WIP이며 현재 제공 범위로 표시하지 않습니다.

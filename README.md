@@ -67,4 +67,4 @@ pwsh -File core/scripts/verify-isolated.ps1
 
 대시보드는 `dashboard/`의 `npm test`로 검증합니다. 위 스크립트는 실제 Runtime·Resource 연결과 대화 흐름을 Docker에서 검증하며 모델 호출은 하지 않습니다.
 
-Usage details: [Core](core/README.md), [Dashboard](dashboard/README.md), [Log](log/README.md). Design/API/state diagrams: [roster-docs](https://github.com/roster-framework/roster-docs). Contribution goals and Issue/PR guidance: [CONTRIBUTING](CONTRIBUTING.md). 사용 상세는 구성요소 README에, 설계·API·상태 다이어그램은 별도 문서 저장소에 둡니다.
+Usage details: [Core](core/README.md), [Dashboard](dashboard/README.md), [Log](log/README.md). Contribution goals and Issue/PR guidance: [CONTRIBUTING](CONTRIBUTING.md). Internal design documents are maintained separately. 사용법은 구성요소 README에, 기여 안내는 CONTRIBUTING에 있습니다. 내부 설계 문서는 별도로 관리합니다.

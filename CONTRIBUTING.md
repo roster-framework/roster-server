@@ -20,4 +20,4 @@ Before opening an issue, search existing issues. Describe the observable behavio
 
 For a PR, link the issue or explain the use case. State which contract or transition changes, how duplicate/out-of-order reports and cancellation races behave, and which Docker module checks you ran. Keep unrelated changes separate. PR에는 이슈 또는 사용 사례를 연결하고 계약·전이 변경, 중복/역순 보고와 취소 경합 처리, 실행한 Docker 모듈 검증을 적어 주세요. 무관한 변경은 분리해 주세요.
 
-Design, API, state diagrams, and open tasks live in [roster-docs](https://github.com/roster-framework/roster-docs). Usage and local setup are in this repository's [README](README.md). 설계·API·상태 다이어그램·TODO는 별도 문서 저장소에, 사용법과 로컬 실행은 이 저장소 README에 둡니다.
+Usage and local setup are in this repository's [README](README.md). Public contracts are in the source and component READMEs; propose design changes in an Issue or PR. Internal design documents are maintained separately. 사용법은 README를 보고, 계약 변경 제안은 Issue나 PR로 남겨 주세요. 내부 설계 문서는 별도로 관리합니다.

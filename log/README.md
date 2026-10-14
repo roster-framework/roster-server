@@ -14,4 +14,4 @@ CLI는 `node scripts/logs.mjs`의 append/compact/features/agents/query/retention
 
 Go 검증은 Linux Docker의 `go test ./...`, `go vet ./...`와 기존 Node CLI tests를 사용합니다. 운영 원장에 테스트용 정리/회수를 실행하지 않습니다.
 
-상세 문서: [설계](https://github.com/roster-framework/roster-docs/blob/main/roster-log-go/design.md) · [API](https://github.com/roster-framework/roster-docs/blob/main/roster-log-go/api.md) · [TODO](https://github.com/roster-framework/roster-docs/blob/main/roster-log-go/todo.md). native 지원과 옛 Core/새 Core의 실제 통합 수락을 구분합니다.
+설계·API·TODO는 별도 내부 문서에서 관리합니다. 공개 사용법은 이 README와 소스 계약을 따릅니다. native 지원과 옛 Core/새 Core의 실제 통합 수락을 구분합니다.
