@@ -209,6 +209,7 @@ test("subscription canvas extent follows cards when wrapping narrow and shrinkin
 
 test("gateway validates raw subscription receipts and returns only safe mutation outcomes", async () => {
   const commands: Array<{ path: string; body: Record<string, unknown> }> = [];
+  let hangingResponse: import("node:http").ServerResponse | undefined;
   const core = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -220,6 +221,8 @@ test("gateway validates raw subscription receipts and returns only safe mutation
     commands.push({ path, body });
     if (path.endsWith("subscriptions.create")) {
       const id = String(body.id);
+      if (id === "sub-server-error") { response.writeHead(500, { "Content-Type": "application/json" }); response.end(JSON.stringify({ message: "private Core failure" })); return; }
+      if (id === "sub-timeout") { hangingResponse = response; return; }
       if (id === "sub-unknown") { response.writeHead(400, { "Content-Type": "application/json" }); response.end(JSON.stringify({ code: "future_fault", message: "private" })); return; }
       if (id === "sub-schema") { response.writeHead(400, { "Content-Type": "application/json" }); response.end(JSON.stringify({ code: "invalid_schema", message: "private" })); return; }
       const value = { id, source: body.source, event: body.event, target: body.target, operation: body.operation,
@@ -249,8 +252,21 @@ test("gateway validates raw subscription receipts and returns only safe mutation
     assert.equal(ready, true);
     const post = (path: string, body: unknown) => fetch(`${origin}${path}`, { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const declaration = { source: { namespace: "nodes", id: "node-a" }, event: "changed", target: { namespace: "nodes", id: "node-b" }, operation: "apply", input: {} };
+    const denied = async (headers: Record<string, string>) => fetch(`${origin}/api/subscriptions`, { method: "POST", headers, body: JSON.stringify({ ...declaration, id: "sub-denied" }) });
+    assert.equal((await denied({ "Content-Type": "application/json" })).status, 403);
+    assert.equal((await denied({ Origin: "http://example.invalid", "Content-Type": "application/json" })).status, 403);
+    assert.equal((await denied({ Origin: "null", "Content-Type": "application/json" })).status, 403);
     const none = await fetch(`${origin}/api/subscriptions`, { method: "POST", headers: { Origin: origin, "Sec-Fetch-Site": "none", "Content-Type": "application/json" }, body: JSON.stringify({ ...declaration, id: "sub-no-site" }) });
-    assert.equal(none.status, 403); assert.equal(commands.length, 0);
+    assert.equal(none.status, 403);
+    assert.equal((await denied({ Origin: origin, "Sec-Fetch-Site": "cross-site", "Content-Type": "application/json" })).status, 403);
+    assert.equal((await fetch(`${origin}/api/subscriptions`, { method: "POST", headers: { Origin: origin, "Content-Type": "text/plain" }, body: JSON.stringify({ ...declaration, id: "sub-media" }) })).status, 415);
+    const malformedBody = await fetch(`${origin}/api/subscriptions`, { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: "{not-json" });
+    assert.equal(malformedBody.status, 400);
+    const duplicateBody = await fetch(`${origin}/api/subscriptions`, { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: '{"id":"sub-dup","id":"sub-dup","source":{"namespace":"nodes","id":"node-a"},"event":"changed","target":{"namespace":"nodes","id":"node-b"},"operation":"apply","input":{}}' });
+    assert.equal(duplicateBody.status, 400);
+    const oversizedBody = await fetch(`${origin}/api/subscriptions`, { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: " ".repeat(33 * 1024) });
+    assert.equal(oversizedBody.status, 413);
+    assert.equal(commands.length, 0);
     const good = await post("/api/subscriptions", { ...declaration, id: "sub-good" });
     assert.equal(good.status, 200);
     const goodBody = await good.text(); assert.equal(goodBody.includes("private_value"), false); assert.equal(goodBody.includes("must not echo"), false);
@@ -260,10 +276,15 @@ test("gateway validates raw subscription receipts and returns only safe mutation
     assert.equal(unknown.status, 400); assert.deepEqual(await unknown.json(), { status: "rejected", code: "core_rejected", id: "sub-unknown" });
     const schema = await post("/api/subscriptions", { ...declaration, id: "sub-schema" });
     assert.equal(schema.status, 400); assert.deepEqual(await schema.json(), { status: "rejected", code: "invalid_schema", id: "sub-schema" });
+    const serverError = await post("/api/subscriptions", { ...declaration, id: "sub-server-error" });
+    assert.equal(serverError.status, 502); assert.deepEqual(await serverError.json(), { status: "unconfirmed", code: "mutation_unconfirmed", id: "sub-server-error", action: "create" });
+    const timedOut = await post("/api/subscriptions", { ...declaration, id: "sub-timeout" });
+    assert.equal(timedOut.status, 504); assert.deepEqual(await timedOut.json(), { status: "unconfirmed", code: "mutation_unconfirmed", id: "sub-timeout", action: "create" });
     const removed = await post("/api/subscriptions/remove", { id: "sub-good", expected_revision: 2 });
     assert.deepEqual(await removed.json(), { status: "applied", action: "remove", id: "sub-good", revision: 3, removed: true });
-    assert.equal(commands.length, 5);
+    assert.equal(commands.length, 7);
   } finally {
+    hangingResponse?.destroy();
     child.kill("SIGTERM");
     await new Promise<void>((resolve, reject) => core.close((error) => error ? reject(error) : resolve()));
   }
