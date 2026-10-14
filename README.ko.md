@@ -6,6 +6,8 @@
 
 ![Roster Server 구조: Core가 Runtime·Resource Node와 연결되고 로컬 대시보드는 Core 조회와 구독 관리를 담당합니다](docs/assets/server-architecture.svg)
 
+![호출 상태 흐름: 접수, 실행, 대기, 취소 요청, 불명, 조사, 종료 확인](docs/assets/call-state.svg)
+
 ## 로컬 실행
 
 필요 도구는 Go 1.26, Node.js 24, npm입니다. 저장소 루트에서 각 서비스를 별도 터미널로 실행하세요.

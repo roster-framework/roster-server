@@ -6,6 +6,8 @@ Run the central Go Core with its local dashboard and optional log service. The C
 
 ![Roster Server architecture: Core connects to Runtime and Resource Nodes, while the local dashboard reads Core and manages subscription declarations](docs/assets/server-architecture.svg)
 
+![Call state flow: admission, execution, waiting, cancellation, uncertainty, reconciliation, and confirmed terminal states](docs/assets/call-state.svg)
+
 ## Run locally
 
 Requirements: Go 1.26, Node.js 24, and npm. Run each service in a separate terminal from the repository root.
