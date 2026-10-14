@@ -91,10 +91,16 @@ func (s *Service) Remove(id string, revision uint64) (c.Change[c.Subscription], 
 	_, err = lifecycle.Commit(s.store, ch, s.journal)
 	return ch, err
 }
-func (s *Service) Publish(e c.Event) ([]string, error) {
+func (s *Service) Publish(e c.Event, origin c.AdmissionOrigin) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e = c.Clone(e)
+	if !c.ValidAdmissionOrigin(origin) {
+		return nil, c.Err("forbidden", "Admission is not authorized")
+	}
+	if origin.Kind == c.OriginSource && origin.Actor != e.Source || origin.Kind == c.OriginResult && (origin.Actor != e.Source || origin.ParentCallID != e.CallID) {
+		return nil, c.Err("forbidden", "Admission provenance does not match the event")
+	}
 	if !c.ValidID(e.ID) || !c.ValidID(e.Name) || e.Category != "published" || e.OccurredAt.IsZero() || !e.Source.Valid() {
 		return nil, c.Err("invalid_input", "Invalid published event")
 	}
@@ -111,7 +117,11 @@ func (s *Service) Publish(e c.Event) ([]string, error) {
 	if err != nil || len(b) > 65536 {
 		return nil, c.Err("invalid_input", "Event exceeds size limit")
 	}
-	digest := c.ID(string(b))
+	originBytes, err := json.Marshal(origin)
+	if err != nil {
+		return nil, c.Err("invalid_input", "Invalid event provenance")
+	}
+	digest := c.ID(string(b), string(originBytes))
 	if old, ok := s.receipts[e.ID]; ok {
 		if old.digest != digest {
 			return nil, c.Err("conflict", "Event ID reused with different content")
@@ -139,7 +149,11 @@ func (s *Service) Publish(e c.Event) ([]string, error) {
 		ids = append(ids, id)
 		calls = append(calls, c.Call{ID: id, Target: sub.Target, Operation: sub.Operation, Input: mapped, CorrelationID: e.CorrelationID, CausationID: e.ID, ConversationID: e.ConversationID})
 	}
-	if _, err = s.caller.SubmitBatch(calls); err != nil {
+	subscriptionOrigin := origin
+	subscriptionOrigin.Kind = c.OriginSubscription
+	subscriptionOrigin.ParentCallID = ""
+	subscriptionOrigin.ParentEventID = e.ID
+	if _, err = s.caller.SubmitBatch(subscriptionOrigin, calls); err != nil {
 		return nil, err
 	}
 	s.receipts[e.ID] = receipt{digest, ids}
@@ -166,13 +180,17 @@ func (s *Service) Drain(outbox c.Outbox, recorder c.EventRecorder, complete func
 				}
 				releaseID = d.Event.ID
 			case d.Event != nil && d.Event.Category == "published":
-				_, err = s.Publish(*d.Event)
+				if d.Origin == nil {
+					err = c.Err("forbidden", "Admission provenance is missing")
+				} else {
+					_, err = s.Publish(*d.Event, *d.Origin)
+				}
 				if err != nil {
 					fault := c.AsFault(err)
 					if fault.Code == "busy" && fault.Message != "Host is draining" {
 						return err
 					}
-					if fault.Code != "invalid_input" && fault.Code != "invalid_schema" && fault.Code != "not_found" && fault.Code != "conflict" && !(fault.Code == "busy" && fault.Message == "Host is draining") {
+					if fault.Code != "invalid_input" && fault.Code != "invalid_schema" && fault.Code != "not_found" && fault.Code != "conflict" && fault.Code != "forbidden" && !(fault.Code == "busy" && fault.Message == "Host is draining") {
 						return err
 					}
 					rejected := c.Event{ID: c.ID(d.Event.ID, "event.rejected", fault.Code), Source: d.Event.Source, Name: "event.rejected", Category: "observation", OccurredAt: d.Event.OccurredAt, CorrelationID: d.Event.CorrelationID, CausationID: d.Event.ID, CallID: d.Event.CallID, ConversationID: d.Event.ConversationID, Payload: c.Data{"event_id": d.Event.ID, "code": fault.Code}}

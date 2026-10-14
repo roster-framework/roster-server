@@ -34,7 +34,7 @@ npm start
 node scripts/launch.mjs --config ../local-config/server.json
 ```
 
-설정에는 `schema: "roster-launch/1"`, `data_root`, `env_file`, `core_binary`, `dashboard_entry`(절대 경로인 `dashboard/build/src/gateway.js`)를 지정합니다. 빈 Core의 env 파일 형식은 `{ "env": {} }`입니다. 자격을 사용하는 Node를 가져올 때는 허용된 Core 토큰 환경변수를 `core_token_env`에 등록하세요. 실제 값은 외부 env 파일에만 둡니다. Core와 대시보드는 loopback의 7350·7360 포트에 바인딩합니다. Launcher는 준비 상태를 확인하고 자신이 실행한 자식 프로세스만 관리하며 데이터와 잠금 파일은 Git 밖에 둡니다. 그룹 실행·종료는 Linux Docker에서 검증했으며 Windows ACL·signal 동작은 아직 검증하지 않았습니다.
+설정에는 `schema: "roster-launch/1"`, `data_root`, `env_file`, `core_binary`, `dashboard_entry`(절대 경로인 `dashboard/build/src/gateway.js`)를 지정합니다. 선택 항목 `authority_file`은 저장소 밖의 소유자 전용 정책 JSON 경로이며 launcher가 Core에 전달합니다. 빈 Core의 env 파일 형식은 `{ "env": {} }`입니다. 자격을 사용하는 Node를 가져올 때는 허용된 Core 토큰 환경변수를 `core_token_env`에 등록하세요. 실제 값은 외부 env 파일에만 둡니다. Core와 대시보드는 loopback의 7350·7360 포트에 바인딩합니다. Launcher는 준비 상태를 확인하고 자신이 실행한 자식 프로세스만 관리하며 데이터와 잠금 파일은 Git 밖에 둡니다. 그룹 실행·종료는 Linux Docker에서 검증했으며 Windows ACL·signal 동작은 아직 검증하지 않았습니다.
 
 ## Node와 Call 조회
 
@@ -47,7 +47,19 @@ printf '%s\n' '{}' | go run ./cmd/roster nodes.list --file -
 
 Runtime 또는 Resource Node를 등록하기 전에 [Roster Node Client](https://github.com/roster-framework/roster-node-client)를 실행하세요. `nodes.register` 또는 로컬 Core 설정을 사용할 수 있습니다. `core/examples/local-stack.json`은 예제이며 Node ID, target ID, 공급자 URL과 `token_env` 이름을 실제 환경에 맞춰야 합니다. 자격 값은 Core 프로세스 환경에만 두고 Node binding·manifest·Git에는 넣지 마세요.
 
-Call은 `calls.submit`, `calls.get`, `calls.list`, `calls.inspect`, `calls.abort`로 제출·조회합니다. 연결 단절이나 timeout 뒤에는 Call이 `unknown`일 수 있으므로 같은 receipt를 확인한 뒤 조치하세요. 공급자 등록만으로 현재 연결 가능성이 증명되지는 않습니다. 구독 선언은 이후 이벤트 경로를 설정할 뿐 전달 성공을 증명하지 않습니다. Core 로그의 Event receipt와 생성된 Call 근거를 확인하세요. 구독을 제거해도 이미 생성된 Call은 취소되지 않습니다.
+Call은 `calls.submit`, `calls.get`, `calls.list`, `calls.inspect`, `calls.abort`로 제출·조회합니다. `--authority`/`authority_file`을 생략하면 Core는 빈 fail-closed 정책으로 시작합니다. readiness와 조회는 되지만 Call 제출과 사용자의 Abort는 거절됩니다. 주체, 대상 Node, action, operation을 정확히 허용하세요. 최소 local 권한 예시는 다음과 같습니다.
+
+```json
+{
+  "schema": "roster-authority/1",
+  "grants": [
+    { "principal": { "namespace": "operators", "id": "local" }, "action": "invoke", "target": { "namespace": "nodes", "id": "runtime" }, "operations": ["run"] },
+    { "principal": { "namespace": "operators", "id": "local" }, "action": "abort", "target": { "namespace": "nodes", "id": "runtime" }, "operations": ["run"] }
+  ]
+}
+```
+
+정책 파일에는 자격을 넣지 마세요. 연결 단절이나 timeout 뒤에는 Call이 `unknown`일 수 있으므로 같은 receipt를 확인한 뒤 조치하세요. 공급자 등록만으로 현재 연결 가능성이 증명되지는 않습니다. 구독 선언은 이후 이벤트 경로를 설정할 뿐 전달 성공을 증명하지 않습니다. Core 로그의 Event receipt와 생성된 Call 근거를 확인하세요. 구독을 제거해도 이미 생성된 Call은 취소되지 않습니다.
 
 ## 커뮤니티 bundle 가져오기
 

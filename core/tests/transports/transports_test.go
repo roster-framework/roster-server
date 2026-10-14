@@ -29,6 +29,12 @@ type mismatchedOutput string
 
 func (mismatchedOutput) MarshalJSON() ([]byte, error) { return []byte(`{}`), nil }
 
+type abortInput struct {
+	ID                 string `json:"id"`
+	ExpectedRevision   uint64 `json:"expected_revision"`
+	ExpectedInstanceID string `json:"expected_instance_id,omitempty"`
+}
+
 func TestSharedCommandTransports(t *testing.T) {
 	ctx := context.Background()
 	registry := command.New()
@@ -136,6 +142,27 @@ func TestSharedCommandTransports(t *testing.T) {
 	var catalog []command.Metadata
 	if json.Unmarshal(stdout.Bytes(), &catalog) != nil || len(catalog) != 2 {
 		t.Fatalf("catalog: %s", &stdout)
+	}
+}
+
+func TestAbortExpectedInstanceIDIsPreservedByHTTPCommandTransport(t *testing.T) {
+	registry := command.New()
+	if err := command.Register(registry, "calls.abort", "Abort", func(_ context.Context, in abortInput) (abortInput, error) { return in, nil }); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(httpapi.Handler(registry))
+	defer server.Close()
+	response, err := http.Post(server.URL+"/api/commands/calls.abort", "application/json", strings.NewReader(`{"id":"call-a","expected_revision":9,"expected_instance_id":"core-b"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var got abortInput
+	if err := json.NewDecoder(response.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || got.ID != "call-a" || got.ExpectedRevision != 9 || got.ExpectedInstanceID != "core-b" {
+		t.Fatalf("abort fence did not survive HTTP transport: status=%d input=%+v", response.StatusCode, got)
 	}
 }
 

@@ -160,7 +160,7 @@ async function prepare(configPath, started) {
   if (performance.now() - started > TOTAL_MS) fail('preflight', 'preflight_timeout', 2);
   await ordinaryFile(configPath, { ownerOnly: true });
   const config = await readJson(configPath);
-  const optional = ['core_port','dashboard_port','core_config','core_token_env'];
+  const optional = ['core_port','dashboard_port','core_config','core_token_env','authority_file'];
   exactKeys(config, ['schema','data_root','env_file','core_binary','dashboard_entry'], optional);
   if (config.schema !== 'roster-launch/1') fail('preflight', 'config_invalid');
   if ((config.core_port !== undefined && config.core_port !== 7350) || (config.dashboard_port !== undefined && config.dashboard_port !== 7360)) fail('preflight', 'port_invalid');
@@ -169,8 +169,9 @@ async function prepare(configPath, started) {
     data: resolveInputPath(config.data_root, base), envFile: resolveInputPath(config.env_file, base),
     core: resolveInputPath(config.core_binary, base), gateway: resolveInputPath(config.dashboard_entry, base),
     coreConfig: config.core_config === undefined ? null : resolveInputPath(config.core_config, base),
+    authority: config.authority_file === undefined ? null : resolveInputPath(config.authority_file, base),
   };
-  for (const candidate of [configPath, paths.data, paths.envFile, paths.coreConfig].filter(Boolean)) assertOutsideRepos(candidate, [ROOT]);
+  for (const candidate of [configPath, paths.data, paths.envFile, paths.coreConfig, paths.authority].filter(Boolean)) assertOutsideRepos(candidate, [ROOT]);
   await ordinaryFile(paths.envFile, { ownerOnly: true });
   const envDoc = await readJson(paths.envFile);
   exactKeys(envDoc, ['env']);
@@ -187,6 +188,7 @@ async function prepare(configPath, started) {
     if (Buffer.byteLength(coreConfigText, 'utf8') > 64 * 1024) fail('preflight', 'size_limit');
     for (const name of extractCoreTokenRefs(coreConfigText)) allowedNames.add(name);
   }
+  if (paths.authority) await ordinaryFile(paths.authority, { ownerOnly: true, max: 64 * 1024 });
   const coreEnv = Object.create(null);
   for (const name of allowedNames) {
     if (RESERVED.has(name.toUpperCase())) fail('preflight', 'env_allowlist_invalid');
@@ -349,14 +351,11 @@ export async function launch(argv = process.argv.slice(2)) {
     const prepared = await prepare(configPath, started);
     await initDataRoot(prepared.paths.data, 'server');
     lock = await acquireLock(prepared.paths.data);
-    if (prepared.config.core_config) {
-      const coreConfig = resolveInputPath(prepared.config.core_config, dirname(configPath));
-      children.push(spawnOwned('core', prepared.paths.core, ['serve','--listen','127.0.0.1:7350','--config',coreConfig], CORE_ROOT,
-        { ...childBaseEnv(), ...prepared.coreEnv }));
-    } else {
-      children.push(spawnOwned('core', prepared.paths.core, ['serve','--listen','127.0.0.1:7350'], CORE_ROOT,
-        { ...childBaseEnv(), ...prepared.coreEnv }));
-    }
+    const coreArgs = ['serve','--listen','127.0.0.1:7350'];
+    if (prepared.paths.coreConfig) coreArgs.push('--config', prepared.paths.coreConfig);
+    if (prepared.paths.authority) coreArgs.push('--authority', prepared.paths.authority);
+    children.push(spawnOwned('core', prepared.paths.core, coreArgs, CORE_ROOT,
+      { ...childBaseEnv(), ...prepared.coreEnv }));
     children.push(spawnOwned('gateway', process.execPath, [prepared.paths.gateway], DASHBOARD_ROOT, { ...childBaseEnv(), PORT: '7360' }));
     const startupDeadline = performance.now() + STARTUP_MS;
     const readyTask = ready(children, startupDeadline);

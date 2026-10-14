@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { runDeployment } from "../src/deployment.js";
 import {
-  CALL_STATES, MutationInputError, confirmedCoreDisplayState, continuousCallTransitionPairs, coreInstanceChanged, hasContinuousJournal, keepHighestCallRevisions, mergeJournalEvidence, mutationResponseIsCurrent, subscriptionCanvasExtent, parseCallsQuery, parseListLimit, parseLogsQuery, parseSubscriptionCreateInput, parseSubscriptionRemoveInput, projectCall, projectCalls, projectConversations, projectCore, projectLogs, projectNodeDetails, projectNodes, projectRelations, type SafeCall,
+  CALL_STATES, MutationInputError, abortObservationChanged, canRequestCallAbort, confirmedCoreDisplayState, continuousCallTransitionPairs, coreInstanceChanged, hasContinuousJournal, isDefiniteAbortRejection, keepHighestCallRevisions, mergeJournalEvidence, mutationResponseIsCurrent, subscriptionCanvasExtent, parseCallsQuery, parseListLimit, parseLogsQuery, parseCallAbortInput, parseSubscriptionCreateInput, parseSubscriptionRemoveInput, projectCall, projectCalls, projectConversations, projectCore, projectLogs, projectNodeDetails, projectNodes, projectRelations, type SafeCall,
   validDashboardRequest,
 } from "../src/projection.js";
 
@@ -196,10 +196,59 @@ test("subscription removal requires an observed positive safe revision", () => {
   ]) assert.throws(() => parseSubscriptionRemoveInput(value), MutationInputError);
 });
 
+test("call cancellation input requires exact observed revision and Core instance", () => {
+  const input = { id: "call-a", expected_revision: 4, expected_instance_id: "core-a" };
+  assert.deepEqual(parseCallAbortInput(input), input);
+  for (const value of [
+    { ...input, reason: "spoofed" }, { ...input, actor: "operators/admin" }, { ...input, expected_revision: 0 },
+    { ...input, expected_revision: Number.MAX_SAFE_INTEGER + 1 }, { ...input, expected_instance_id: "../core" },
+    { id: input.id, expected_revision: input.expected_revision },
+  ]) assert.throws(() => parseCallAbortInput(value), MutationInputError);
+});
+
+test("cancellation action requires a fresh selected nonterminal snapshot", () => {
+  const call = projectCall(callFixture());
+  assert.equal(canRequestCallAbort(call, true, false), true);
+  assert.equal(canRequestCallAbort(call, false, false), false);
+  assert.equal(canRequestCallAbort(call, true, true), false);
+  assert.equal(canRequestCallAbort(call, true, false, true), false);
+  for (const state of ["unknown", "cancelling", "succeeded", "failed", "cancelled", "expired", "rejected"] as const) {
+    assert.equal(canRequestCallAbort({ ...call, lifecycle: { ...call.lifecycle, state } }, true, false), false);
+  }
+});
+
+test("cancellation remains locked until observed revision or state changes", () => {
+  const call = projectCall(callFixture());
+  const attempt = { revision: call.revision, state: call.lifecycle.state };
+  assert.equal(abortObservationChanged(attempt, call), false);
+  assert.equal(abortObservationChanged(attempt, { ...call, revision: call.revision + 1 }), true);
+  assert.equal(abortObservationChanged(attempt, { ...call, lifecycle: { ...call.lifecycle, state: "cancelling" } }), true);
+  assert.equal(abortObservationChanged(attempt, null), false);
+});
+
+test("local cancellation parsing failures are definite pre-send rejections", () => {
+  for (const status of [400, 403, 404, 408, 409, 413, 415, 422, 429]) assert.equal(isDefiniteAbortRejection(status), true);
+  for (const status of [200, 502, 504]) assert.equal(isDefiniteAbortRejection(status), false);
+  assert.equal(isDefiniteAbortRejection(500, "rejected"), true);
+});
+
 test("subscription mutation responses are ignored after generation or Core identity changes", () => {
   assert.equal(mutationResponseIsCurrent(7, 7, "core-a", "core-a"), true);
   assert.equal(mutationResponseIsCurrent(7, 8, "core-a", "core-a"), false);
   assert.equal(mutationResponseIsCurrent(7, 7, "core-a", "core-b"), false);
+});
+
+test("a delayed cancellation response stays stale after selecting away and back to the same Call", () => {
+  const actionGeneration = 11;
+  let currentGeneration = actionGeneration;
+  const action = { id: "call-a", revision: 7, instanceId: "core-a" };
+  let current: { id: string; revision: number; instanceId: string } = action;
+  current = { ...action, id: "call-b" };
+  currentGeneration += 1; // selection changes away
+  current = action;
+  currentGeneration += 1; // selection returns to the same ID and revision
+  assert.deepEqual(current, action);
+  assert.equal(mutationResponseIsCurrent(actionGeneration, currentGeneration, action.instanceId, current.instanceId), false);
 });
 
 test("subscription canvas extent follows cards when wrapping narrow and shrinking wide", () => {
@@ -214,6 +263,7 @@ test("subscription canvas extent follows cards when wrapping narrow and shrinkin
 test("gateway validates raw subscription receipts and returns only safe mutation outcomes", async () => {
   const commands: Array<{ path: string; body: Record<string, unknown> }> = [];
   let hangingResponse: import("node:http").ServerResponse | undefined;
+  let coreInstance = "core-fixture";
   const core = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -221,6 +271,10 @@ test("gateway validates raw subscription receipts and returns only safe mutation
     const path = request.url ?? "";
     if (path === "/api/commands/subscriptions.list") {
       response.writeHead(200, { "Content-Type": "application/json" }); response.end("[]"); return;
+    }
+    if (path === "/api/commands/core.status") {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ instance_id: coreInstance, lifecycle: { value: { state: "running", updated_at: "2026-10-13T00:00:00Z" } }, ready: true, local_stopped: false, unresolved_call_ids: [], pending_delivery_count: 0, pending_observation_count: 0 })); return;
     }
     commands.push({ path, body });
     if (path.endsWith("subscriptions.create")) {
@@ -233,6 +287,20 @@ test("gateway validates raw subscription receipts and returns only safe mutation
         input: { values: { private_value: "must not echo" } }, ...(id === "sub-removed" ? { removed: true } : {}) };
       response.writeHead(200, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ subject: { namespace: "subscriptions", id }, revision: 1, value })); return;
+    }
+    if (path.endsWith("calls.abort")) {
+      const id = String(body.id);
+      if (id === "call-server-error") { response.writeHead(500, { "Content-Type": "application/json" }); response.end(JSON.stringify({ message: "private Core failure" })); return; }
+      if (id === "call-timeout") { hangingResponse = response; return; }
+      if (id === "call-rejected") { response.writeHead(409, { "Content-Type": "application/json" }); response.end(JSON.stringify({ code: "conflict", message: "private" })); return; }
+      if (id === "call-forbidden") { response.writeHead(403, { "Content-Type": "application/json" }); response.end(JSON.stringify({ code: "forbidden", message: "private" })); return; }
+      if (id === "call-instance-changed") coreInstance = "core-restarted";
+      const callId = id === "call-bad-snapshot" ? "different-call" : id;
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ subject: { namespace: "calls", id: callId }, revision: Number(body.expected_revision) + 1, value: {
+        call: { id: callId, target: { namespace: "nodes", id: "node-a" }, operation: "run" },
+        lifecycle: { state: "cancelling", updated_at: "2026-10-13T00:00:00Z" }, abort_requested: true,
+      } })); return;
     }
     const id = String(body.id); const revision = Number(body.expected_revision);
     response.writeHead(200, { "Content-Type": "application/json" });
@@ -286,7 +354,40 @@ test("gateway validates raw subscription receipts and returns only safe mutation
     assert.equal(timedOut.status, 504); assert.deepEqual(await timedOut.json(), { status: "unconfirmed", code: "mutation_unconfirmed", id: "sub-timeout", action: "create" });
     const removed = await post("/api/subscriptions/remove", { id: "sub-good", expected_revision: 2 });
     assert.deepEqual(await removed.json(), { status: "applied", action: "remove", id: "sub-good", revision: 3, removed: true });
-    assert.equal(commands.length, 7);
+    const abortInput = { id: "call-good", expected_revision: 4, expected_instance_id: "core-fixture" };
+    const abortNoOrigin = await fetch(`${origin}/api/calls/abort`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(abortInput) });
+    assert.equal(abortNoOrigin.status, 403);
+    const abortFetchNone = await fetch(`${origin}/api/calls/abort`, { method: "POST", headers: { Origin: origin, "Sec-Fetch-Site": "none", "Content-Type": "application/json" }, body: JSON.stringify(abortInput) });
+    assert.equal(abortFetchNone.status, 403);
+    const abortExtra = await post("/api/calls/abort", { ...abortInput, reason: "spoofed" });
+    assert.equal(abortExtra.status, 400);
+    const abortDuplicate = await fetch(`${origin}/api/calls/abort`, { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: `{"id":"call-good","id":"call-good","expected_revision":4,"expected_instance_id":"core-fixture"}` });
+    assert.equal(abortDuplicate.status, 400);
+    const abortMedia = await fetch(`${origin}/api/calls/abort`, { method: "POST", headers: { Origin: origin, "Content-Type": "text/plain" }, body: JSON.stringify(abortInput) });
+    assert.equal(abortMedia.status, 415);
+    const abortOversized = await fetch(`${origin}/api/calls/abort`, { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: " ".repeat(4 * 1024 + 1) });
+    assert.equal(abortOversized.status, 413);
+    const aborted = await post("/api/calls/abort", abortInput);
+    const abortBody = await aborted.json() as { status: string; action: string; id: string; call: SafeCall };
+    assert.equal(aborted.status, 200); assert.equal(abortBody.status, "confirmed"); assert.equal(abortBody.action, "abort");
+    assert.equal(abortBody.call.lifecycle.state, "cancelling"); assert.equal(abortBody.call.abort_requested, true);
+    assert.equal(JSON.stringify(abortBody).includes("operator_intervention"), false);
+    const abortCommand = commands.find((item) => item.path.endsWith("calls.abort"));
+    assert.deepEqual(abortCommand?.body, { ...abortInput, reason: "operator_intervention" });
+    const abortBadSnapshot = await post("/api/calls/abort", { ...abortInput, id: "call-bad-snapshot" });
+    assert.deepEqual(await abortBadSnapshot.json(), { status: "unconfirmed", code: "mutation_unconfirmed", id: "call-bad-snapshot", action: "abort" });
+    const abortRejected = await post("/api/calls/abort", { ...abortInput, id: "call-rejected" });
+    assert.deepEqual(await abortRejected.json(), { status: "rejected", code: "conflict", id: "call-rejected", action: "abort" });
+    const abortForbidden = await post("/api/calls/abort", { ...abortInput, id: "call-forbidden" });
+    assert.deepEqual(await abortForbidden.json(), { status: "rejected", code: "forbidden", id: "call-forbidden", action: "abort" });
+    const abortServerError = await post("/api/calls/abort", { ...abortInput, id: "call-server-error" });
+    assert.deepEqual(await abortServerError.json(), { status: "unconfirmed", code: "mutation_unconfirmed", id: "call-server-error", action: "abort" });
+    const abortTimeout = await post("/api/calls/abort", { ...abortInput, id: "call-timeout" });
+    assert.equal(abortTimeout.status, 504); assert.deepEqual(await abortTimeout.json(), { status: "unconfirmed", code: "mutation_unconfirmed", id: "call-timeout", action: "abort" });
+    coreInstance = "core-fixture";
+    const abortInstanceChanged = await post("/api/calls/abort", { ...abortInput, id: "call-instance-changed" });
+    assert.deepEqual(await abortInstanceChanged.json(), { status: "unconfirmed", code: "mutation_unconfirmed", id: "call-instance-changed", action: "abort" });
+    assert.equal(commands.length, 14);
   } finally {
     hangingResponse?.destroy();
     child.kill("SIGTERM");

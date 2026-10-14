@@ -90,7 +90,8 @@ func TestDrainRejectsFanoutDuringShutdownBeforeTerminalReply(t *testing.T) {
 	calls.BeginDrain()
 	published := c.Event{ID: "late-emission", Source: sub.Source, Name: "complete", Category: "published", OccurredAt: c.Now(), CallID: "origin", CausationID: "origin", Payload: c.Data{"summary": "finished"}}
 	terminal := execution(c.Succeeded)
-	outbox := &orderedOutbox{deliveries: []c.Delivery{{ID: published.ID, Event: &published}, {ID: "terminal-reply", Execution: &terminal}}}
+	origin := &c.AdmissionOrigin{Root: sub.Source, Actor: sub.Source, Kind: c.OriginResult, ParentCallID: "origin"}
+	outbox := &orderedOutbox{deliveries: []c.Delivery{{ID: published.ID, Event: &published, Origin: origin}, {ID: "terminal-reply", Execution: &terminal}}}
 	var replied int
 	if err := events.Drain(outbox, j, func(c.Snapshot[c.Execution]) error { replied++; return nil }); err != nil {
 		t.Fatal(err)
@@ -99,11 +100,25 @@ func TestDrainRejectsFanoutDuringShutdownBeforeTerminalReply(t *testing.T) {
 		t.Fatalf("shutdown fanout blocked the terminal reply: replies=%d acked=%v pending=%d", replied, outbox.acked, outbox.PendingDeliveryCount())
 	}
 	page, err := j.Query(observation.Filter{CallID: "origin"})
-	if err != nil || len(page.Entries) != 1 || page.Entries[0].Event.Name != "event.rejected" {
+	if err != nil || len(page.Entries) != 1 || page.Entries[0].Event.Name != "event.rejected" || page.Entries[0].Event.Payload["code"] != "busy" {
 		t.Fatalf("draining rejection was not audited: %+v %v", page, err)
 	}
 	if len(calls.List()) != 0 {
 		t.Fatal("draining event created a downstream call")
+	}
+}
+
+func TestDrainRejectsPublishedDeliveryWithoutServerOrigin(t *testing.T) {
+	j := observation.New(10)
+	events := event.New(nil, nil, nil, j)
+	published := c.Event{ID: "missing-origin", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "complete", Category: "published", OccurredAt: c.Now(), Payload: c.Data{}}
+	outbox := &orderedOutbox{deliveries: []c.Delivery{{ID: published.ID, Event: &published}}}
+	if err := events.Drain(outbox, j, nil); err != nil {
+		t.Fatal(err)
+	}
+	page, err := j.Query(observation.Filter{})
+	if err != nil || len(page.Entries) != 1 || page.Entries[0].Event.Name != "event.rejected" || page.Entries[0].Event.Payload["code"] != "forbidden" {
+		t.Fatalf("missing event provenance did not fail closed: %+v %v", page, err)
 	}
 }
 
@@ -116,7 +131,12 @@ func TestEventAtomicFanoutAndIdempotentSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	e := c.Event{ID: "event", Source: sub.Source, Name: "complete", Category: "published", OccurredAt: c.Now(), Payload: c.Data{"summary": "ready"}}
-	ids, err := events.Publish(e)
+	_, err = events.Publish(e, sourceOrigin("spoofed-source"))
+	fault(t, err, "forbidden")
+	if len(calls.List()) != 0 {
+		t.Fatal("event payload source replaced the server-derived origin")
+	}
+	ids, err := events.Publish(e, directOrigin())
 	if err != nil || len(ids) != 1 {
 		t.Fatalf("publish %v %v", ids, err)
 	}
@@ -130,13 +150,15 @@ func TestEventAtomicFanoutAndIdempotentSnapshot(t *testing.T) {
 	if _, err = events.Remove(sub.ID, snap.Revision); err != nil {
 		t.Fatal(err)
 	}
-	again, err := events.Publish(e)
+	again, err := events.Publish(e, directOrigin())
 	if err != nil || len(again) != 1 || again[0] != ids[0] || len(calls.List()) != 1 {
 		t.Fatalf("retry reevaluated subscriptions %v %v", again, err)
 	}
+	_, err = events.Publish(e, sourceOrigin("node"))
+	fault(t, err, "conflict")
 	changed := c.Clone(e)
 	changed.Payload["summary"] = "different"
-	_, err = events.Publish(changed)
+	_, err = events.Publish(changed, directOrigin())
 	fault(t, err, "conflict")
 	sub.ID = "valid"
 	sub.Input = c.InputTemplate{Values: c.Data{"text": "fixed"}}
@@ -150,7 +172,7 @@ func TestEventAtomicFanoutAndIdempotentSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.ID = "retry"
-	_, err = events.Publish(e)
+	_, err = events.Publish(e, directOrigin())
 	fault(t, err, "invalid_input")
 	if len(calls.List()) != 1 {
 		t.Fatal("fanout partially submitted")
@@ -158,13 +180,13 @@ func TestEventAtomicFanoutAndIdempotentSnapshot(t *testing.T) {
 	if _, err = events.Remove(sub.ID, bad.Revision); err != nil {
 		t.Fatal(err)
 	}
-	ids, err = events.Publish(e)
+	ids, err = events.Publish(e, directOrigin())
 	if err != nil || len(ids) != 1 || len(calls.List()) != 2 {
 		t.Fatalf("failed event could not retry %v %v", ids, err)
 	}
 	e.ID = "log"
 	e.Category = "observation"
-	_, err = events.Publish(e)
+	_, err = events.Publish(e, directOrigin())
 	fault(t, err, "invalid_input")
 }
 
@@ -181,37 +203,40 @@ func TestConversationScopeRetryAndLateReply(t *testing.T) {
 	req := c.SendMessage{ID: conv.ID, MessageID: "message", Author: author, Recipients: []c.Ref{recipient}, Text: "hello", Attachments: []c.Ref{{Namespace: "files", ID: "attachment"}}}
 	outsider := c.Clone(req)
 	outsider.Recipients = []c.Ref{{Namespace: "nodes", ID: "outsider"}}
-	_, err = sessions.Send(outsider)
+	_, err = sessions.Send(outsider, directOrigin())
 	fault(t, err, "invalid_input")
 	if len(calls.List()) != 0 {
 		t.Fatal("outsider delivery was submitted")
 	}
 	bad := c.Clone(req)
 	bad.ReplyTo = "other-session-message"
-	_, err = sessions.Send(bad)
+	_, err = sessions.Send(bad, directOrigin())
 	fault(t, err, "invalid_input")
-	message, err := sessions.Send(req)
+	message, err := sessions.Send(req, directOrigin())
 	if err != nil || len(message.CallIDs) != 1 {
 		t.Fatalf("send %+v %v", message, err)
 	}
-	duplicate, err := sessions.Send(req)
+	duplicate, err := sessions.Send(req, directOrigin())
 	if err != nil || duplicate.ID != message.ID || len(calls.List()) != 1 {
 		t.Fatal("duplicate message called recipient again")
 	}
 	conflict := c.Clone(req)
 	conflict.Text = "changed"
-	_, err = sessions.Send(conflict)
+	_, err = sessions.Send(conflict, directOrigin())
 	fault(t, err, "conflict")
 	if _, err = sessions.Close(conv.ID, snap.Revision); err != nil {
 		t.Fatal(err)
 	}
 	fresh := c.Clone(req)
 	fresh.MessageID = "new"
-	_, err = sessions.Send(fresh)
+	_, err = sessions.Send(fresh, directOrigin())
 	fault(t, err, "conflict")
 	pending, err := calls.Get(message.CallIDs[0])
 	if err != nil {
 		t.Fatal(err)
+	}
+	if pending.Value.Origin.Root != (c.Ref{Namespace: "operators", ID: "local"}) || pending.Value.Origin.Actor != pending.Value.Origin.Root || pending.Value.Origin.Kind != c.OriginConversation || pending.Value.Origin.ParentEventID != req.MessageID {
+		t.Fatalf("conversation fanout provenance was not preserved: %+v", pending.Value.Origin)
 	}
 	pending.Value.Lifecycle.State = c.Unknown
 	sessions.Complete(pending)
@@ -232,7 +257,7 @@ func TestConversationScopeRetryAndLateReply(t *testing.T) {
 		t.Fatalf("invalid reply %+v", reply)
 	}
 	// A queued cancellation completes independently of closing the session.
-	if _, err = calls.Abort(context.Background(), message.CallIDs[0], "cleanup"); err != nil {
+	if _, err = calls.Abort(context.Background(), message.CallIDs[0], "cleanup", nil); err != nil {
 		t.Fatal(err)
 	}
 }

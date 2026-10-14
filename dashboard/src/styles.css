@@ -14,3 +14,7 @@
 .connection-node{position:relative;z-index:1}
 .declaration-edge-layer{position:absolute;inset:0;z-index:0;overflow:visible;pointer-events:none}
 .canvas-subscription-edge{fill:none;stroke:#c4a7ff;stroke-width:2.5;stroke-dasharray:7 6;stroke-linecap:round;opacity:.9;vector-effect:non-scaling-stroke}
+
+.abort-control{margin-top:1rem;padding-top:1rem;border-top:1px solid var(--line,#343a45)}.abort-control p{line-height:1.5}.abort-confirm{margin:.75rem 0;padding:.85rem;border:1px solid #d39a42;border-radius:10px;background:#2a241b}.abort-button{margin:.5rem 0;padding:.65rem .9rem;border:1px solid #b87536;border-radius:8px;background:#6a351e;color:#fff;font:inherit}.abort-button:disabled{opacity:.55;cursor:not-allowed}.abort-status{margin:.65rem 0;font-size:.9rem}.abort-confirm p{overflow-wrap:anywhere}
+
+.abort-dialog{position:static;inset:auto;max-width:34rem;margin:1rem 0;padding:1rem;border:1px solid #d39a42;border-radius:12px;background:#242832;color:inherit}.abort-dialog::backdrop{background:transparent}.abort-dialog h3{margin-top:0}.abort-dialog p{line-height:1.5;overflow-wrap:anywhere}.abort-dialog-actions{display:flex;flex-wrap:wrap;gap:.65rem;justify-content:flex-end}.abort-dialog-actions button{padding:.55rem .8rem;border:1px solid #596171;border-radius:8px;background:#303642;color:inherit;font:inherit}

@@ -18,8 +18,10 @@ type RevisionInput struct {
 	ExpectedRevision uint64 `json:"expected_revision"`
 }
 type AbortInput struct {
-	ID     string `json:"id"`
-	Reason string `json:"reason"`
+	ID                 string  `json:"id"`
+	Reason             string  `json:"reason"`
+	ExpectedRevision   *uint64 `json:"expected_revision,omitempty"`
+	ExpectedInstanceID *string `json:"expected_instance_id,omitempty"`
 }
 type ResumeInput struct {
 	ID    string `json:"id"`
@@ -45,6 +47,7 @@ func publicExecution(s c.Snapshot[c.Execution]) c.Snapshot[c.Execution] {
 	s = c.Clone(s)
 	s.Value.Call.Input = c.Data{}
 	s.Value.Observation = c.ObservationCursor{}
+	s.Value.Origin = c.AdmissionOrigin{}
 	return s
 }
 func (s *Core) bindCommands() error {
@@ -58,7 +61,8 @@ func (s *Core) bindCommands() error {
 			return catalog.Public(n), err
 		}),
 		command.Register(r, "calls.submit", "Submit one common node call", func(_ context.Context, in c.Call) (c.Snapshot[c.Execution], error) {
-			out, err := s.Calls.SubmitBatch([]c.Call{in})
+			origin := c.AdmissionOrigin{Root: c.Ref{Namespace: "operators", ID: "local"}, Actor: c.Ref{Namespace: "operators", ID: "local"}, Kind: c.OriginDirect}
+			out, err := s.Calls.SubmitBatch(origin, []c.Call{in})
 			if err != nil {
 				return c.Snapshot[c.Execution]{}, err
 			}
@@ -80,7 +84,18 @@ func (s *Core) bindCommands() error {
 			return out, nil
 		}),
 		command.Register(r, "calls.abort", "Request cancellation without inventing termination", func(ctx context.Context, in AbortInput) (c.Snapshot[c.Execution], error) {
-			out, err := s.Calls.Abort(ctx, in.ID, in.Reason)
+			if in.ExpectedRevision != nil && (*in.ExpectedRevision == 0 || *in.ExpectedRevision > (uint64(1)<<53)-1) {
+				return c.Snapshot[c.Execution]{}, c.Err("invalid", "Expected revision must be a positive safe integer")
+			}
+			if in.ExpectedInstanceID != nil {
+				if !c.ValidID(*in.ExpectedInstanceID) {
+					return c.Snapshot[c.Execution]{}, c.Err("invalid", "Invalid expected Core instance")
+				}
+				if *in.ExpectedInstanceID != s.instanceID {
+					return c.Snapshot[c.Execution]{}, c.Err("conflict", "Core instance changed")
+				}
+			}
+			out, err := s.Calls.Abort(ctx, in.ID, in.Reason, in.ExpectedRevision)
 			return publicExecution(out), err
 		}),
 		command.Register(r, "calls.inspect", "Reconcile an unknown call using its original remote receipt", func(ctx context.Context, in IDInput) (c.Snapshot[c.Execution], error) {
@@ -98,7 +113,8 @@ func (s *Core) bindCommands() error {
 			return s.Events.Remove(in.ID, in.ExpectedRevision)
 		}),
 		command.Register(r, "events.publish", "Publish a declared event; duplicates do not rerun subscriptions", func(_ context.Context, in c.Event) (EventReceipt, error) {
-			ids, err := s.Events.Publish(in)
+			local := c.Ref{Namespace: "operators", ID: "local"}
+			ids, err := s.Events.Publish(in, c.AdmissionOrigin{Root: local, Actor: local, Kind: c.OriginDirect})
 			return EventReceipt{in.ID, ids}, err
 		}),
 		command.Register(r, "logs.query", "Query the shared journal using a retention-aware cursor", func(_ context.Context, in observation.Filter) (observation.Page, error) { return s.Journal.Query(in) }),
@@ -109,7 +125,10 @@ func (s *Core) bindCommands() error {
 		command.Register(r, "conversations.get", "Read participants and paginated messages", func(_ context.Context, in ConversationPage) (conversation.View, error) {
 			return s.Conversations.Get(in.ID, in.After, in.Limit)
 		}),
-		command.Register(r, "conversations.send", "Send to explicit participants using the common call queue", func(_ context.Context, in c.SendMessage) (c.Message, error) { return s.Conversations.Send(in) }),
+		command.Register(r, "conversations.send", "Send to explicit participants using the common call queue", func(_ context.Context, in c.SendMessage) (c.Message, error) {
+			local := c.Ref{Namespace: "operators", ID: "local"}
+			return s.Conversations.Send(in, c.AdmissionOrigin{Root: local, Actor: local, Kind: c.OriginDirect})
+		}),
 		command.Register(r, "conversations.close", "Close new messages; already started replies are retained", func(_ context.Context, in RevisionInput) (c.Change[c.Conversation], error) {
 			return s.Conversations.Close(in.ID, in.ExpectedRevision)
 		}),

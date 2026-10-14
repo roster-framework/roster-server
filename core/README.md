@@ -11,6 +11,24 @@ go build -o roster ./cmd/roster
 ./roster serve --config examples/local-stack.json
 ```
 
+Calls use a fail-closed immutable authority policy. Without `--authority`, the Core remains ready for reads but denies Call invocation and operator Abort. Point it to a policy JSON file outside the repository:
+
+```sh
+./roster serve --config examples/local-stack.json --authority ../local-config/authority.json
+```
+
+The policy lists exact grants; it contains no credentials. For example, allow the local operator to invoke and abort only the `runtime` Node's `run` operation:
+
+```json
+{
+  "schema": "roster-authority/1",
+  "grants": [
+    { "principal": { "namespace": "operators", "id": "local" }, "action": "invoke", "target": { "namespace": "nodes", "id": "runtime" }, "operations": ["run"] },
+    { "principal": { "namespace": "operators", "id": "local" }, "action": "abort", "target": { "namespace": "nodes", "id": "runtime" }, "operations": ["run"] }
+  ]
+}
+```
+
 설정 파일 없이 시작해 `nodes.register`로 구성할 수도 있습니다. 기본 HTTP 주소는 `http://127.0.0.1:7350`, MCP 주소는 `/mcp`입니다. CLI·HTTP·MCP는 같은 command registry를 사용합니다.
 
 ```sh

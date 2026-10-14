@@ -12,6 +12,7 @@ import (
 
 	"github.com/roster-framework/roster-server/core/internal/adapters/memory"
 	"github.com/roster-framework/roster-server/core/internal/adapters/schema"
+	"github.com/roster-framework/roster-server/core/internal/authority"
 	"github.com/roster-framework/roster-server/core/internal/catalog"
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
 	"github.com/roster-framework/roster-server/core/internal/event"
@@ -28,6 +29,72 @@ func fault(t *testing.T, err error, code string) {
 }
 func execution(state c.State) c.Snapshot[c.Execution] {
 	return c.Snapshot[c.Execution]{Subject: c.Ref{Namespace: "calls", ID: "call"}, Revision: 7, Value: c.Execution{Call: c.Call{ID: "call"}, Lifecycle: c.Lifecycle{State: state}}}
+}
+
+func directOrigin() c.AdmissionOrigin {
+	local := c.Ref{Namespace: "operators", ID: "local"}
+	return c.AdmissionOrigin{Root: local, Actor: local, Kind: c.OriginDirect}
+}
+
+func sourceOrigin(id string) c.AdmissionOrigin {
+	node := c.Ref{Namespace: "nodes", ID: id}
+	return c.AdmissionOrigin{Root: node, Actor: node, Kind: c.OriginSource}
+}
+
+func fixtureAuthority(t *testing.T) c.Authority {
+	t.Helper()
+	node := authority.Principal{Namespace: "nodes", ID: "node"}
+	local := authority.Principal{Namespace: "operators", ID: "local"}
+	policy, err := authority.New([]authority.Grant{
+		{Principal: local, Action: "invoke", Target: node, Operations: []string{"run"}},
+		{Principal: node, Action: "invoke", Target: node, Operations: []string{"run"}},
+		{Principal: local, Action: "abort", Target: node, Operations: []string{"run"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return policy
+}
+
+func TestAuthorityPolicyIsStrictAndRequiresRootAndActor(t *testing.T) {
+	valid := `{"schema":"roster-authority/1","grants":[{"principal":{"namespace":"operators","id":"local"},"action":"invoke","target":{"namespace":"nodes","id":"target"},"operations":["run"]},{"principal":{"namespace":"nodes","id":"emitter"},"action":"invoke","target":{"namespace":"nodes","id":"target"},"operations":["run"]}]}`
+	policy, err := authority.Parse([]byte(valid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := c.Ref{Namespace: "nodes", ID: "target"}
+	origin := c.AdmissionOrigin{Root: c.Ref{Namespace: "operators", ID: "local"}, Actor: c.Ref{Namespace: "nodes", ID: "emitter"}, Kind: c.OriginResult, ParentCallID: "call"}
+	if err := policy.Authorize(origin, "invoke", target, "run"); err != nil {
+		t.Fatalf("exact root and emitter grants rejected: %v", err)
+	}
+	denied, err := authority.Parse([]byte(`{"schema":"roster-authority/1","grants":[{"principal":{"namespace":"operators","id":"local"},"action":"invoke","target":{"namespace":"nodes","id":"target"},"operations":["run"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := denied.Authorize(origin, "invoke", target, "run"); c.AsFault(err).Code != "forbidden" {
+		t.Fatalf("missing immediate emitter grant was allowed: %v", err)
+	}
+	for _, malformed := range []string{
+		`{"schema":"roster-authority/1","schema":"roster-authority/1","grants":[]}`,
+		`{"schema":"roster-authority/1","grants":[{"principal":{"namespace":"operators","id":"local","id":"other"},"action":"invoke","target":{"namespace":"nodes","id":"target"},"operations":["run"]}]}`,
+		`{"schema":"roster-authority/1","grants":[{"principal":{"namespace":"operators","id":"*"},"action":"invoke","target":{"namespace":"nodes","id":"target"},"operations":["run"]}]}`,
+		`{"schema":"roster-authority/1","grants":[],"extra":true}`,
+	} {
+		if _, err := authority.Parse([]byte(malformed)); err == nil {
+			t.Fatalf("malformed policy accepted: %s", malformed)
+		}
+	}
+	if err := authority.Empty().Authorize(directOrigin(), "invoke", target, "run"); c.AsFault(err).Code != "forbidden" {
+		t.Fatalf("empty policy did not fail closed: %v", err)
+	}
+	owner, otherOwner := &struct{ id string }{"current"}, &struct{ id string }{"other"}
+	shutdown := policy.ShutdownCapability(owner)
+	if err := shutdown.AuthorizeAbort(owner, target, "run"); err != nil {
+		t.Fatalf("instance shutdown capability rejected its owner: %v", err)
+	}
+	if err := shutdown.AuthorizeAbort(otherOwner, target, "run"); c.AsFault(err).Code != "forbidden" {
+		t.Fatalf("shutdown capability authorized another invocation instance: %v", err)
+	}
 }
 
 func TestLifecycleEvidenceAndRevision(t *testing.T) {
@@ -340,7 +407,7 @@ func TestInvocationConcurrentDuplicateSubmission(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 16 {
 		wg.Go(func() {
-			_, err := s.SubmitBatch([]c.Call{call("same")})
+			_, err := s.SubmitBatch(directOrigin(), []c.Call{call("same")})
 			if err == nil {
 				accepted.Add(1)
 			} else if c.AsFault(err).Code != "conflict" {
@@ -386,7 +453,8 @@ func fixture(t *testing.T, f *fakeConnector) (*catalog.Service, *invocation.Serv
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{"secret":"private"}`)}); err != nil {
 		t.Fatal(err)
 	}
-	calls := invocation.New(memory.NewExecutions(32, 32), cat, j)
+	auth := fixtureAuthority(t)
+	calls := invocation.New(memory.NewExecutions(32, 32), cat, j, auth)
 	drainer := event.New(memory.NewStore[c.Subscription](32), cat, calls, j)
 	drainCtx, stopDrain := context.WithCancel(context.Background())
 	wake := make(chan struct{}, 1)
@@ -420,6 +488,40 @@ func fixture(t *testing.T, f *fakeConnector) (*catalog.Service, *invocation.Serv
 func call(id string) c.Call {
 	return c.Call{ID: id, Target: c.Ref{Namespace: "nodes", ID: "node"}, Operation: "run", Input: c.Data{"text": "hello"}}
 }
+
+func TestHostShutdownUsesInstanceCapabilityWithoutAbortGrant(t *testing.T) {
+	f := &fakeConnector{}
+	if f.descriptor.Operations == nil {
+		f.descriptor = c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}`), OutputSchema: json.RawMessage(`{"type":"object"}`), Capabilities: c.Capabilities{Abort: true, Inspect: true}}}}
+	}
+	journal := observation.New(100)
+	cat := catalog.New(memory.NewStore[c.Node](8), map[string]c.Connector{"fake": f}, schema.New(), journal)
+	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := authority.New([]authority.Grant{{Principal: authority.Principal{Namespace: "operators", ID: "local"}, Action: "invoke", Target: authority.Principal{Namespace: "nodes", ID: "node"}, Operations: []string{"run"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := memory.NewExecutions(8, 8)
+	calls := invocation.New(store, cat, journal, policy)
+	if _, err := calls.SubmitBatch(directOrigin(), []c.Call{call("shutdown-queued")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := calls.Abort(context.Background(), "shutdown-queued", "human abort", nil); c.AsFault(err).Code != "forbidden" {
+		t.Fatalf("ordinary Abort unexpectedly allowed without grant: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := calls.Close(ctx); err != nil {
+		t.Fatalf("host shutdown should cancel its queued Call: %v", err)
+	}
+	snap, err := calls.Get("shutdown-queued")
+	if err != nil || snap.Value.Lifecycle.State != c.Cancelled {
+		t.Fatalf("queued Call was not canceled through host control: state=%s err=%v", snap.Value.Lifecycle.State, err)
+	}
+}
+
 func waitState(t *testing.T, s *invocation.Service, id string, want c.State) c.Snapshot[c.Execution] {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -466,10 +568,22 @@ func TestCatalogPrivateBindingAndDeclaredSchema(t *testing.T) {
 	fault(t, err, "conflict")
 	bad := call("invalid")
 	bad.Input = c.Data{"text": 3}
-	_, err = s.SubmitBatch([]c.Call{call("valid"), bad})
+	_, err = s.SubmitBatch(directOrigin(), []c.Call{call("valid"), bad})
 	fault(t, err, "invalid_input")
 	if len(s.List()) != 0 {
 		t.Fatal("schema-invalid batch partially accepted")
+	}
+	foreignTarget := call("foreign-target")
+	foreignTarget.Target = c.Ref{Namespace: "nodes", ID: "other"}
+	_, err = s.SubmitBatch(directOrigin(), []c.Call{call("valid"), foreignTarget})
+	fault(t, err, "forbidden")
+	if len(s.List()) != 0 {
+		t.Fatal("denied member partially committed a call batch")
+	}
+	_, err = s.SubmitBatch(sourceOrigin("spoofed-source"), []c.Call{call("spoofed-origin")})
+	fault(t, err, "forbidden")
+	if len(s.List()) != 0 {
+		t.Fatal("ungranted source origin was accepted")
 	}
 	page, err := j.Query(observation.Filter{})
 	if err != nil {
@@ -499,10 +613,10 @@ func TestInvocationRemoteOutcomes(t *testing.T) {
 			return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{"done": true}}
 		}}
 		_, s, j := fixture(t, f)
-		if _, err := s.SubmitBatch([]c.Call{call("success"), call("cancel")}); err != nil {
+		if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("success"), call("cancel")}); err != nil {
 			t.Fatal(err)
 		}
-		snap, err := s.Abort(context.Background(), "cancel", "user request")
+		snap, err := s.Abort(context.Background(), "cancel", "user request", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -529,7 +643,7 @@ func TestInvocationRemoteOutcomes(t *testing.T) {
 			return c.Result{CallID: call.ID, State: c.Unknown}
 		}, inspect: func(call c.Call) c.Result { return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{}} }}
 		_, s, _ := fixture(t, f)
-		s.SubmitBatch([]c.Call{call("unknown")})
+		s.SubmitBatch(directOrigin(), []c.Call{call("unknown")})
 		start(t, s)
 		waitState(t, s, "unknown", c.Unknown)
 		snap, err := s.Inspect(context.Background(), "unknown")
@@ -540,7 +654,7 @@ func TestInvocationRemoteOutcomes(t *testing.T) {
 	t.Run("foreign inspect receipt rejected", func(t *testing.T) {
 		f := &fakeConnector{invoke: func(call c.Call, _ c.ReportSink) c.Result { return c.Result{CallID: call.ID, State: c.Unknown} }, inspect: func(c.Call) c.Result { return c.Result{CallID: "other", State: c.Running} }}
 		_, s, _ := fixture(t, f)
-		s.SubmitBatch([]c.Call{call("foreign")})
+		s.SubmitBatch(directOrigin(), []c.Call{call("foreign")})
 		start(t, s)
 		waitState(t, s, "foreign", c.Unknown)
 		snap, err := s.Inspect(context.Background(), "foreign")
@@ -560,20 +674,120 @@ func TestInvocationRemoteOutcomes(t *testing.T) {
 			return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{}}
 		}, abort: func(c.Call) (c.AbortObservation, error) { return c.AbortObservation{Requested: true}, nil }}
 		_, s, _ := fixture(t, f)
-		s.SubmitBatch([]c.Call{call("abort")})
+		s.SubmitBatch(directOrigin(), []c.Call{call("abort")})
 		start(t, s)
 		select {
 		case <-entered:
 		case <-time.After(time.Second):
 			t.Fatal("invoke not started")
 		}
-		snap, err := s.Abort(context.Background(), "abort", "requested")
+		snap, err := s.Abort(context.Background(), "abort", "requested", nil)
 		if err != nil || snap.Value.Lifecycle.State != c.Cancelling {
 			t.Errorf("ACK state %+v %v", snap, err)
 		}
 		close(release)
 		waitState(t, s, "abort", c.Succeeded)
 	})
+}
+
+func TestAbortRevisionCASAndUnknownRejectsNewIntent(t *testing.T) {
+	var aborts atomic.Int32
+	f := &fakeConnector{
+		invoke: func(call c.Call, _ c.ReportSink) c.Result { return c.Result{CallID: call.ID, State: c.Unknown} },
+		abort: func(call c.Call) (c.AbortObservation, error) {
+			aborts.Add(1)
+			return c.AbortObservation{Requested: true}, nil
+		},
+	}
+	_, calls, _ := fixture(t, f)
+	if _, err := calls.SubmitBatch(directOrigin(), []c.Call{call("abort-cas")}); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := calls.Get("abort-cas")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := queued.Revision - 1
+	if _, err := calls.Abort(context.Background(), "abort-cas", "stale", &stale); c.AsFault(err).Code != "conflict" {
+		t.Fatalf("stale control revision was accepted: %v", err)
+	}
+	unchanged, _ := calls.Get("abort-cas")
+	if unchanged.Value.AbortRequested || unchanged.Value.Lifecycle.State != c.Queued || aborts.Load() != 0 {
+		t.Fatalf("stale control changed state or reached connector: %+v aborts=%d", unchanged, aborts.Load())
+	}
+	if _, err := calls.Abort(context.Background(), "abort-cas", "authorized", &queued.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if current, _ := calls.Get("abort-cas"); current.Value.Lifecycle.State != c.Cancelled || aborts.Load() != 0 {
+		t.Fatalf("queued cancellation was not local: %+v aborts=%d", current, aborts.Load())
+	}
+	if _, err := calls.SubmitBatch(directOrigin(), []c.Call{call("unknown-abort")}); err != nil {
+		t.Fatal(err)
+	}
+	start(t, calls)
+	waitState(t, calls, "unknown-abort", c.Unknown)
+	unknown, _ := calls.Get("unknown-abort")
+	if _, err := calls.Abort(context.Background(), "unknown-abort", "do not resend", nil); c.AsFault(err).Code != "conflict" {
+		t.Fatalf("unknown execution accepted a new abort: %v", err)
+	}
+	stillUnknown, _ := calls.Get("unknown-abort")
+	if stillUnknown.Revision != unknown.Revision || stillUnknown.Value.AbortRequested || aborts.Load() != 0 {
+		t.Fatalf("unknown abort changed intent/revision or reached connector: %+v aborts=%d", stillUnknown, aborts.Load())
+	}
+}
+
+func TestConcurrentAbortHasOneRemoteDispatchOwner(t *testing.T) {
+	var aborts atomic.Int32
+	entered := make(chan struct{})
+	releaseInvoke := make(chan struct{})
+	f := &fakeConnector{
+		invoke: func(call c.Call, sink c.ReportSink) c.Result {
+			if err := sink(c.Report{State: c.Running, Evidence: c.Evidence{CallID: call.ID, RemoteID: call.ID, Confirmed: true}}); err != nil {
+				return c.Result{CallID: call.ID, State: c.Unknown, Error: c.AsFault(err)}
+			}
+			close(entered)
+			<-releaseInvoke
+			return c.Result{CallID: call.ID, State: c.Running}
+		},
+		abort: func(c.Call) (c.AbortObservation, error) {
+			aborts.Add(1)
+			return c.AbortObservation{Requested: true}, nil
+		},
+	}
+	_, calls, _ := fixture(t, f)
+	if _, err := calls.SubmitBatch(directOrigin(), []c.Call{call("abort-race")}); err != nil {
+		t.Fatal(err)
+	}
+	start(t, calls)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("invoke did not enter running state")
+	}
+	gate := make(chan struct{})
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-gate
+			_, err := calls.Abort(context.Background(), "abort-race", "requested", nil)
+			errs <- err
+		}()
+	}
+	close(gate)
+	for range 2 {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatalf("concurrent authorized Abort failed: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("concurrent Abort did not return")
+		}
+	}
+	if got := aborts.Load(); got != 1 {
+		t.Fatalf("first-intent ownership dispatched remote Abort %d times", got)
+	}
+	close(releaseInvoke)
 }
 
 func TestTerminalProgressCannotBypassResult(t *testing.T) {
@@ -585,7 +799,7 @@ func TestTerminalProgressCannotBypassResult(t *testing.T) {
 	}}
 	_, s, _ := fixture(t, f)
 	s.OnResult = func(snap c.Snapshot[c.Execution]) { completed <- snap }
-	if _, err := s.SubmitBatch([]c.Call{call("terminal-report")}); err != nil {
+	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("terminal-report")}); err != nil {
 		t.Fatal(err)
 	}
 	start(t, s)
@@ -624,7 +838,7 @@ func TestReportSinkRejectsTerminalResultAndForeignCallIdentity(t *testing.T) {
 		return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{"answer": "actual"}}
 	}}
 	_, s, _ := fixture(t, f)
-	if _, err := s.SubmitBatch([]c.Call{call("sink-boundary")}); err != nil {
+	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("sink-boundary")}); err != nil {
 		t.Fatal(err)
 	}
 	start(t, s)
@@ -705,8 +919,9 @@ func TestPendingTerminalWinsAndRetryDoesNotDeleteReplacement(t *testing.T) {
 	}
 	base := memory.NewExecutions(8, 8)
 	store := &interceptExecutionStore{ExecutionStore: base, failures: map[c.State]int{c.Unknown: 1}, afterNextState: map[c.State]func(){}}
-	s := invocation.New(store, cat, journal)
-	if _, err := s.SubmitBatch([]c.Call{call("pending-priority")}); err != nil {
+	auth := fixtureAuthority(t)
+	s := invocation.New(store, cat, journal, auth)
+	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("pending-priority")}); err != nil {
 		t.Fatal(err)
 	}
 	start(t, s)
@@ -763,11 +978,13 @@ func TestPendingTerminalWinsAndRetryDoesNotDeleteReplacement(t *testing.T) {
 func TestConfirmedWaitingPendingReplacesUnknownResult(t *testing.T) {
 	f := &fakeConnector{
 		descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}`), OutputSchema: json.RawMessage(`{"type":"object"}`), Capabilities: c.Capabilities{Abort: true, Inspect: true}}}, Events: map[string]c.Schema{"complete": json.RawMessage(`{"type":"object"}`)}},
-		invoke:     func(call c.Call, _ c.ReportSink) c.Result { return c.Result{CallID: call.ID, State: c.Unknown} },
-		abort: func(call c.Call) (c.AbortObservation, error) {
-			waiting := c.Result{CallID: call.ID, State: c.Waiting}
-			return c.AbortObservation{Result: &waiting}, nil
+		invoke: func(call c.Call, sink c.ReportSink) c.Result {
+			if err := sink(c.Report{State: c.Running, Evidence: c.Evidence{CallID: call.ID, RemoteID: call.ID, Confirmed: true}}); err != nil {
+				return c.Result{CallID: call.ID, State: c.Unknown, Error: c.AsFault(err)}
+			}
+			return c.Result{CallID: call.ID, State: c.Unknown}
 		},
+		inspect: func(call c.Call) c.Result { return c.Result{CallID: call.ID, State: c.Waiting} },
 	}
 	journal := observation.New(100)
 	cat := catalog.New(memory.NewStore[c.Node](8), map[string]c.Connector{"fake": f}, schema.New(), journal)
@@ -775,8 +992,9 @@ func TestConfirmedWaitingPendingReplacesUnknownResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := &interceptExecutionStore{ExecutionStore: memory.NewExecutions(8, 8), failures: map[c.State]int{c.Unknown: 1, c.Waiting: 1}, afterNextState: map[c.State]func(){}}
-	s := invocation.New(store, cat, journal)
-	if _, err := s.SubmitBatch([]c.Call{call("waiting-priority")}); err != nil {
+	auth := fixtureAuthority(t)
+	s := invocation.New(store, cat, journal, auth)
+	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("waiting-priority")}); err != nil {
 		t.Fatal(err)
 	}
 	start(t, s)
@@ -787,7 +1005,7 @@ func TestConfirmedWaitingPendingReplacesUnknownResult(t *testing.T) {
 	if got := s.PendingObservationCount(); got != 1 {
 		t.Fatalf("unknown invoke result was not retained: pending=%d", got)
 	}
-	if _, err := s.Abort(context.Background(), "waiting-priority", "reconcile"); err != nil {
+	if _, err := s.Inspect(context.Background(), "waiting-priority"); err != nil {
 		t.Fatal(err)
 	}
 	if got := s.PendingObservationCount(); got != 1 {
@@ -805,7 +1023,7 @@ func TestForeignInvokeResultBecomesUnknownInsteadOfStickingDispatching(t *testin
 		return c.Result{CallID: "other-call", State: c.Succeeded, Output: c.Data{"answer": "foreign"}}
 	}}
 	_, s, _ := fixture(t, f)
-	if _, err := s.SubmitBatch([]c.Call{call("foreign-invoke-result")}); err != nil {
+	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("foreign-invoke-result")}); err != nil {
 		t.Fatal(err)
 	}
 	start(t, s)
@@ -828,10 +1046,10 @@ func TestTerminalSinkCanReadAndFanOutReentrantly(t *testing.T) {
 			completed <- err
 			return
 		}
-		_, err := publisher.Publish(emission)
+		_, err := publisher.Publish(emission, directOrigin())
 		completed <- err
 	}
-	if _, err := s.SubmitBatch([]c.Call{call("callback-reentry")}); err != nil {
+	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("callback-reentry")}); err != nil {
 		t.Fatal(err)
 	}
 	start(t, s)
@@ -850,7 +1068,7 @@ func TestNonJSONFailureBecomesUnknownWithoutLockingService(t *testing.T) {
 		return c.Result{CallID: call.ID, State: c.Failed, Output: make(chan int), Error: &c.Fault{Code: "remote_failed", Message: "failed"}}
 	}}
 	_, s, _ := fixture(t, f)
-	if _, err := s.SubmitBatch([]c.Call{call("non-json")}); err != nil {
+	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("non-json")}); err != nil {
 		t.Fatal(err)
 	}
 	start(t, s)
@@ -888,7 +1106,7 @@ func TestControlPanicsBecomeUnknownAndRetainAbortReason(t *testing.T) {
 	}
 	_, s, _ := fixture(t, f)
 	s.OnResult = func(snap c.Snapshot[c.Execution]) { completed <- snap }
-	if _, err := s.SubmitBatch([]c.Call{call("control-panic")}); err != nil {
+	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("control-panic")}); err != nil {
 		t.Fatal(err)
 	}
 	start(t, s)
@@ -904,7 +1122,7 @@ func TestControlPanicsBecomeUnknownAndRetainAbortReason(t *testing.T) {
 			t.Fatalf("control panic lost state or intent: %+v %v", snap, err)
 		}
 	}
-	snap, err := s.Abort(context.Background(), "control-panic", "user cancellation")
+	snap, err := s.Abort(context.Background(), "control-panic", "user cancellation", nil)
 	assertUnknown(snap, err)
 	snap, err = s.Inspect(context.Background(), "control-panic")
 	assertUnknown(snap, err)
@@ -925,7 +1143,7 @@ func TestReconciledRunningReceiptCanBeInspectedUntilCompletion(t *testing.T) {
 		},
 	}
 	_, s, _ := fixture(t, f)
-	if _, err := s.SubmitBatch([]c.Call{call("receipt-progress")}); err != nil {
+	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("receipt-progress")}); err != nil {
 		t.Fatal(err)
 	}
 	start(t, s)

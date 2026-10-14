@@ -15,6 +15,8 @@ type Service struct {
 	mu          sync.Mutex
 	store       c.ExecutionStore
 	catalog     *catalog.Service
+	authority   c.Authority
+	shutdown    c.HostShutdownCapability
 	journal     c.Journal
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -28,8 +30,12 @@ type Service struct {
 
 var _ c.Caller = (*Service)(nil)
 
-func New(store c.ExecutionStore, cat *catalog.Service, j c.Journal) *Service {
-	return &Service{store: store, catalog: cat, journal: j, pending: map[string]c.Report{}}
+func New(store c.ExecutionStore, cat *catalog.Service, j c.Journal, auth c.Authority) *Service {
+	s := &Service{store: store, catalog: cat, authority: auth, journal: j, pending: map[string]c.Report{}}
+	if auth != nil {
+		s.shutdown = auth.ShutdownCapability(s)
+	}
+	return s
 }
 func (s *Service) Start(ctx context.Context, workers int) {
 	s.ctx, s.cancel = context.WithCancel(ctx)
@@ -65,7 +71,18 @@ func (s *Service) LocalStopped() bool {
 	}
 }
 func ref(id string) c.Ref { return c.Ref{Namespace: "calls", ID: id} }
-func (s *Service) SubmitBatch(calls []c.Call) ([]c.Snapshot[c.Execution], error) {
+func (s *Service) SubmitBatch(origin c.AdmissionOrigin, calls []c.Call) ([]c.Snapshot[c.Execution], error) {
+	if len(calls) == 0 {
+		return []c.Snapshot[c.Execution]{}, nil
+	}
+	if s.authority == nil || !c.ValidAdmissionOrigin(origin) {
+		return nil, c.Err("forbidden", "Admission is not authorized")
+	}
+	for _, call := range calls {
+		if err := s.authority.Authorize(origin, "invoke", call.Target, call.Operation); err != nil {
+			return nil, c.Err("forbidden", "Admission is not authorized")
+		}
+	}
 	s.mu.Lock()
 	var wake func()
 	committed := false
@@ -119,7 +136,7 @@ func (s *Service) SubmitBatch(calls []c.Call) ([]c.Snapshot[c.Execution], error)
 		if _, _, err = s.catalog.Validate(call.Target, call.Operation, call.Input); err != nil {
 			return nil, err
 		}
-		data := c.Execution{Call: call, Lifecycle: c.Lifecycle{State: c.Created, UpdatedAt: c.Now()}}
+		data := c.Execution{Call: call, Origin: origin, Lifecycle: c.Lifecycle{State: c.Created, UpdatedAt: c.Now()}}
 		created := lifecycle.Create(ref(call.ID), data, "received")
 		changes = append(changes, created)
 		snap := c.Snapshot[c.Execution]{Subject: created.Subject, Revision: created.AfterRevision, Value: created.After}
@@ -276,6 +293,10 @@ func (s *Service) normalizeResult(id string, result c.Result, allowProgress bool
 }
 
 func (s *Service) applyReport(r c.Report) error {
+	return s.applyReportAt(r, nil)
+}
+
+func (s *Service) applyReportAt(r c.Report, expectedRevision *uint64) error {
 	id := r.Evidence.CallID
 	if id == "" {
 		return c.Err("invalid_input", "Report has no Call ID")
@@ -298,7 +319,24 @@ func (s *Service) applyReport(r c.Report) error {
 		if err != nil {
 			return err
 		}
+		if expectedRevision != nil && old.Revision != *expectedRevision {
+			return c.Err("conflict", "Execution revision conflict")
+		}
 		obs := lifecycle.Observe(old, r)
+		if len(obs.Deliveries) > 0 && old.Value.Origin != (c.AdmissionOrigin{}) {
+			origin := old.Value.Origin
+			origin.Actor = old.Value.Call.Target
+			origin.Kind = c.OriginResult
+			origin.ParentCallID = old.Value.Call.ID
+			origin.ParentEventID = ""
+			for i := range obs.Deliveries {
+				delivery := &obs.Deliveries[i]
+				if delivery.Event != nil && delivery.Event.Category == "published" && delivery.Event.CallID == old.Value.Call.ID {
+					copy := origin
+					delivery.Origin = &copy
+				}
+			}
+		}
 		if obs.Err != nil {
 			resultErr = obs.Err
 		}
@@ -326,6 +364,9 @@ func (s *Service) applyReport(r c.Report) error {
 				s.savePending(r)
 			}
 			return err
+		}
+		if expectedRevision != nil {
+			return c.Err("conflict", "Execution revision conflict")
 		}
 		resultErr = err
 	}
@@ -495,21 +536,59 @@ func (s *Service) failPanic(id string) {
 	s.mu.Unlock()
 	s.finish(id, c.Result{CallID: id, State: c.Unknown, Error: &c.Fault{Code: "connector_panic", Message: "Connector execution interrupted"}})
 }
-func (s *Service) Abort(ctx context.Context, id, reason string) (c.Snapshot[c.Execution], error) {
+func (s *Service) Abort(ctx context.Context, id, reason string, expectedRevision *uint64) (c.Snapshot[c.Execution], error) {
+	return s.abort(ctx, id, reason, expectedRevision, false)
+}
+
+func (s *Service) abort(ctx context.Context, id, reason string, expectedRevision *uint64, hostShutdown bool) (c.Snapshot[c.Execution], error) {
 	if reason == "" || len(reason) > 500 {
 		return c.Snapshot[c.Execution]{}, c.Err("invalid_input", "A bounded cancellation reason is required")
+	}
+	if expectedRevision != nil && *expectedRevision == 0 {
+		return c.Snapshot[c.Execution]{}, c.Err("invalid_input", "Expected revision must be positive")
 	}
 	old, err := s.store.Get(ref(id))
 	if err != nil {
 		return old, err
 	}
+	local := c.Ref{Namespace: "operators", ID: "local"}
+	origin := c.AdmissionOrigin{Root: local, Actor: local, Kind: c.OriginDirect}
+	var authErr error
+	if hostShutdown {
+		if s.shutdown == nil {
+			authErr = c.Err("forbidden", "Admission is not authorized")
+		} else {
+			authErr = s.shutdown.AuthorizeAbort(s, old.Value.Call.Target, old.Value.Call.Operation)
+		}
+	} else if s.authority == nil {
+		authErr = c.Err("forbidden", "Admission is not authorized")
+	} else {
+		authErr = s.authority.Authorize(origin, "abort", old.Value.Call.Target, old.Value.Call.Operation)
+	}
+	if authErr != nil {
+		return c.Snapshot[c.Execution]{}, c.Err("forbidden", "Admission is not authorized")
+	}
+	if expectedRevision != nil && old.Revision != *expectedRevision {
+		return old, c.Err("conflict", "Execution revision conflict")
+	}
 	state := old.Value.Lifecycle.State
+	if state == c.Unknown {
+		return old, c.Err("conflict", "Reconcile unknown execution before cancelling")
+	}
 	if state.Terminal() {
 		return old, nil
 	}
+	if state == c.Cancelling {
+		return old, nil
+	}
 	if state == c.Created || state == c.Validating || state == c.Queued || state == c.Preparing {
-		err = s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Cancelled, Payload: c.Data{"reason": reason}})
+		err = s.applyReportAt(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Cancelled, Payload: c.Data{"reason": reason}}, &old.Revision)
 		if err != nil {
+			if expectedRevision == nil {
+				if current, getErr := s.Get(id); getErr == nil && (current.Value.Lifecycle.State.Terminal() || current.Value.Lifecycle.State == c.Cancelling) {
+					return current, nil
+				}
+			}
 			return old, err
 		}
 		return s.Get(id)
@@ -519,18 +598,21 @@ func (s *Service) Abort(ctx context.Context, id, reason string) (c.Snapshot[c.Ex
 	if !op.Capabilities.Abort {
 		return old, c.Err("unsupported", "Node does not support remote cancellation")
 	}
-	if state == c.Unknown {
-		return old, c.Err("conflict", "Reconcile unknown execution before cancelling")
-	}
-	if state != c.Cancelling {
-		err = s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Cancelling, Payload: c.Data{"reason": reason}})
-	}
+	err = s.applyReportAt(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Cancelling, Payload: c.Data{"reason": reason}}, &old.Revision)
 	if err != nil {
+		if expectedRevision == nil {
+			if current, getErr := s.Get(id); getErr == nil && (current.Value.Lifecycle.State.Terminal() || current.Value.Lifecycle.State == c.Cancelling) {
+				return current, nil
+			}
+		}
 		return old, err
 	}
 	old, err = s.Get(id)
 	if err != nil {
 		return old, err
+	}
+	if old.Value.Lifecycle.State.Terminal() || old.Value.Lifecycle.State != c.Cancelling {
+		return old, nil
 	}
 	obs, e := safeAbort(ctx, s.catalog.Connector(n.ConnectorID), n, old.Value.Call)
 	if e != nil {
@@ -602,7 +684,7 @@ func (s *Service) Close(ctx context.Context) error {
 	for _, snap := range s.List() {
 		state := snap.Value.Lifecycle.State
 		if state == c.Created || state == c.Validating || state == c.Queued || state == c.Preparing {
-			_, _ = s.Abort(ctx, snap.Value.Call.ID, "host_shutdown")
+			_, _ = s.abort(ctx, snap.Value.Call.ID, "host_shutdown", nil, true)
 		}
 	}
 	drain := time.NewTimer(4 * time.Second)
@@ -633,7 +715,7 @@ draining:
 	for _, snap := range s.List() {
 		state := snap.Value.Lifecycle.State
 		if !state.Terminal() && state != c.Waiting && state != c.Unknown {
-			_, _ = s.Abort(ctx, snap.Value.Call.ID, "host_shutdown")
+			_, _ = s.abort(ctx, snap.Value.Call.ID, "host_shutdown", nil, true)
 		}
 	}
 	if s.cancel != nil {

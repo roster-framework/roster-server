@@ -64,6 +64,7 @@ export interface SubscriptionCreateInput {
   input: { values?: Record<string, unknown>; pointers?: Record<string, string> };
 }
 export interface SubscriptionRemoveInput { id: string; expected_revision: number }
+export interface CallAbortInput { id: string; expected_revision: number; expected_instance_id: string }
 export class MutationInputError extends Error { constructor(readonly code: string) { super(code); } }
 export interface SafeConversation {
   id: string; revision: number; closed: boolean;
@@ -322,6 +323,13 @@ export function parseSubscriptionRemoveInput(value: unknown): SubscriptionRemove
   const row = mutationRecord(value); mutationKeys(row, ["id", "expected_revision"]);
   if (typeof row.expected_revision !== "number" || !Number.isSafeInteger(row.expected_revision) || row.expected_revision <= 0) throw new MutationInputError("invalid_mutation");
   return { id: mutationId(row.id), expected_revision: row.expected_revision };
+}
+
+export function parseCallAbortInput(value: unknown): CallAbortInput {
+  const input = mutationRecord(value);
+  mutationKeys(input, ["id", "expected_revision", "expected_instance_id"]);
+  if (typeof input.expected_revision !== "number" || !Number.isSafeInteger(input.expected_revision) || input.expected_revision <= 0) throw new MutationInputError("invalid_mutation");
+  return { id: mutationId(input.id), expected_revision: input.expected_revision, expected_instance_id: mutationId(input.expected_instance_id) };
 }
 
 function state(value: unknown): CallState {
@@ -696,6 +704,19 @@ export function validDashboardRequest(input: {
 
 export function mutationResponseIsCurrent(actionGeneration: number, currentGeneration: number, actionInstanceId: string, currentInstanceId: string): boolean {
   return actionGeneration === currentGeneration && actionInstanceId === currentInstanceId;
+}
+
+export function canRequestCallAbort(call: SafeCall | null, fresh: boolean, instanceChanged: boolean, outcomeUnrefreshed = false): boolean {
+  if (!call || !fresh || instanceChanged || outcomeUnrefreshed) return false;
+  return !["unknown", "cancelling", "succeeded", "failed", "cancelled", "expired", "rejected"].includes(call.lifecycle.state);
+}
+
+export function isDefiniteAbortRejection(status: number, resultStatus?: string): boolean {
+  return resultStatus === "rejected" || [400, 403, 404, 408, 409, 413, 415, 422, 429].includes(status);
+}
+
+export function abortObservationChanged(attempt: { revision: number; state: string }, observed: SafeCall | null): boolean {
+  return observed !== null && (observed.revision !== attempt.revision || observed.lifecycle.state !== attempt.state);
 }
 
 export function subscriptionCanvasExtent(viewportWidth: number, viewportHeight: number, cardBounds: Array<{ right: number; bottom: number }>, paddingRight: number, paddingBottom: number): { width: number; height: number } {

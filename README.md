@@ -34,7 +34,7 @@ Build the Core binary from `core/` with `go build -o roster-core.exe ./cmd/roste
 node scripts/launch.mjs --config ../local-config/server.json
 ```
 
-The config uses `schema: "roster-launch/1"`, `data_root`, `env_file`, `core_binary`, and `dashboard_entry` (the absolute path to `dashboard/build/src/gateway.js`). The env file has the shape `{ "env": {} }` for an empty Core. If importing Nodes that use credentials, allowlist the Core token environment names with `core_token_env`; keep values in the external env file. Core and dashboard bind to loopback ports 7350 and 7360. The launcher checks readiness, owns only its child processes, and keeps data and locks outside Git. Grouped startup and shutdown are verified in Linux Docker; native Windows ACL and signal behavior remain unverified.
+The config uses `schema: "roster-launch/1"`, `data_root`, `env_file`, `core_binary`, and `dashboard_entry` (the absolute path to `dashboard/build/src/gateway.js`). Add optional `authority_file` to point to an owner-only policy JSON outside the repository; the launcher passes its path to Core. The env file has the shape `{ "env": {} }` for an empty Core. If importing Nodes that use credentials, allowlist the Core token environment names with `core_token_env`; keep values in the external env file. Core and dashboard bind to loopback ports 7350 and 7360. The launcher checks readiness, owns only its child processes, and keeps data and locks outside Git. Grouped startup and shutdown are verified in Linux Docker; native Windows ACL and signal behavior remain unverified.
 
 ## Inspect Nodes and Calls
 
@@ -47,7 +47,19 @@ printf '%s\n' '{}' | go run ./cmd/roster nodes.list --file -
 
 Start [Roster Node Client](https://github.com/roster-framework/roster-node-client) before registering its Runtime or Resource Node. Use `nodes.register` or a local Core configuration. `core/examples/local-stack.json` is a fixture: set Node IDs, target IDs, provider URLs, and `token_env` names for your environment. Put credential values in the Core process environment, never in a Node binding, manifest, or Git.
 
-Calls use `calls.submit`, `calls.get`, `calls.list`, `calls.inspect`, and `calls.abort`. A disconnect or timeout can leave a Call `unknown`; inspect the same receipt before deciding what to do. Registering a provider does not prove it is reachable. A subscription declaration configures future event routing but does not prove delivery. Verify the Event receipt and resulting Call evidence in Core logs. Removing a subscription does not cancel existing Calls.
+Calls use `calls.submit`, `calls.get`, `calls.list`, `calls.inspect`, and `calls.abort`. Core starts with an empty, fail-closed call policy when `--authority`/`authority_file` is omitted: readiness and reads work, while Call submission and human Abort are denied. Grant only exact principals, Nodes, actions, and operations. A minimal local grant looks like:
+
+```json
+{
+  "schema": "roster-authority/1",
+  "grants": [
+    { "principal": { "namespace": "operators", "id": "local" }, "action": "invoke", "target": { "namespace": "nodes", "id": "runtime" }, "operations": ["run"] },
+    { "principal": { "namespace": "operators", "id": "local" }, "action": "abort", "target": { "namespace": "nodes", "id": "runtime" }, "operations": ["run"] }
+  ]
+}
+```
+
+This policy file contains no credentials. A disconnect or timeout can leave a Call `unknown`; inspect the same receipt before deciding what to do. Registering a provider does not prove it is reachable. A subscription declaration configures future event routing but does not prove delivery. Verify the Event receipt and resulting Call evidence in Core logs. Removing a subscription does not cancel existing Calls.
 
 ## Import a community bundle
 

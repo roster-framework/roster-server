@@ -7,6 +7,7 @@ import (
 	resourceadapter "github.com/roster-framework/roster-server/core/internal/adapters/resource"
 	runtimeadapter "github.com/roster-framework/roster-server/core/internal/adapters/runtime"
 	"github.com/roster-framework/roster-server/core/internal/adapters/schema"
+	"github.com/roster-framework/roster-server/core/internal/authority"
 	"github.com/roster-framework/roster-server/core/internal/catalog"
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
 	"github.com/roster-framework/roster-server/core/internal/conversation"
@@ -59,6 +60,7 @@ type Options struct {
 	Connectors map[string]c.Connector
 	Workers    int
 	Lookup     func(string) string
+	Authority  c.Authority
 }
 
 func New(ctx context.Context, opts Options) (*Core, error) {
@@ -73,7 +75,11 @@ func New(ctx context.Context, opts Options) (*Core, error) {
 	}
 	j := observation.New(5000)
 	cat := catalog.New(memory.NewStore[c.Node](256), connectors, schema.New(), j)
-	calls := invocation.New(memory.NewExecutions(1000, 256), cat, j)
+	auth := opts.Authority
+	if auth == nil {
+		auth = authority.Empty()
+	}
+	calls := invocation.New(memory.NewExecutions(1000, 256), cat, j, auth)
 	events := event.New(memory.NewStore[c.Subscription](512), cat, calls, j)
 	conv := conversation.New(memory.NewStore[c.Conversation](128), cat, calls, j)
 	instanceID := c.ID(strconv.FormatInt(time.Now().UnixNano(), 10), "core")
@@ -119,7 +125,9 @@ func New(ctx context.Context, opts Options) (*Core, error) {
 					return enterErr
 				}
 				defer release()
-				_, e := events.Publish(c.Event{ID: c.ID(node.ID, in.ID), Source: c.Ref{Namespace: "nodes", ID: node.ID}, Name: in.Name, Category: "published", OccurredAt: in.At, CorrelationID: c.ID(node.ID, in.ID), Payload: in.Payload})
+				nodeRef := c.Ref{Namespace: "nodes", ID: node.ID}
+				origin := c.AdmissionOrigin{Root: nodeRef, Actor: nodeRef, Kind: c.OriginSource}
+				_, e := events.Publish(c.Event{ID: c.ID(node.ID, in.ID), Source: nodeRef, Name: in.Name, Category: "published", OccurredAt: in.At, CorrelationID: c.ID(node.ID, in.ID), Payload: in.Payload}, origin)
 				return e
 			})
 			if err != nil && sourceContext.Err() == nil {

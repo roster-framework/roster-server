@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/roster-framework/roster-server/core/internal/authority"
 	"github.com/roster-framework/roster-server/core/internal/host"
 	"github.com/roster-framework/roster-server/core/internal/interfaces/cli"
 	"io"
@@ -32,6 +33,7 @@ func run() (runErr error) {
 	f := flag.NewFlagSet("serve", flag.ContinueOnError)
 	listen := f.String("listen", "127.0.0.1:7350", "Local listen address")
 	config := f.String("config", "", "Optional node/subscription/conversation configuration")
+	authorityFile := f.String("authority", "", "Optional immutable call authority policy")
 	if err := f.Parse(os.Args[2:]); err != nil {
 		return err
 	}
@@ -46,7 +48,23 @@ func run() (runErr error) {
 	if hostname != "localhost" && (ip == nil || !ip.IsLoopback()) {
 		return errors.New("this initial core only listens on loopback")
 	}
-	core, err := host.New(context.Background(), host.Options{})
+	var authPolicy *authority.Service
+	if *authorityFile != "" {
+		file, openErr := os.Open(*authorityFile)
+		if openErr != nil {
+			return errors.New("could not read authority policy")
+		}
+		policyBytes, readErr := io.ReadAll(io.LimitReader(file, authority.MaxPolicyBytes+1))
+		closeErr := file.Close()
+		if readErr != nil || closeErr != nil {
+			return errors.New("could not read authority policy")
+		}
+		authPolicy, err = authority.Parse(policyBytes)
+		if err != nil {
+			return errors.New("invalid authority policy")
+		}
+	}
+	core, err := host.New(context.Background(), host.Options{Authority: authPolicy})
 	if err != nil {
 		return err
 	}

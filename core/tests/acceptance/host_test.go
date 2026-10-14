@@ -13,6 +13,7 @@ import (
 	"time"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/roster-framework/roster-server/core/internal/authority"
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
 	"github.com/roster-framework/roster-server/core/internal/conversation"
 	"github.com/roster-framework/roster-server/core/internal/host"
@@ -44,6 +45,8 @@ type drainConnector struct {
 	release     <-chan struct{}
 	resultState c.State
 	once        sync.Once
+	aborted     chan struct{}
+	abortOnce   sync.Once
 }
 
 func (d *drainConnector) Describe(c.Context, json.RawMessage) (c.Descriptor, error) {
@@ -68,13 +71,16 @@ func (d *drainConnector) Invoke(_ c.Context, _ json.RawMessage, call c.Call, _ c
 func (*drainConnector) Inspect(_ c.Context, _ json.RawMessage, call c.Call) c.Result {
 	return c.Result{CallID: call.ID, State: c.Unknown}
 }
-func (*drainConnector) Abort(c.Context, json.RawMessage, c.Call) (c.AbortObservation, error) {
+func (d *drainConnector) Abort(c.Context, json.RawMessage, c.Call) (c.AbortObservation, error) {
+	if d.aborted != nil {
+		d.abortOnce.Do(func() { close(d.aborted) })
+	}
 	return c.AbortObservation{Requested: true}, nil
 }
 
 func newCore(t *testing.T) *host.Core {
 	t.Helper()
-	core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": connector{}}, Workers: 2})
+	core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": connector{}}, Workers: 2, Authority: testAuthority(t, "A", "B")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,6 +97,30 @@ func newCore(t *testing.T) *host.Core {
 		}
 	}
 	return core
+}
+
+func testAuthority(t *testing.T, ids ...string) c.Authority {
+	t.Helper()
+	local := authority.Principal{Namespace: "operators", ID: "local"}
+	principals := []authority.Principal{local}
+	targets := make([]authority.Principal, 0, len(ids))
+	for _, id := range ids {
+		p := authority.Principal{Namespace: "nodes", ID: id}
+		principals = append(principals, p)
+		targets = append(targets, p)
+	}
+	grants := []authority.Grant{}
+	for _, target := range targets {
+		grants = append(grants, authority.Grant{Principal: local, Action: "abort", Target: target, Operations: []string{"run"}})
+		for _, principal := range principals {
+			grants = append(grants, authority.Grant{Principal: principal, Action: "invoke", Target: target, Operations: []string{"run"}})
+		}
+	}
+	policy, err := authority.New(grants)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return policy
 }
 
 func TestIdleCoreCloseIsIdempotentAndObservable(t *testing.T) {
@@ -152,6 +182,63 @@ func TestIdleCoreCloseIsIdempotentAndObservable(t *testing.T) {
 	}
 }
 
+func TestAbortExpectedInstanceMismatchRejectsBeforeConnector(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseCall := func() { releaseOnce.Do(func() { close(release) }) }
+	connector := &drainConnector{entered: make(chan struct{}), release: release, aborted: make(chan struct{})}
+	core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": connector}, Workers: 1, Authority: testAuthority(t, "A")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		releaseCall()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := core.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := core.Catalog.Register(context.Background(), c.Registration{ID: "A", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	local := c.Ref{Namespace: "operators", ID: "local"}
+	if _, err := core.Calls.SubmitBatch(c.AdmissionOrigin{Root: local, Actor: local, Kind: c.OriginDirect}, []c.Call{{ID: "fenced-call", Target: c.Ref{Namespace: "nodes", ID: "A"}, Operation: "run", Input: c.Data{"text": "hello"}}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-connector.entered:
+	case <-time.After(time.Second):
+		t.Fatal("call did not enter connector")
+	}
+	_, emptyErr := core.Commands.Execute(context.Background(), "calls.abort", json.RawMessage(`{"id":"fenced-call","reason":"operator_intervention","expected_instance_id":""}`))
+	if c.AsFault(emptyErr).Code != "invalid" {
+		t.Fatalf("an explicitly empty Core fence must be rejected, got %v", emptyErr)
+	}
+	_, err = core.Commands.Execute(context.Background(), "calls.abort", json.RawMessage(`{"id":"fenced-call","reason":"operator_intervention","expected_revision":1,"expected_instance_id":"different-core"}`))
+	if c.AsFault(err).Code != "conflict" {
+		t.Fatalf("expected instance conflict, got %v", err)
+	}
+	_, err = core.Commands.Execute(context.Background(), "calls.abort", json.RawMessage(`{"id":"fenced-call","reason":"operator_intervention","expected_revision":9007199254740992,"expected_instance_id":"`+core.Status().InstanceID+`"}`))
+	if c.AsFault(err).Code != "invalid" {
+		t.Fatalf("unsafe JavaScript revision must be rejected before connector Abort, got %v", err)
+	}
+	_, err = core.Commands.Execute(context.Background(), "calls.abort", json.RawMessage(`{"id":"fenced-call","reason":"operator_intervention","expected_revision":0,"expected_instance_id":"`+core.Status().InstanceID+`"}`))
+	if c.AsFault(err).Code != "invalid" {
+		t.Fatalf("zero expected revision must be rejected before connector Abort, got %v", err)
+	}
+	select {
+	case <-connector.aborted:
+		t.Fatal("instance mismatch reached connector Abort")
+	default:
+	}
+	releaseCall()
+	eventually(t, func() bool {
+		snapshot, getErr := core.Calls.Get("fenced-call")
+		return getErr == nil && snapshot.Value.Lifecycle.State == c.Succeeded
+	})
+}
+
 func TestParentCancellationClosesAndManualCloseReturnsCachedOutcome(t *testing.T) {
 	parent, cancelParent := context.WithCancel(context.Background())
 	core, err := host.New(parent, host.Options{Workers: 1})
@@ -173,7 +260,7 @@ func TestParentCancellationClosesAndManualCloseReturnsCachedOutcome(t *testing.T
 func TestDrainCompletesAcceptedConversationWithoutNewFanout(t *testing.T) {
 	release := make(chan struct{})
 	drain := &drainConnector{entered: make(chan struct{}), release: release}
-	core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": drain}, Workers: 1})
+	core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": drain}, Workers: 1, Authority: testAuthority(t, "A", "B")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +318,7 @@ func TestDrainPreservesWaitingAndUnknownCallEvidence(t *testing.T) {
 				}
 			})
 			drain := &drainConnector{entered: make(chan struct{}), release: release, resultState: state}
-			core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": drain}, Workers: 1})
+			core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": drain}, Workers: 1, Authority: testAuthority(t, "A")})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -241,13 +328,23 @@ func TestDrainPreservesWaitingAndUnknownCallEvidence(t *testing.T) {
 				}
 			}
 			call := execute[c.Snapshot[c.Execution]](t, core, "calls.submit", c.Call{ID: "unresolved", Target: node("A"), Operation: "run", Input: c.Data{"text": "work"}})
+			for _, public := range []any{
+				call,
+				execute[c.Snapshot[c.Execution]](t, core, "calls.get", host.IDInput{ID: call.Value.Call.ID}),
+				execute[[]c.Snapshot[c.Execution]](t, core, "calls.list", host.CallsFilter{}),
+			} {
+				encoded, err := json.Marshal(public)
+				if err != nil || bytes.Contains(encoded, []byte(`"origin"`)) {
+					t.Fatalf("public Call projection exposed private provenance: %s err=%v", encoded, err)
+				}
+			}
 			select {
 			case <-drain.entered:
 			case <-time.After(time.Second):
 				t.Fatal("call did not enter connector")
 			}
 			if state == c.Waiting {
-				ack, err := core.Calls.Abort(context.Background(), call.Value.Call.ID, "user_abort")
+				ack, err := core.Calls.Abort(context.Background(), call.Value.Call.ID, "user_abort", nil)
 				if err != nil || ack.Value.Lifecycle.State != c.Cancelling {
 					t.Fatalf("abort ACK falsely completed call: %+v %v", ack, err)
 				}
@@ -281,7 +378,7 @@ func TestCloseDeadlineWithUncooperativeConnectorIsBounded(t *testing.T) {
 		}
 	})
 	drain := &drainConnector{entered: make(chan struct{}), release: release}
-	core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": drain}, Workers: 1})
+	core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": drain}, Workers: 1, Authority: testAuthority(t, "A")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +426,7 @@ func TestSecondCloseCallerDeadlineOnlyEndsItsWait(t *testing.T) {
 		}
 	})
 	drain := &drainConnector{entered: make(chan struct{}), release: release}
-	core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": drain}, Workers: 1})
+	core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": drain}, Workers: 1, Authority: testAuthority(t, "A")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +510,14 @@ func TestNodeEventUsesCommonQueueAndJournal(t *testing.T) {
 	core := newCore(t)
 	sub := c.Subscription{ID: "A-to-B", Source: node("A"), Event: "complete", Target: node("B"), Operation: "run", Input: c.InputTemplate{Values: c.Data{}, Pointers: map[string]string{"text": "/summary"}}}
 	execute[c.Snapshot[c.Subscription]](t, core, "subscriptions.create", sub)
-	execute[c.Snapshot[c.Execution]](t, core, "calls.submit", c.Call{ID: "initial", Target: node("A"), Operation: "run", Input: c.Data{"text": "start"}, CorrelationID: "flow"})
+	submitted := execute[c.Snapshot[c.Execution]](t, core, "calls.submit", c.Call{ID: "initial", Target: node("A"), Operation: "run", Input: c.Data{"text": "start"}, CorrelationID: "flow"})
+	if submitted.Value.Origin != (c.AdmissionOrigin{}) {
+		t.Fatalf("public submit response exposed private provenance: %+v", submitted.Value.Origin)
+	}
+	initial, err := core.Calls.Get("initial")
+	if err != nil || initial.Value.Origin.Root != (c.Ref{Namespace: "operators", ID: "local"}) || initial.Value.Origin.Actor != initial.Value.Origin.Root {
+		t.Fatalf("direct call provenance was not stored: %+v %v", initial.Value.Origin, err)
+	}
 	derived := c.ID(c.ID("initial", "0", "complete"), sub.ID)
 	eventually(t, func() bool {
 		snap, err := core.Calls.Get(derived)
@@ -422,6 +526,9 @@ func TestNodeEventUsesCommonQueueAndJournal(t *testing.T) {
 	downstream, _ := core.Calls.Get(derived)
 	if downstream.Value.Call.Target != node("B") || downstream.Value.Call.Input["text"] != "from A" || downstream.Value.Call.CorrelationID != "flow" {
 		t.Fatalf("invalid downstream call %+v", downstream)
+	}
+	if downstream.Value.Origin.Root != (c.Ref{Namespace: "operators", ID: "local"}) || downstream.Value.Origin.Actor != node("A") || downstream.Value.Origin.Kind != c.OriginSubscription || downstream.Value.Origin.ParentEventID == "" {
+		t.Fatalf("result-to-subscription provenance was not preserved: %+v", downstream.Value.Origin)
 	}
 	page := execute[observation.Page](t, core, "logs.query", observation.Filter{CorrelationID: "flow"})
 	seenA, seenB, published := false, false, false

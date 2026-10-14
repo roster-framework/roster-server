@@ -29,6 +29,7 @@ type Emission struct {
 }
 type Execution struct {
 	Call           Call              `json:"call"`
+	Origin         AdmissionOrigin   `json:"origin,omitzero"`
 	Lifecycle      Lifecycle         `json:"lifecycle"`
 	Result         *Result           `json:"result,omitempty"`
 	AbortRequested bool              `json:"abort_requested"`
@@ -90,7 +91,7 @@ type Validator interface {
 	Validate(Schema, any) error
 }
 type Caller interface {
-	SubmitBatch([]Call) ([]Snapshot[Execution], error)
+	SubmitBatch(AdmissionOrigin, []Call) ([]Snapshot[Execution], error)
 	Get(string) (Snapshot[Execution], error)
 }
 type ExecutionStore interface {
@@ -102,6 +103,7 @@ type ExecutionStore interface {
 }
 type Delivery struct {
 	ID        string               `json:"id"`
+	Origin    *AdmissionOrigin     `json:"origin,omitempty"`
 	Event     *Event               `json:"event,omitempty"`
 	Execution *Snapshot[Execution] `json:"execution,omitempty"`
 }
@@ -120,5 +122,7 @@ type EventRecorder interface {
 	Record(Event) error
 	Release(id string)
 }
-type Publisher interface{ Publish(Event) ([]string, error) }
+type Publisher interface {
+	Publish(Event, AdmissionOrigin) ([]string, error)
+}
 type Journal interface{ Append(Event) }

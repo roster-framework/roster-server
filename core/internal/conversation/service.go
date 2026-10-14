@@ -98,9 +98,12 @@ func (s *Service) Get(id string, after, limit int) (View, error) {
 	end := min(after+limit, len(messages))
 	return View{conv, c.Clone(messages[after:end]), end}, nil
 }
-func (s *Service) Send(req c.SendMessage) (c.Message, error) {
+func (s *Service) Send(req c.SendMessage, origin c.AdmissionOrigin) (c.Message, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !c.ValidAdmissionOrigin(origin) || origin.Root != (c.Ref{Namespace: "operators", ID: "local"}) || origin.Actor != origin.Root {
+		return c.Message{}, c.Err("forbidden", "Admission is not authorized")
+	}
 	if !c.ValidID(req.MessageID) || len(req.Text) == 0 || len(req.Text) > 16384 || len(req.Recipients) > 32 {
 		return c.Message{}, c.Err("invalid_input", "Invalid message")
 	}
@@ -175,7 +178,11 @@ func (s *Service) Send(req c.SendMessage) (c.Message, error) {
 	if len(s.messages[req.ID])+s.reserved[req.ID]+1+len(calls) > 500 {
 		return c.Message{}, c.Err("busy", "Conversation message capacity exhausted")
 	}
-	if _, err = s.caller.SubmitBatch(calls); err != nil {
+	conversationOrigin := origin
+	conversationOrigin.Kind = c.OriginConversation
+	conversationOrigin.ParentCallID = ""
+	conversationOrigin.ParentEventID = req.MessageID
+	if _, err = s.caller.SubmitBatch(conversationOrigin, calls); err != nil {
 		return c.Message{}, err
 	}
 	m := c.Message{ID: req.MessageID, Author: req.Author, Recipients: c.Clone(req.Recipients), Text: req.Text, Attachments: c.Clone(req.Attachments), ReplyTo: req.ReplyTo, CallIDs: ids, At: c.Now()}

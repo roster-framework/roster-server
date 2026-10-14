@@ -93,6 +93,8 @@ func WriteFault(w http.ResponseWriter, err error) {
 		status = 400
 	case "not_found":
 		status = 404
+	case "forbidden":
+		status = http.StatusForbidden
 	case "conflict":
 		status = 409
 	case "busy":

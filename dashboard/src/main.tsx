@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { confirmedCoreDisplayState, continuousCallTransitionPairs, coreInstanceChanged, hasContinuousJournal, keepHighestCallRevisions, mergeJournalEvidence, mutationResponseIsCurrent, subscriptionCanvasExtent, type CallsResponse, type LogsResponse, type OverviewResponse, type SafeCall, type SafeConversation, type SafeLogEntry, type SafeNodeDetail, type SafeRelation } from "./projection.js";
+import { abortObservationChanged, canRequestCallAbort, confirmedCoreDisplayState, continuousCallTransitionPairs, coreInstanceChanged, hasContinuousJournal, isDefiniteAbortRejection, keepHighestCallRevisions, mergeJournalEvidence, mutationResponseIsCurrent, subscriptionCanvasExtent, type CallsResponse, type LogsResponse, type OverviewResponse, type SafeCall, type SafeConversation, type SafeLogEntry, type SafeNodeDetail, type SafeRelation } from "./projection.js";
 import "./styles.css";
 
 type Page = "home" | "calls" | "relations";
@@ -63,6 +63,8 @@ function timeLabel(value: number | null): string {
 type RelationSelection = { kind: "node" | "call" | "conversation" | "event" | "subscription"; id: string } | null;
 type SubscriptionDraft = { id: string; source?: { id: string; event: string }; target?: { id: string; operation: string } };
 type MutationStatus = { phase: "idle" | "draft" | "sending" | "applied" | "rejected" | "unconfirmed" | "invalid"; message: string };
+type AbortDraft = { id: string; revision: number; instanceId: string } | null;
+type AbortStatus = { phase: "idle" | "sending" | "confirmed" | "rejected" | "unconfirmed"; message: string };
 
 function RelationsView({ visible, instanceId, instanceChanged, openCalls }: { visible: boolean; instanceId: string; instanceChanged: boolean; openCalls: () => void }) {
   const [selected, setSelected] = useState<RelationSelection>(null);
@@ -374,6 +376,19 @@ function App() {
   const [stateFilter, setStateFilter] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [callsRefresh, setCallsRefresh] = useState(0);
+  const [abortDraft, setAbortDraft] = useState<AbortDraft>(null);
+  const [abortStatus, setAbortStatus] = useState<AbortStatus>({ phase: "idle", message: "" });
+  const [abortSending, setAbortSending] = useState(false);
+  const abortGeneration = useRef(0);
+  const abortAttempts = useRef(new Map<string, { id: string; instanceId: string; revision: number; state: string }>());
+  const abortInFlight = useRef(new Set<string>());
+  const [abortAttemptEpoch, setAbortAttemptEpoch] = useState(0);
+  const abortDialogRef = useRef<HTMLDialogElement>(null);
+  const abortConfirmRef = useRef<HTMLButtonElement>(null);
+  const abortTriggerRef = useRef<HTMLButtonElement>(null);
+  const previousAbortDraft = useRef<AbortDraft>(null);
+  const restoreAbortFocus = useRef(false);
   const [visible, setVisible] = useState(!document.hidden);
   useEffect(() => {
     const update = () => setVisible(!document.hidden);
@@ -390,7 +405,7 @@ function App() {
   }, [query, stateFilter]);
   const coreDisplay = confirmedCoreDisplayState(overview.value, overview.stale, overview.error);
   const confirmedInstanceId = coreDisplay === "unconfirmed" || coreDisplay === "connecting" ? "" : overview.value?.core?.instance_id ?? "";
-  const calls = usePoll<CallsResponse>(callsUrl, visible && page === "calls", 2_000, confirmedInstanceId, Boolean(confirmedInstanceId));
+  const calls = usePoll<CallsResponse>(callsUrl, visible && page === "calls", 2_000, confirmedInstanceId, Boolean(confirmedInstanceId), callsRefresh);
   const previousInstance = useRef<string | null>(null);
   const [instanceChanged, setInstanceChanged] = useState(false);
   useEffect(() => {
@@ -400,6 +415,105 @@ function App() {
   }, [confirmedInstanceId]);
   const selectedCall = calls.value?.calls?.find((item) => item.call.id === selected) ?? null;
   const selectedNode = overview.value?.nodes?.find((node) => node.id === selectedNodeId) ?? null;
+  const currentAbortContext = useRef({ selected: selected as string | null, revision: selectedCall?.revision, instanceId: confirmedInstanceId });
+  currentAbortContext.current = { selected: selected as string | null, revision: selectedCall?.revision, instanceId: confirmedInstanceId };
+  const abortAttemptKey = selectedCall && confirmedInstanceId ? `${confirmedInstanceId}\u0000${selectedCall.call.id}` : "";
+  const abortAttempt = abortAttemptKey ? abortAttempts.current.get(abortAttemptKey) : undefined;
+  const abortOutcomeLocked = Boolean(abortAttempt && selectedCall && !abortObservationChanged(abortAttempt, selectedCall));
+  const canRequestAbort = canRequestCallAbort(selectedCall, Boolean(confirmedInstanceId && !overview.error && !overview.stale && !calls.error && !calls.stale), instanceChanged, abortSending || abortOutcomeLocked);
+  useEffect(() => {
+    abortGeneration.current += 1;
+    setAbortDraft(null);
+    setAbortStatus({ phase: "idle", message: "" });
+  }, [selected, confirmedInstanceId, selectedCall?.revision]);
+  useEffect(() => {
+    if (!confirmedInstanceId || overview.error || overview.stale || calls.error || calls.stale || !calls.value?.calls) return;
+    let changed = false;
+    for (const [key, attempt] of abortAttempts.current) {
+      if (attempt.instanceId !== confirmedInstanceId) {
+        abortAttempts.current.delete(key);
+        changed = true;
+        continue;
+      }
+      const observed = calls.value.calls.find((item) => item.call.id === attempt.id) ?? null;
+      if (abortObservationChanged(attempt, observed)) {
+        abortAttempts.current.delete(key);
+        changed = true;
+      }
+    }
+    if (changed) setAbortAttemptEpoch((value) => value + 1);
+  }, [confirmedInstanceId, overview.error, overview.stale, calls.error, calls.stale, calls.value]);
+  useEffect(() => {
+    const dialog = abortDialogRef.current;
+    if (abortDraft && dialog && !dialog.open) {
+      dialog.showModal();
+      abortConfirmRef.current?.focus();
+    }
+    if (!abortDraft && previousAbortDraft.current) {
+      if (abortSending) restoreAbortFocus.current = true;
+      else requestAnimationFrame(() => abortTriggerRef.current?.focus());
+    }
+    if (!abortDraft && !abortSending && restoreAbortFocus.current) {
+      restoreAbortFocus.current = false;
+      requestAnimationFrame(() => abortTriggerRef.current?.focus());
+    }
+    if (!abortDraft && dialog?.open) dialog.close();
+    previousAbortDraft.current = abortDraft;
+  }, [abortDraft, abortSending]);
+  void abortAttemptEpoch;
+  const requestAbort = async () => {
+    if (!selectedCall || !canRequestAbort || abortSending || !confirmedInstanceId) return;
+    if (!abortDraft || abortDraft.id !== selectedCall.call.id || abortDraft.revision !== selectedCall.revision || abortDraft.instanceId !== confirmedInstanceId) {
+      setAbortDraft({ id: selectedCall.call.id, revision: selectedCall.revision, instanceId: confirmedInstanceId });
+      setAbortStatus({ phase: "idle", message: "Review this Call and confirm the cancellation request. · 호출 정보를 확인한 뒤 취소 요청을 확정하세요." });
+      return;
+    }
+    const key = `${confirmedInstanceId}\u0000${selectedCall.call.id}`;
+    if (abortInFlight.current.has(key) || abortAttempts.current.has(key)) return;
+    abortAttempts.current.set(key, { id: selectedCall.call.id, instanceId: confirmedInstanceId, revision: selectedCall.revision, state: selectedCall.lifecycle.state });
+    abortInFlight.current.add(key);
+    setAbortAttemptEpoch((value) => value + 1);
+    setAbortDraft(null);
+    setAbortSending(true);
+    const actionGeneration = ++abortGeneration.current;
+    const actionInstance = confirmedInstanceId;
+    const actionId = selectedCall.call.id;
+    const actionRevision = selectedCall.revision;
+    setAbortStatus({ phase: "sending", message: "Sending one cancellation request… · 취소 요청을 한 번 전송하는 중…" });
+    let next: AbortStatus = { phase: "unconfirmed", message: "The response is unconfirmed. Do not resend; refresh is read-only. · 응답을 확인할 수 없습니다. 다시 보내지 말고 읽기 전용 새로고침만 하세요." };
+    try {
+      const response = await fetch("/api/calls/abort", {
+        method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ id: actionId, expected_revision: actionRevision, expected_instance_id: actionInstance }),
+        redirect: "error", signal: AbortSignal.timeout(5_000),
+      });
+      let result: { status?: string; code?: string; action?: string; id?: string; call?: SafeCall } = {};
+      try { result = await response.json() as typeof result; } catch { /* Status-only local rejection remains classifiable; other failures stay unconfirmed. */ }
+      if (response.status === 200 && result.status === "confirmed" && result.action === "abort" && result.id === actionId &&
+          result.call?.call.id === actionId && result.call.subject.id === actionId && result.call.subject.namespace === "calls" &&
+          Number.isSafeInteger(result.call.revision) && result.call.revision >= actionRevision && typeof result.call.abort_requested === "boolean") {
+        next = { phase: "confirmed", message: "Core confirmed the cancellation control response; termination is not proven. · Core가 취소 제어 응답을 확인했지만 종료 완료를 뜻하지 않습니다." };
+      } else if (isDefiniteAbortRejection(response.status, result.status)) {
+        next = { phase: "rejected", message: `Request rejected · 요청 거절: ${result.code ?? `HTTP ${response.status}`}. Refreshing the current snapshot. · 현재 스냅샷을 갱신합니다.` };
+      }
+    } catch { /* An interrupted request is never automatically retried. */ }
+    const current = currentAbortContext.current;
+    if (mutationResponseIsCurrent(actionGeneration, abortGeneration.current, actionInstance, current.instanceId) && current.selected === actionId && current.revision === actionRevision) {
+      setAbortStatus(next);
+      setCallsRefresh((value) => value + 1);
+    }
+    abortInFlight.current.delete(key);
+    setAbortSending(false);
+  };
+  const dismissAbortDialog = () => {
+    if (abortSending) return;
+    setAbortDraft(null);
+    setAbortStatus({ phase: "idle", message: "Cancellation request dismissed. · 취소 요청을 닫았습니다." });
+  };
+  const handleAbortDialogCancel = (event: React.SyntheticEvent<HTMLDialogElement>) => {
+    event.preventDefault();
+    dismissAbortDialog();
+  };
 
   return <div className="app-shell">
     <aside className="rail" aria-label="Primary navigation">
@@ -456,7 +570,7 @@ function App() {
           {calls.value?.calls === null && <tr><td colSpan={5} className="empty-row">No verified call snapshot is available. · 확인된 호출 스냅샷이 없습니다.</td></tr>}
           {!calls.value && <tr><td colSpan={5} className="empty-row">{calls.error ? "Call snapshot unavailable · 호출 스냅샷 확인 불가" : "Loading Core call snapshot… · Core 호출 스냅샷 불러오는 중"}</td></tr>}
         </tbody></table></div>
-        <aside className="detail-panel" aria-label="Selected call details · 선택한 호출 세부 정보">{selectedCall ? <CallDetail call={selectedCall}/> : <div className="detail-empty"><span aria-hidden="true">◉</span><strong>Select a call · 호출 선택</strong><p>Safe call details will appear here. · 안전한 호출 세부 정보가 여기에 표시됩니다.</p></div>}</aside></div>
+        <aside className="detail-panel" aria-label="Selected call details · 선택한 호출 세부 정보">{selectedCall ? <><CallDetail call={selectedCall}/><section className="abort-control" aria-label="Cancellation request · 취소 요청"><p className="detail-caption">A cancellation acknowledgement does not prove termination. · 취소 응답은 종료 완료를 증명하지 않습니다.</p>{abortDraft && abortDraft.id === selectedCall.call.id && <dialog ref={abortDialogRef} className="abort-dialog" aria-labelledby="abort-dialog-title" aria-describedby="abort-dialog-description" onCancel={handleAbortDialogCancel}><h3 id="abort-dialog-title">Confirm cancellation request · 취소 요청 확인</h3><p id="abort-dialog-description">{abortDraft.id} · {selectedCall.call.target.id}/{selectedCall.call.operation} · {stateLabel(selectedCall.lifecycle.state)} · revision {abortDraft.revision} · Core {abortDraft.instanceId}</p><p>Request cancellation only; the Call may remain active. · 취소 요청만 전송하며 호출은 계속 실행 중일 수 있습니다.</p><div className="abort-dialog-actions"><button type="button" onClick={dismissAbortDialog}>Cancel · 닫기</button><button ref={abortConfirmRef} type="button" className="abort-button" disabled={!canRequestAbort} onClick={() => void requestAbort()}>Confirm once · 한 번만 전송</button></div></dialog>}<button ref={abortTriggerRef} type="button" className="abort-button" disabled={(!canRequestAbort && !abortOutcomeLocked) || Boolean(abortDraft)} aria-disabled={abortOutcomeLocked || abortSending} onClick={() => void requestAbort()}>{abortOutcomeLocked ? "Refresh observation before another request · 다시 요청하기 전 새 관측 필요" : "Request cancellation · 취소 요청"}</button>{!canRequestAbort && !abortOutcomeLocked && <p className="quiet">A fresh observed Call and Core instance are required; unknown, cancelling, and terminal Calls cannot be selected. · 최신 호출과 Core 인스턴스 확인이 필요하며 unknown·취소 중·종료 Call은 요청할 수 없습니다.</p>}{abortStatus.message && <p className={`abort-status abort-${abortStatus.phase}`} role="status">{abortStatus.message}</p>}</section></> : <div className="detail-empty"><span aria-hidden="true">◉</span><strong>Select a call · 호출 선택</strong><p>Safe call details will appear here. · 안전한 호출 세부 정보가 여기에 표시됩니다.</p>{abortStatus.message && <p className="abort-status" role="status">{abortStatus.message}</p>}</div>}</aside></div>
         {calls.value?.meta.truncated && <p className="quiet truncation">Showing the first {calls.value.meta.returned_count} calls. Narrow the query to inspect a smaller set.</p>}
       </section> : <RelationsView visible={visible && page === "relations"} instanceId={confirmedInstanceId} instanceChanged={instanceChanged} openCalls={() => setPage("calls")}/>}
       <footer className="page-footer"><span>ROSTER DASHBOARD <b>·</b> LOCAL CORE VIEW · SUBSCRIPTION EDIT</span><span>{overview.value?.core?.instance_id ?? "Core instance unconfirmed"}</span></footer>
