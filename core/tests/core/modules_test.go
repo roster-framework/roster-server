@@ -1160,3 +1160,346 @@ func TestReconciledRunningReceiptCanBeInspectedUntilCompletion(t *testing.T) {
 		t.Fatalf("invoked %d times, inspected %d times", invoked.Load(), inspected.Load())
 	}
 }
+
+func TestRepeatedUnknownInspectionUsesFreshRevisionLineage(t *testing.T) {
+	var invoked, inspected atomic.Int32
+	f := &fakeConnector{
+		invoke: func(call c.Call, _ c.ReportSink) c.Result {
+			invoked.Add(1)
+			return c.Result{CallID: call.ID, State: c.Unknown}
+		},
+		inspect: func(call c.Call) c.Result {
+			inspected.Add(1)
+			return c.Result{CallID: call.ID, State: c.Unknown}
+		},
+	}
+	_, s, _ := fixture(t, f)
+	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("repeat-unknown-inspect")}); err != nil {
+		t.Fatal(err)
+	}
+	start(t, s)
+	waitState(t, s, "repeat-unknown-inspect", c.Unknown)
+	firstBefore, err := s.Get("repeat-unknown-inspect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.Inspect(context.Background(), "repeat-unknown-inspect")
+	if err != nil || first.Value.Lifecycle.State != c.Unknown {
+		t.Fatalf("first unknown receipt: %+v %v", first, err)
+	}
+	secondBefore, err := s.Get("repeat-unknown-inspect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.Inspect(context.Background(), "repeat-unknown-inspect")
+	if err != nil || second.Value.Lifecycle.State != c.Unknown {
+		t.Fatalf("second unknown receipt: %+v %v", second, err)
+	}
+	wantFirst := c.ID("repeat-unknown-inspect", "inspect", fmt.Sprint(firstBefore.Revision+1))
+	wantSecond := c.ID("repeat-unknown-inspect", "inspect", fmt.Sprint(secondBefore.Revision+1))
+	if wantFirst == wantSecond || second.Value.Observation.Reports[wantFirst] == "" || second.Value.Observation.Reports[wantSecond] == "" {
+		t.Fatalf("fresh explicit inspections did not retain distinct report identities: want %q and %q, got %+v", wantFirst, wantSecond, second.Value.Observation.ReportOrder)
+	}
+	if invoked.Load() != 1 || inspected.Load() != 2 {
+		t.Fatalf("invoked %d times, inspected %d times", invoked.Load(), inspected.Load())
+	}
+}
+
+func TestReconcilingInspectUsesOneRevisionIdentityAndAbortConflicts(t *testing.T) {
+	inspectStarted := make(chan struct{})
+	releaseInspect := make(chan struct{})
+	releaseInvoke := make(chan struct{})
+	var invoked, aborts atomic.Int32
+	f := &fakeConnector{
+		invoke: func(call c.Call, sink c.ReportSink) c.Result {
+			invoked.Add(1)
+			if err := sink(c.Report{State: c.Running, Evidence: c.Evidence{CallID: call.ID, RemoteID: call.ID, Confirmed: true}}); err != nil {
+				panic(err)
+			}
+			<-releaseInvoke
+			return c.Result{CallID: call.ID, State: c.Unknown}
+		},
+		inspect: func(call c.Call) c.Result {
+			close(inspectStarted)
+			<-releaseInspect
+			return c.Result{CallID: call.ID, State: c.Unknown}
+		},
+		abort: func(c.Call) (c.AbortObservation, error) {
+			aborts.Add(1)
+			return c.AbortObservation{Requested: true}, nil
+		},
+	}
+	_, s, _ := fixture(t, f)
+	defer close(releaseInvoke)
+	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("inspect-abort-conflict")}); err != nil {
+		t.Fatal(err)
+	}
+	start(t, s)
+	waitState(t, s, "inspect-abort-conflict", c.Running)
+	firstDone := make(chan c.Snapshot[c.Execution], 1)
+	go func() {
+		snap, _ := s.Inspect(context.Background(), "inspect-abort-conflict")
+		firstDone <- snap
+	}()
+	select {
+	case <-inspectStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first inspection did not reach connector")
+	}
+	reconciling, err := s.Get("inspect-abort-conflict")
+	if err != nil || reconciling.Value.Lifecycle.State != c.Reconciling {
+		t.Fatalf("inspection did not expose reconciling state: %+v %v", reconciling, err)
+	}
+	if _, err := s.Abort(context.Background(), "inspect-abort-conflict", "human request", &reconciling.Revision); err == nil || c.AsFault(err).Code != "conflict" {
+		t.Fatalf("abort during reconciliation should conflict: %v", err)
+	}
+	unchanged, err := s.Get("inspect-abort-conflict")
+	if err != nil || unchanged.Revision != reconciling.Revision || unchanged.Value.Lifecycle.State != c.Reconciling || aborts.Load() != 0 {
+		t.Fatalf("reconciling abort mutated state or reached connector: %+v err=%v aborts=%d", unchanged, err, aborts.Load())
+	}
+	close(releaseInspect)
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("inspection did not complete")
+	}
+	if invoked.Load() != 1 || aborts.Load() != 0 {
+		t.Fatalf("invoked %d times, aborted %d times", invoked.Load(), aborts.Load())
+	}
+}
+
+func TestConcurrentSameRevisionInspectCannotReplaceDifferentReceipt(t *testing.T) {
+	started := make(chan struct{}, 2)
+	firstRelease, secondRelease := make(chan struct{}), make(chan struct{})
+	releaseInvoke := make(chan struct{})
+	var invoked, inspectNumber atomic.Int32
+	f := &fakeConnector{
+		invoke: func(call c.Call, sink c.ReportSink) c.Result {
+			invoked.Add(1)
+			if err := sink(c.Report{State: c.Running, Evidence: c.Evidence{CallID: call.ID, RemoteID: call.ID, Confirmed: true}}); err != nil {
+				panic(err)
+			}
+			<-releaseInvoke
+			return c.Result{CallID: call.ID, State: c.Unknown}
+		},
+		inspect: func(call c.Call) c.Result {
+			index := inspectNumber.Add(1)
+			started <- struct{}{}
+			if index == 1 {
+				<-firstRelease
+				return c.Result{CallID: call.ID, State: c.Unknown}
+			}
+			<-secondRelease
+			return c.Result{CallID: call.ID, State: c.Waiting}
+		},
+	}
+	_, s, _ := fixture(t, f)
+	defer close(releaseInvoke)
+	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("same-inspect-revision")}); err != nil {
+		t.Fatal(err)
+	}
+	start(t, s)
+	waitState(t, s, "same-inspect-revision", c.Running)
+	firstDone := make(chan struct{})
+	go func() { _, _ = s.Inspect(context.Background(), "same-inspect-revision"); close(firstDone) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first inspection did not start")
+	}
+	secondDone := make(chan struct{})
+	go func() { _, _ = s.Inspect(context.Background(), "same-inspect-revision"); close(secondDone) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("second inspection did not share reconciling revision")
+	}
+	close(firstRelease)
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first inspection did not finish")
+	}
+	firstResult, err := s.Get("same-inspect-revision")
+	if err != nil || firstResult.Value.Lifecycle.State != c.Unknown {
+		t.Fatalf("first inspection result: %+v %v", firstResult, err)
+	}
+	revision := firstResult.Revision
+	close(secondRelease)
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second inspection did not finish")
+	}
+	final, err := s.Get("same-inspect-revision")
+	inspectID := c.ID("same-inspect-revision", "inspect", fmt.Sprint(firstResult.Revision-1))
+	inspectReceipts := 0
+	for _, reportID := range final.Value.Observation.ReportOrder {
+		if reportID == inspectID {
+			inspectReceipts++
+		}
+	}
+	if err != nil || final.Value.Lifecycle.State != c.Unknown || final.Revision < revision || inspectReceipts != 1 || invoked.Load() != 1 {
+		t.Fatalf("changed same-revision receipt was not rejected without replacing the saved report: %+v err=%v inspect receipts=%d invokes=%d", final, err, inspectReceipts, invoked.Load())
+	}
+}
+
+func TestNewerInspectionPendingReplacesAndRetriesOnlyItsLineage(t *testing.T) {
+	releaseInvoke := make(chan struct{})
+	var invoked, inspected atomic.Int32
+	f := &fakeConnector{
+		descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}`), OutputSchema: json.RawMessage(`{"type":"object"}`), Capabilities: c.Capabilities{Abort: true, Inspect: true}}}, Events: map[string]c.Schema{"complete": json.RawMessage(`{"type":"object"}`)}},
+		invoke: func(call c.Call, sink c.ReportSink) c.Result {
+			invoked.Add(1)
+			if err := sink(c.Report{State: c.Running, Evidence: c.Evidence{CallID: call.ID, RemoteID: call.ID, Confirmed: true}}); err != nil {
+				panic(err)
+			}
+			<-releaseInvoke
+			return c.Result{CallID: call.ID, State: c.Unknown}
+		},
+		inspect: func(call c.Call) c.Result {
+			inspected.Add(1)
+			return c.Result{CallID: call.ID, State: c.Unknown}
+		},
+	}
+	journal := observation.New(100)
+	cat := catalog.New(memory.NewStore[c.Node](8), map[string]c.Connector{"fake": f}, schema.New(), journal)
+	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	base := memory.NewExecutions(8, 8)
+	store := &interceptExecutionStore{ExecutionStore: base, failures: map[c.State]int{c.Unknown: 2}, afterNextState: map[c.State]func(){}}
+	s := invocation.New(store, cat, journal, fixtureAuthority(t))
+	defer close(releaseInvoke)
+	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("newer-inspect-pending")}); err != nil {
+		t.Fatal(err)
+	}
+	start(t, s)
+	waitState(t, s, "newer-inspect-pending", c.Running)
+	firstBefore, err := s.Get("newer-inspect-pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Inspect(context.Background(), "newer-inspect-pending"); err != nil {
+		t.Fatal(err)
+	}
+	firstPendingState, err := s.Get("newer-inspect-pending")
+	if err != nil || firstPendingState.Value.Lifecycle.State != c.Reconciling || s.PendingObservationCount() != 1 {
+		t.Fatalf("first failed inspection was not retained: %+v err=%v pending=%d", firstPendingState, err, s.PendingObservationCount())
+	}
+	unknown, err := base.Get(c.Ref{Namespace: "calls", ID: "newer-inspect-pending"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	change, err := lifecycle.Move(unknown, c.Transition{Subject: unknown.Subject, ExpectedRevision: unknown.Revision, From: c.Reconciling, To: c.Unknown, Reason: "test_new_inspection_lineage", Evidence: c.Evidence{CallID: "newer-inspect-pending", Local: true, Confirmed: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := base.Commit(c.ExecutionMutation{Subject: unknown.Subject, ExpectedRevision: unknown.Revision, Changes: []c.Change[c.Execution]{change}}); err != nil {
+		t.Fatal(err)
+	}
+	secondBefore, err := s.Get("newer-inspect-pending")
+	if err != nil || secondBefore.Value.Lifecycle.State != c.Unknown {
+		t.Fatalf("could not prepare a newer explicit inspection: %+v %v", secondBefore, err)
+	}
+	if _, err := s.Inspect(context.Background(), "newer-inspect-pending"); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.PendingObservationCount(); got != 1 {
+		t.Fatalf("newer query did not replace the bounded pending slot: %d", got)
+	}
+	s.RetryPending()
+	final, err := s.Get("newer-inspect-pending")
+	if err != nil || final.Value.Lifecycle.State != c.Unknown {
+		t.Fatalf("newer pending query was not reconciled: %+v %v", final, err)
+	}
+	wantFirst := c.ID("newer-inspect-pending", "inspect", fmt.Sprint(firstBefore.Revision+1))
+	wantSecond := c.ID("newer-inspect-pending", "inspect", fmt.Sprint(secondBefore.Revision+1))
+	if wantFirst == wantSecond || final.Value.Observation.Reports[wantFirst] != "" || final.Value.Observation.Reports[wantSecond] == "" || s.PendingObservationCount() != 0 || invoked.Load() != 1 || inspected.Load() != 2 {
+		t.Fatalf("retry did not preserve only the newer inspection lineage: order=%v pending=%d invokes=%d inspects=%d", final.Value.Observation.ReportOrder, s.PendingObservationCount(), invoked.Load(), inspected.Load())
+	}
+}
+
+func TestInspectionQueryDoesNotReplacePendingWaitingStream(t *testing.T) {
+	f := &fakeConnector{
+		descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}`), OutputSchema: json.RawMessage(`{"type":"object"}`), Capabilities: c.Capabilities{Abort: true, Inspect: true}}}, Events: map[string]c.Schema{"complete": json.RawMessage(`{"type":"object"}`)}},
+		invoke: func(call c.Call, sink c.ReportSink) c.Result {
+			if err := sink(c.Report{State: c.Running, Evidence: c.Evidence{CallID: call.ID, RemoteID: call.ID, Confirmed: true}}); err != nil {
+				panic(err)
+			}
+			return c.Result{CallID: call.ID, State: c.Waiting}
+		},
+		inspect: func(call c.Call) c.Result { return c.Result{CallID: call.ID, State: c.Unknown} },
+	}
+	journal := observation.New(100)
+	cat := catalog.New(memory.NewStore[c.Node](8), map[string]c.Connector{"fake": f}, schema.New(), journal)
+	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	store := &interceptExecutionStore{ExecutionStore: memory.NewExecutions(8, 8), failures: map[c.State]int{c.Waiting: 1}, afterNextState: map[c.State]func(){}}
+	s := invocation.New(store, cat, journal, fixtureAuthority(t))
+	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("stream-query-priority")}); err != nil {
+		t.Fatal(err)
+	}
+	start(t, s)
+	waitState(t, s, "stream-query-priority", c.Running)
+	deadline := time.Now().Add(time.Second)
+	for s.PendingObservationCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := s.PendingObservationCount(); got != 1 {
+		t.Fatalf("waiting stream report was not retained: pending=%d", got)
+	}
+	store.mu.Lock()
+	store.failures[c.Unknown] = 1
+	store.mu.Unlock()
+	if _, err := s.Inspect(context.Background(), "stream-query-priority"); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.PendingObservationCount(); got != 1 {
+		t.Fatalf("failed query replaced the older waiting stream slot: pending=%d", got)
+	}
+	s.RetryPending()
+	final, err := s.Get("stream-query-priority")
+	if err != nil || final.Value.Lifecycle.State != c.Waiting || s.PendingObservationCount() != 0 {
+		t.Fatalf("waiting stream slot was not the one retried: state=%s pending=%d err=%v", final.Value.Lifecycle.State, s.PendingObservationCount(), err)
+	}
+}
+
+func TestAcceptedInspectionDoesNotClearPendingWaitingStream(t *testing.T) {
+	f := &fakeConnector{
+		descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}`), OutputSchema: json.RawMessage(`{"type":"object"}`), Capabilities: c.Capabilities{Abort: true, Inspect: true}}}, Events: map[string]c.Schema{"complete": json.RawMessage(`{"type":"object"}`)}},
+		invoke: func(call c.Call, sink c.ReportSink) c.Result {
+			if err := sink(c.Report{State: c.Running, Evidence: c.Evidence{CallID: call.ID, RemoteID: call.ID, Confirmed: true}}); err != nil {
+				panic(err)
+			}
+			return c.Result{CallID: call.ID, State: c.Waiting}
+		},
+		inspect: func(call c.Call) c.Result { return c.Result{CallID: call.ID, State: c.Unknown} },
+	}
+	journal := observation.New(100)
+	cat := catalog.New(memory.NewStore[c.Node](8), map[string]c.Connector{"fake": f}, schema.New(), journal)
+	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	store := &interceptExecutionStore{ExecutionStore: memory.NewExecutions(8, 8), failures: map[c.State]int{c.Waiting: 1}, afterNextState: map[c.State]func(){}}
+	s := invocation.New(store, cat, journal, fixtureAuthority(t))
+	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("stream-query-clear")}); err != nil {
+		t.Fatal(err)
+	}
+	start(t, s)
+	waitState(t, s, "stream-query-clear", c.Running)
+	deadline := time.Now().Add(time.Second)
+	for s.PendingObservationCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := s.PendingObservationCount(); got != 1 {
+		t.Fatalf("waiting stream report was not retained: pending=%d", got)
+	}
+	if _, err := s.Inspect(context.Background(), "stream-query-clear"); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.PendingObservationCount(); got != 1 {
+		t.Fatalf("accepted query cleared an unrelated waiting stream slot: pending=%d", got)
+	}
+}

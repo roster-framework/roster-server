@@ -212,7 +212,7 @@ test("cancellation action requires a fresh selected nonterminal snapshot", () =>
   assert.equal(canRequestCallAbort(call, false, false), false);
   assert.equal(canRequestCallAbort(call, true, true), false);
   assert.equal(canRequestCallAbort(call, true, false, true), false);
-  for (const state of ["unknown", "cancelling", "succeeded", "failed", "cancelled", "expired", "rejected"] as const) {
+  for (const state of ["unknown", "reconciling", "cancelling", "succeeded", "failed", "cancelled", "expired", "rejected"] as const) {
     assert.equal(canRequestCallAbort({ ...call, lifecycle: { ...call.lifecycle, state } }, true, false), false);
   }
 });

@@ -7,6 +7,7 @@ import (
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
 	"github.com/roster-framework/roster-server/core/internal/lifecycle"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -312,6 +313,17 @@ func (s *Service) applyReportAt(r c.Report, expectedRevision *uint64) error {
 			r.Evidence.RemoteID = id
 		}
 	}
+	if r.Evidence.ReportID != "" {
+		s.mu.Lock()
+		pending, ok := s.pending[id]
+		conflictingPending := ok && pending.Evidence.ReportID == r.Evidence.ReportID && pendingSlotIdentity(pending) != pendingSlotIdentity(r)
+		s.mu.Unlock()
+		if conflictingPending {
+			err := c.Err("conflict", "Pending report ID reused with different lineage or content")
+			s.recordPendingAudit(r)
+			return err
+		}
+	}
 	var wake func()
 	var resultErr error
 	for attempt := 0; attempt < 8; attempt++ {
@@ -343,6 +355,7 @@ func (s *Service) applyReportAt(r c.Report, expectedRevision *uint64) error {
 		if len(obs.Changes) == 0 && len(obs.Deliveries) == 0 {
 			if resultErr == nil {
 				s.clearPendingAfterTerminal(r, true)
+				s.clearPendingAfterAccepted(r)
 			}
 			return resultErr
 		}
@@ -350,6 +363,9 @@ func (s *Service) applyReportAt(r c.Report, expectedRevision *uint64) error {
 		if err == nil {
 			if resultErr == nil || hasRejectedAudit(obs.Deliveries) {
 				s.clearPendingAfterTerminal(r, resultErr == nil)
+				if resultErr == nil && !hasStaleAudit(obs.Deliveries) {
+					s.clearPendingAfterAccepted(r)
+				}
 			}
 			s.mu.Lock()
 			wake = s.OnCommit
@@ -394,9 +410,33 @@ func pendingReportDigest(r c.Report) string {
 	}{r.State, result, r.Name, r.Payload})
 	return c.ID(string(b))
 }
+func pendingSlotIdentity(r c.Report) string {
+	b, _ := json.Marshal(struct {
+		CallID           string `json:"call_id"`
+		RemoteID         string `json:"remote_id,omitempty"`
+		ReportID         string `json:"report_id,omitempty"`
+		Sequence         uint64 `json:"sequence,omitempty"`
+		ObservedRevision uint64 `json:"observed_revision,omitempty"`
+		Local            bool   `json:"local"`
+		Confirmed        bool   `json:"confirmed"`
+		Content          string `json:"content"`
+	}{r.Evidence.CallID, r.Evidence.RemoteID, r.Evidence.ReportID, r.Evidence.Sequence, r.ObservedRevision, r.Evidence.Local, r.Evidence.Confirmed, pendingReportDigest(r)})
+	return c.ID(string(b))
+}
+func isInspectionQueryReport(r c.Report) bool {
+	return r.ObservedRevision > 0 && r.Evidence.ReportID != ""
+}
 func hasRejectedAudit(deliveries []c.Delivery) bool {
 	for _, delivery := range deliveries {
 		if delivery.Event != nil && delivery.Event.Name == "report.rejected" {
+			return true
+		}
+	}
+	return false
+}
+func hasStaleAudit(deliveries []c.Delivery) bool {
+	for _, delivery := range deliveries {
+		if delivery.Event != nil && delivery.Event.Name == "report.stale" {
 			return true
 		}
 	}
@@ -407,20 +447,36 @@ func (s *Service) clearPendingAfterTerminal(r c.Report, accepted bool) {
 		return
 	}
 	id := r.Evidence.CallID
-	digest := pendingReportDigest(r)
+	identity := pendingSlotIdentity(r)
 	s.mu.Lock()
 	if pending, ok := s.pending[id]; ok {
-		if pendingReportDigest(pending) == digest || accepted && (pending.Result == nil || !pending.Result.State.Terminal()) {
+		if pendingSlotIdentity(pending) == identity || accepted && (pending.Result == nil || !pending.Result.State.Terminal()) {
 			delete(s.pending, id)
 		}
 	}
 	s.mu.Unlock()
 }
+func (s *Service) clearPendingAfterAccepted(r c.Report) {
+	if r.Result == nil || r.Result.State.Terminal() {
+		return
+	}
+	id := r.Evidence.CallID
+	identity := pendingSlotIdentity(r)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending, ok := s.pending[id]
+	if !ok || pending.Result != nil && pending.Result.State.Terminal() {
+		return
+	}
+	if pendingSlotIdentity(pending) == identity || isInspectionQueryReport(r) && isInspectionQueryReport(pending) && r.ObservedRevision > pending.ObservedRevision {
+		delete(s.pending, id)
+	}
+}
 func (s *Service) savePending(r c.Report) {
 	id := r.Evidence.CallID
 	s.mu.Lock()
 	if existing, ok := s.pending[id]; ok {
-		if pendingReportDigest(existing) == pendingReportDigest(r) {
+		if pendingSlotIdentity(existing) == pendingSlotIdentity(r) {
 			s.mu.Unlock()
 			return
 		}
@@ -433,6 +489,24 @@ func (s *Service) savePending(r c.Report) {
 			s.pending[id] = r
 			s.mu.Unlock()
 			return
+		}
+		if existing.Evidence.ReportID != "" && existing.Evidence.ReportID == r.Evidence.ReportID {
+			s.mu.Unlock()
+			s.recordPendingAudit(r)
+			return
+		}
+		if isInspectionQueryReport(existing) && isInspectionQueryReport(r) {
+			if r.ObservedRevision > existing.ObservedRevision {
+				s.pending[id] = r
+				s.mu.Unlock()
+				s.recordPendingAudit(existing)
+				return
+			}
+			if existing.ObservedRevision > r.ObservedRevision {
+				s.mu.Unlock()
+				s.recordPendingAudit(r)
+				return
+			}
 		}
 		if existing.Result != nil && existing.Result.State == c.Unknown && r.Result != nil && r.Result.State == c.Waiting && r.Evidence.Confirmed {
 			s.pending[id] = r
@@ -499,14 +573,7 @@ func (s *Service) RetryPending() {
 	}
 	s.mu.Unlock()
 	for _, r := range items {
-		err := s.applyReport(r)
-		if err == nil {
-			s.mu.Lock()
-			if currentSlot, ok := s.pending[r.Evidence.CallID]; ok && pendingReportDigest(currentSlot) == pendingReportDigest(r) {
-				delete(s.pending, r.Evidence.CallID)
-			}
-			s.mu.Unlock()
-		}
+		_ = s.applyReport(r)
 	}
 }
 
@@ -572,6 +639,9 @@ func (s *Service) abort(ctx context.Context, id, reason string, expectedRevision
 		return old, c.Err("conflict", "Execution revision conflict")
 	}
 	state := old.Value.Lifecycle.State
+	if state == c.Reconciling {
+		return old, c.Err("conflict", "Reconcile remote evidence before cancelling")
+	}
 	if state == c.Unknown {
 		return old, c.Err("conflict", "Reconcile unknown execution before cancelling")
 	}
@@ -640,16 +710,35 @@ func (s *Service) Inspect(ctx context.Context, id string) (c.Snapshot[c.Executio
 		return old, c.Err("unsupported", "Node does not support receipt lookup")
 	}
 	state := old.Value.Lifecycle.State
-	if state != c.Unknown && state != c.Accepted && state != c.Running && state != c.Waiting && state != c.Cancelling {
+	if state != c.Unknown && state != c.Accepted && state != c.Running && state != c.Waiting && state != c.Cancelling && state != c.Reconciling {
 		return old, c.Err("conflict", "Call is not available for remote inspection")
 	}
-	err = s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Reconciling, Payload: c.Data{"reason": "inspect_reconciling"}})
-	if err != nil {
-		return old, err
-	}
-	old, err = s.Get(id)
-	if err != nil {
-		return old, err
+	if state != c.Reconciling {
+		err = s.applyReportAt(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Reconciling, Payload: c.Data{"reason": "inspect_reconciling"}}, &old.Revision)
+		if err != nil {
+			latest, getErr := s.Get(id)
+			if getErr != nil {
+				return latest, getErr
+			}
+			if latest.Value.Lifecycle.State.Terminal() {
+				return latest, nil
+			}
+			if c.AsFault(err).Code != "conflict" || latest.Value.Lifecycle.State != c.Reconciling {
+				return latest, err
+			}
+			old = latest
+		} else {
+			old, err = s.Get(id)
+			if err != nil {
+				return old, err
+			}
+		}
+		if old.Value.Lifecycle.State.Terminal() {
+			return old, nil
+		}
+		if old.Value.Lifecycle.State != c.Reconciling {
+			return old, c.Err("conflict", "Call changed before remote inspection")
+		}
 	}
 	observedRevision := old.Revision
 	r := safeInspect(ctx, s.catalog.Connector(n.ConnectorID), n, old.Value.Call)
@@ -663,7 +752,7 @@ func (s *Service) Inspect(ctx context.Context, id string) (c.Snapshot[c.Executio
 			r = c.Result{CallID: id, State: c.Unknown, Error: &c.Fault{Code: "invalid_result", Message: "Remote result violated the declared boundary"}}
 		}
 	}
-	err = s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id, Confirmed: true}, Result: &r, ObservedRevision: observedRevision})
+	err = s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id, Confirmed: true, ReportID: c.ID(id, "inspect", strconv.FormatUint(observedRevision, 10))}, Result: &r, ObservedRevision: observedRevision})
 	if err != nil {
 		return s.Get(id)
 	}

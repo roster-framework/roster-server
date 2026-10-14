@@ -708,7 +708,7 @@ export function mutationResponseIsCurrent(actionGeneration: number, currentGener
 
 export function canRequestCallAbort(call: SafeCall | null, fresh: boolean, instanceChanged: boolean, outcomeUnrefreshed = false): boolean {
   if (!call || !fresh || instanceChanged || outcomeUnrefreshed) return false;
-  return !["unknown", "cancelling", "succeeded", "failed", "cancelled", "expired", "rejected"].includes(call.lifecycle.state);
+  return !["unknown", "reconciling", "cancelling", "succeeded", "failed", "cancelled", "expired", "rejected"].includes(call.lifecycle.state);
 }
 
 export function isDefiniteAbortRejection(status: number, resultStatus?: string): boolean {
