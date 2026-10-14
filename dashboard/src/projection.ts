@@ -58,6 +58,13 @@ export interface SafeRelation {
   id: string; revision: number; removed: boolean; source: SafeRef; event: string;
   target: SafeRef; operation: string;
 }
+export interface SubscriptionCreateInput {
+  id: string; source: { namespace: "nodes"; id: string }; event: string;
+  target: { namespace: "nodes"; id: string }; operation: string;
+  input: { values?: Record<string, unknown>; pointers?: Record<string, string> };
+}
+export interface SubscriptionRemoveInput { id: string; expected_revision: number }
+export class MutationInputError extends Error { constructor(readonly code: string) { super(code); } }
 export interface SafeConversation {
   id: string; revision: number; closed: boolean;
   participants: { ref: SafeRef; receiver?: { target: SafeRef; operation: string } }[];
@@ -241,6 +248,80 @@ function operation(value: unknown): string {
     throw new ProjectionError();
   }
   return parsed;
+}
+
+const dangerousMappingKeys = new Set(["__proto__", "constructor", "prototype"]);
+function mutationId(value: unknown): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/u.test(value)) throw new MutationInputError("invalid_mutation");
+  return value;
+}
+function mutationRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new MutationInputError("invalid_mutation");
+  return value as Record<string, unknown>;
+}
+function mutationKeys(value: Record<string, unknown>, required: string[], optional: string[] = []): void {
+  const allowed = new Set([...required, ...optional]);
+  if (Object.keys(value).some((key) => !allowed.has(key)) || required.some((key) => !Object.prototype.hasOwnProperty.call(value, key))) throw new MutationInputError("invalid_mutation");
+}
+function safeMappingValue(value: unknown): boolean {
+  const stack: unknown[] = [value];
+  while (stack.length) {
+    const item = stack.pop();
+    if (item === null || typeof item === "string" || typeof item === "boolean") continue;
+    if (typeof item === "number") { if (!Number.isFinite(item)) return false; continue; }
+    if (Array.isArray(item)) { stack.push(...item); continue; }
+    if (typeof item !== "object") return false;
+    for (const [key, child] of Object.entries(item)) {
+      if (dangerousMappingKeys.has(key)) return false;
+      stack.push(child);
+    }
+  }
+  return true;
+}
+function mappingKeys(value: Record<string, unknown>): void {
+  const keys = Object.keys(value);
+  if (keys.length > 64 || keys.some((key) => dangerousMappingKeys.has(key) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/u.test(key))) throw new MutationInputError("invalid_mutation");
+}
+function validPointer(value: string): boolean {
+  if (new TextEncoder().encode(value).byteLength > 1024 || (value !== "" && !value.startsWith("/")) || /~(?![01])/u.test(value)) return false;
+  return !value.split("/").slice(1).some((segment) => dangerousMappingKeys.has(segment.replace(/~1/gu, "/").replace(/~0/gu, "~")));
+}
+export function parseSubscriptionCreateInput(value: unknown): SubscriptionCreateInput {
+  try {
+    const row = mutationRecord(value); mutationKeys(row, ["id", "source", "event", "target", "operation", "input"]);
+    const source = mutationRecord(row.source); mutationKeys(source, ["namespace", "id"]);
+    const target = mutationRecord(row.target); mutationKeys(target, ["namespace", "id"]);
+    if (source.namespace !== "nodes" || target.namespace !== "nodes") throw new MutationInputError("invalid_mutation");
+    const input = mutationRecord(row.input); mutationKeys(input, [], ["values", "pointers"]);
+    const parsed: SubscriptionCreateInput = {
+      id: mutationId(row.id), source: { namespace: "nodes", id: mutationId(source.id) }, event: mutationId(row.event),
+      target: { namespace: "nodes", id: mutationId(target.id) }, operation: mutationId(row.operation), input: {},
+    };
+    if (input.values !== undefined) {
+      const values = mutationRecord(input.values); mappingKeys(values);
+      if (!safeMappingValue(values)) throw new MutationInputError("invalid_mutation");
+      parsed.input.values = values;
+    }
+    if (input.pointers !== undefined) {
+      const pointers = mutationRecord(input.pointers); mappingKeys(pointers);
+      const mapped: Record<string, string> = Object.create(null) as Record<string, string>;
+      for (const [key, pointer] of Object.entries(pointers)) {
+        if (typeof pointer !== "string" || !validPointer(pointer)) throw new MutationInputError("invalid_mutation");
+        mapped[key] = pointer;
+      }
+      parsed.input.pointers = mapped;
+    }
+    if (new TextEncoder().encode(JSON.stringify(parsed.input)).byteLength > 16 * 1024) throw new MutationInputError("invalid_mutation");
+    return parsed;
+  } catch (error) {
+    if (error instanceof MutationInputError) throw error;
+    throw new MutationInputError("invalid_mutation");
+  }
+}
+export function parseSubscriptionRemoveInput(value: unknown): SubscriptionRemoveInput {
+  const row = mutationRecord(value); mutationKeys(row, ["id", "expected_revision"]);
+  if (typeof row.expected_revision !== "number" || !Number.isSafeInteger(row.expected_revision) || row.expected_revision <= 0) throw new MutationInputError("invalid_mutation");
+  return { id: mutationId(row.id), expected_revision: row.expected_revision };
 }
 
 function state(value: unknown): CallState {
@@ -600,13 +681,26 @@ export function validDashboardRequest(input: {
   origin: string | undefined;
   fetchSite: string | undefined;
   port: number;
+  requireSameOriginFetchSite?: boolean;
 }): boolean {
   const loopbackPeers = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
   if (!input.remoteAddress || !loopbackPeers.has(input.remoteAddress)) return false;
   if (!input.host) return false;
   const expectedHosts = new Set([`127.0.0.1:${input.port}`, `localhost:${input.port}`]);
   if (!expectedHosts.has(input.host.toLowerCase())) return false;
+  if (input.requireSameOriginFetchSite && input.fetchSite !== undefined && input.fetchSite !== "same-origin") return false;
   if (input.fetchSite && !["same-origin", "none"].includes(input.fetchSite)) return false;
   if (input.origin) return input.origin === `http://${input.host}`;
   return input.fetchSite === "same-origin" || input.fetchSite === "none";
+}
+
+export function mutationResponseIsCurrent(actionGeneration: number, currentGeneration: number, actionInstanceId: string, currentInstanceId: string): boolean {
+  return actionGeneration === currentGeneration && actionInstanceId === currentInstanceId;
+}
+
+export function subscriptionCanvasExtent(viewportWidth: number, viewportHeight: number, cardBounds: Array<{ right: number; bottom: number }>, paddingRight: number, paddingBottom: number): { width: number; height: number } {
+  return {
+    width: Math.max(viewportWidth, ...cardBounds.map((card) => card.right + paddingRight)),
+    height: Math.max(viewportHeight, ...cardBounds.map((card) => card.bottom + paddingBottom)),
+  };
 }

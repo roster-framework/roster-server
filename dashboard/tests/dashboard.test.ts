@@ -2,8 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { CLIENT_PROFILE, applyBundle, applyExitCode, coreOrigin, parseStrictJson, validateManifest, type BundlePlan } from "../src/bundle.js";
 import { createServer } from "node:http";
+import { spawn } from "node:child_process";
 import {
-  CALL_STATES, confirmedCoreDisplayState, continuousCallTransitionPairs, coreInstanceChanged, hasContinuousJournal, keepHighestCallRevisions, mergeJournalEvidence, parseCallsQuery, parseListLimit, parseLogsQuery, projectCall, projectCalls, projectConversations, projectCore, projectLogs, projectNodeDetails, projectNodes, projectRelations, type SafeCall,
+  CALL_STATES, MutationInputError, confirmedCoreDisplayState, continuousCallTransitionPairs, coreInstanceChanged, hasContinuousJournal, keepHighestCallRevisions, mergeJournalEvidence, mutationResponseIsCurrent, subscriptionCanvasExtent, parseCallsQuery, parseListLimit, parseLogsQuery, parseSubscriptionCreateInput, parseSubscriptionRemoveInput, projectCall, projectCalls, projectConversations, projectCore, projectLogs, projectNodeDetails, projectNodes, projectRelations, type SafeCall,
   validDashboardRequest,
 } from "../src/projection.js";
 
@@ -161,6 +162,113 @@ test("relation projections expose only declared Node, subscription, and conversa
   assert.equal(JSON.stringify(conversation).includes("secret"), false);
 });
 
+test("subscription mutation input validates provider-neutral declarations and data-only mappings", () => {
+  const request = parseSubscriptionCreateInput({ id: "sub-a", source: { namespace: "nodes", id: "node-a" }, event: "finished",
+    target: { namespace: "nodes", id: "node-b" }, operation: "run", input: { values: { request: "explicit" }, pointers: { context: "/payload/summary" } } });
+  assert.deepEqual(request.source, { namespace: "nodes", id: "node-a" });
+  assert.deepEqual(request.input.values, { request: "explicit" });
+  assert.deepEqual(Object.fromEntries(Object.entries(request.input.pointers ?? {})), { context: "/payload/summary" });
+  assert.deepEqual(Object.fromEntries(Object.entries(parseSubscriptionCreateInput({ id: "sub-root", source: { namespace: "nodes", id: "a" }, event: "e", target: { namespace: "nodes", id: "b" }, operation: "op", input: { pointers: { value: "" } } }).input.pointers ?? {})), { value: "" });
+  const invalid = [
+    { ...request, unexpected: true },
+    { ...request, source: { namespace: "runtime", id: "node-a" } },
+    { ...request, input: { values: JSON.parse('{"__proto__":"unsafe"}') } },
+    { ...request, input: { values: { x: { constructor: { polluted: true } } } } },
+    { ...request, input: { values: { ["x".repeat(101)]: 1 } } },
+    { ...request, input: { values: Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`k${index}`, index])) } },
+    { ...request, input: { pointers: { value: "/bad~2escape" } } },
+    { ...request, input: { pointers: { value: "/__proto__/x" } } },
+    { ...request, input: { values: { payload: "x".repeat(16 * 1024) } } },
+  ];
+  for (const value of invalid) assert.throws(() => parseSubscriptionCreateInput(value), MutationInputError);
+  assert.throws(() => parseSubscriptionCreateInput({ ...request, removed: false }), MutationInputError);
+});
+
+test("subscription removal requires an observed positive safe revision", () => {
+  assert.deepEqual(parseSubscriptionRemoveInput({ id: "sub-a", expected_revision: 4 }), { id: "sub-a", expected_revision: 4 });
+  for (const value of [
+    { id: "sub-a", expected_revision: 0 }, { id: "sub-a", expected_revision: Number.MAX_SAFE_INTEGER + 1 },
+    { id: "sub-a", expected_revision: 4, extra: "ignored?" }, { id: "../sub-a", expected_revision: 4 },
+  ]) assert.throws(() => parseSubscriptionRemoveInput(value), MutationInputError);
+});
+
+test("subscription mutation responses are ignored after generation or Core identity changes", () => {
+  assert.equal(mutationResponseIsCurrent(7, 7, "core-a", "core-a"), true);
+  assert.equal(mutationResponseIsCurrent(7, 8, "core-a", "core-a"), false);
+  assert.equal(mutationResponseIsCurrent(7, 7, "core-a", "core-b"), false);
+});
+
+test("subscription canvas extent follows cards when wrapping narrow and shrinking wide", () => {
+  const narrow = subscriptionCanvasExtent(600, 480, [{ right: 580, bottom: 700 }], 12, 18);
+  assert.deepEqual(narrow, { width: 600, height: 718 });
+  const wide = subscriptionCanvasExtent(900, 274, [{ right: 860, bottom: 242 }], 12, 18);
+  assert.deepEqual(wide, { width: 900, height: 274 });
+  const borderAligned = subscriptionCanvasExtent(982, 274, [{ right: 964.984, bottom: 257 }], 17, 17);
+  assert.deepEqual(borderAligned, { width: 982, height: 274 });
+});
+
+test("gateway validates raw subscription receipts and returns only safe mutation outcomes", async () => {
+  const commands: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const core = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    const path = request.url ?? "";
+    if (path === "/api/commands/subscriptions.list") {
+      response.writeHead(200, { "Content-Type": "application/json" }); response.end("[]"); return;
+    }
+    commands.push({ path, body });
+    if (path.endsWith("subscriptions.create")) {
+      const id = String(body.id);
+      if (id === "sub-unknown") { response.writeHead(400, { "Content-Type": "application/json" }); response.end(JSON.stringify({ code: "future_fault", message: "private" })); return; }
+      if (id === "sub-schema") { response.writeHead(400, { "Content-Type": "application/json" }); response.end(JSON.stringify({ code: "invalid_schema", message: "private" })); return; }
+      const value = { id, source: body.source, event: body.event, target: body.target, operation: body.operation,
+        input: { values: { private_value: "must not echo" } }, ...(id === "sub-removed" ? { removed: true } : {}) };
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ subject: { namespace: "subscriptions", id }, revision: 1, value })); return;
+    }
+    const id = String(body.id); const revision = Number(body.expected_revision);
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ id: "event-change-id", subject: { namespace: "subscriptions", id }, before_revision: revision,
+      after_revision: revision + 1, after: { id, source: { namespace: "nodes", id: "node-a" }, event: "changed",
+        target: { namespace: "nodes", id: "node-b" }, operation: "apply", removed: true } }));
+  });
+  await new Promise<void>((resolve, reject) => core.listen(7350, "127.0.0.1", (error?: Error) => error ? reject(error) : resolve()));
+  const probe = createServer();
+  await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+  const address = probe.address(); assert.ok(address && typeof address !== "string");
+  await new Promise<void>((resolve) => probe.close(() => resolve()));
+  const child = spawn(process.execPath, ["build/src/gateway.js"], { cwd: process.cwd(), env: { ...process.env, PORT: String(address.port) }, stdio: "ignore" });
+  const origin = `http://127.0.0.1:${address.port}`;
+  try {
+    let ready = false;
+    for (let attempt = 0; attempt < 50 && !ready; attempt++) {
+      try { ready = (await fetch(`${origin}/api/relations`, { headers: { Origin: origin } })).status === 200; }
+      catch { await new Promise((resolve) => setTimeout(resolve, 20)); }
+    }
+    assert.equal(ready, true);
+    const post = (path: string, body: unknown) => fetch(`${origin}${path}`, { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const declaration = { source: { namespace: "nodes", id: "node-a" }, event: "changed", target: { namespace: "nodes", id: "node-b" }, operation: "apply", input: {} };
+    const none = await fetch(`${origin}/api/subscriptions`, { method: "POST", headers: { Origin: origin, "Sec-Fetch-Site": "none", "Content-Type": "application/json" }, body: JSON.stringify({ ...declaration, id: "sub-no-site" }) });
+    assert.equal(none.status, 403); assert.equal(commands.length, 0);
+    const good = await post("/api/subscriptions", { ...declaration, id: "sub-good" });
+    assert.equal(good.status, 200);
+    const goodBody = await good.text(); assert.equal(goodBody.includes("private_value"), false); assert.equal(goodBody.includes("must not echo"), false);
+    const malformed = await post("/api/subscriptions", { ...declaration, id: "sub-removed" });
+    assert.equal(malformed.status, 502); assert.deepEqual(await malformed.json(), { status: "unconfirmed", code: "mutation_unconfirmed", id: "sub-removed", action: "create" });
+    const unknown = await post("/api/subscriptions", { ...declaration, id: "sub-unknown" });
+    assert.equal(unknown.status, 400); assert.deepEqual(await unknown.json(), { status: "rejected", code: "core_rejected", id: "sub-unknown" });
+    const schema = await post("/api/subscriptions", { ...declaration, id: "sub-schema" });
+    assert.equal(schema.status, 400); assert.deepEqual(await schema.json(), { status: "rejected", code: "invalid_schema", id: "sub-schema" });
+    const removed = await post("/api/subscriptions/remove", { id: "sub-good", expected_revision: 2 });
+    assert.deepEqual(await removed.json(), { status: "applied", action: "remove", id: "sub-good", revision: 3, removed: true });
+    assert.equal(commands.length, 5);
+  } finally {
+    child.kill("SIGTERM");
+    await new Promise<void>((resolve, reject) => core.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 test("log projection keeps safe envelope, validates only state.changed evidence, and rejects unsafe queries", () => {
   const event = (id: string, payload: unknown, sequence: number) => ({
     sequence, event: { id, source: { namespace: "calls", id: "call-a" }, name: "state.changed",
@@ -221,6 +329,7 @@ test("gateway request guard requires a loopback peer and same-origin request", (
   assert.equal(validDashboardRequest({ ...good, origin: "https://evil.invalid" }), false);
   assert.equal(validDashboardRequest({ ...good, host: "[invalid" }), false);
   assert.equal(validDashboardRequest({ ...good, fetchSite: "cross-site" }), false);
+  assert.equal(validDashboardRequest({ ...good, fetchSite: "none", requireSameOriginFetchSite: true }), false);
   assert.equal(validDashboardRequest({ ...good, origin: undefined, fetchSite: undefined }), false);
 });
 

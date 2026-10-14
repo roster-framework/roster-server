@@ -1,8 +1,8 @@
 # Roster Server / 로스터 서버
 
-Run a central Go Core with a local dashboard. The Core calls declared Node operations through one Call contract; the dashboard shows registered Nodes, observed Call states, and read-only relations. An optional log service lives in `log/`.
+Run a central Go Core with a local dashboard. The Core calls declared Node operations through one Call contract; the dashboard shows registered Nodes, observed Call states, and subscription relations that operators can create or revision-check remove. Call submission remains a separate Core CLI action. An optional log service lives in `log/`.
 
-중앙 Go Core와 로컬 대시보드를 실행합니다. Core는 선언된 Node operation을 공통 Call 계약으로 호출하고, 대시보드는 등록된 Node·관측된 Call 상태·읽기 전용 관계를 보여 줍니다. 선택형 로그 서비스는 `log/`에 있습니다.
+중앙 Go Core와 로컬 대시보드를 실행합니다. Core는 선언된 Node operation을 공통 Call 계약으로 호출하고, 대시보드는 등록된 Node·관측된 Call 상태·구독 관계를 보여 주며 구독 선언 생성과 revision 확인 제거를 지원합니다. Call 제출은 별도 Core CLI 작업입니다. 선택형 로그 서비스는 `log/`에 있습니다.
 
 ## Run locally / 로컬 실행
 
@@ -20,7 +20,7 @@ npm run build
 npm start
 ```
 
-Open <http://127.0.0.1:7360>. The Core listens on `127.0.0.1:7350`; the dashboard gateway reads it on the server side and shows a local, read-only view. 처음에는 등록된 Node가 없는 화면이 정상입니다. 대시보드는 Core를 서버 쪽에서 조회하며 로컬 읽기 전용 화면을 제공합니다.
+Open <http://127.0.0.1:7360>. The Core listens on `127.0.0.1:7350`; the dashboard gateway reads Core data server-side. Relations can create a subscription declaration or remove one using its observed revision. Call submission uses the separate Core CLI. 처음에는 등록된 Node가 없는 화면이 정상입니다. 대시보드는 Core를 조회하며 Relations에서 구독 선언을 만들거나 관측 revision을 확인해 제거할 수 있습니다. Call 제출은 별도 Core CLI로 수행합니다.
 
 To start both prepared services with one command, build the Core binary from `core/` with `go build -o roster-core.exe ./cmd/roster` and the dashboard from `dashboard/` with `npm ci && npm run build`. Create an owner-only config JSON and a separate owner-only env JSON **outside this repository**, then run from the repository root:
 
@@ -40,7 +40,7 @@ cd core
 
 To register a Runtime or Resource Node, start [Roster Node Client](https://github.com/roster-framework/roster-node-client) first, then use `nodes.register` or a local Core configuration. `core/examples/local-stack.json` is a fixture: set its Node IDs, target IDs, provider URLs and `token_env` names for your own hosts. Keep credential values in the process environment, outside JSON and Git. Runtime/Resource Node를 등록하려면 먼저 Node Client를 실행하고 `nodes.register` 또는 로컬 Core 설정을 사용하세요. 예제 설정의 ID·주소·환경변수 이름은 실제 환경에 맞게 수정해야 합니다.
 
-Call inspection uses `calls.submit`, `calls.get`, `calls.list`, `calls.inspect`, and `calls.abort`. A disconnected provider or timeout can leave a Call `unknown`; inspect the same receipt before any operator decision. Provider registration alone does not prove current reachability. 호출 조회에는 같은 CLI/HTTP/MCP 명령을 쓰며, 연결 단절·timeout은 실패 확정이 아닙니다. 등록은 현재 접속 가능성을 증명하지 않습니다.
+Call inspection uses `calls.submit`, `calls.get`, `calls.list`, `calls.inspect`, and `calls.abort`. A disconnected provider or timeout can leave a Call `unknown`; inspect the same receipt before any operator decision. Provider registration alone does not prove current reachability. A subscription declaration only configures future event routing; it does not prove delivery. Verify an Event receipt and resulting Call evidence in Core logs. Removing a subscription does not cancel existing Calls. 호출은 같은 CLI/HTTP/MCP 명령으로 제출·조회하며, 연결 단절·timeout은 실패 확정이 아닙니다. 등록은 현재 접속 가능성을 증명하지 않습니다. 구독 선언은 이후 이벤트 경로를 설정할 뿐 전달 성공의 증거가 아닙니다. Core 로그의 Event receipt와 생성된 Call 근거를 확인하고, 구독 제거가 기존 Call을 취소하지 않는 점에 유의하세요.
 
 Community packages can declare Nodes and subscriptions for an operator to import. Install an exact package version in a dedicated provider workspace with `npm install --ignore-scripts --save-exact <name>@<version>`, and run its provider separately. From this repository, build `dashboard/`, then validate and explicitly apply the bundle with the CLI below. `<bindings.json>` maps the package's `binding_ref` names to provider origins, target IDs, and **environment variable names** (`token_env`), never credential values. `validate` returns a digest; copy that value into `import`. An import may be partial, so inspect its `applied` and `unresolved` IDs before any manual follow-up. The importer never runs package code or retries Calls.
 
