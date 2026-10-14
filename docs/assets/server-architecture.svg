@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 560" role="img" aria-labelledby="title desc">
+<title id="title">Roster Server / 로스터 서버 architecture and subscription flow</title>
+<desc id="desc">Core calls registered Nodes and routes emitted Events through active subscriptions. Registration does not prove reachability; inspect the same Call receipt after unknown or cancellation acknowledgement.</desc>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="#68758a"/></marker>
+  <marker id="violet" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="#9778d5"/></marker>
+  <style>
+    text{font-family:system-ui,"Noto Sans KR",sans-serif;fill:#e9edf5}.small{font-size:14px;fill:#b9c3d2}.label{font-size:16px;font-weight:700}.card{fill:#202c40;stroke:#65738c;stroke-width:1.5}.core{fill:#342e52;stroke:#a997eb}.lane{fill:#182335;stroke:#43516a}.sub{fill:none;stroke:#b99af4;stroke-width:3;stroke-dasharray:8 7;marker-end:url(#violet)}.flow{fill:none;stroke:#77859b;stroke-width:2;marker-end:url(#arrow)}
+  </style>
+</defs>
+<rect width="1100" height="560" rx="20" fill="#111a29"/>
+<text x="36" y="42" class="label">ROSTER SERVER · NODE / SUBSCRIPTION FLOW · 노드 / 구독 흐름</text>
+<rect x="48" y="100" width="195" height="82" rx="12" class="card"/><text x="145" y="132" text-anchor="middle" class="label">Dashboard</text><text x="145" y="157" text-anchor="middle" class="small">Local UI · 구독 관리</text>
+<rect x="365" y="90" width="280" height="104" rx="14" class="core"/><text x="505" y="128" text-anchor="middle" class="label">Roster Core</text><text x="505" y="154" text-anchor="middle" class="small">Call · Event · Subscription</text><text x="505" y="176" text-anchor="middle" class="small">호출 · 이벤트 · 구독</text>
+<path d="M243 141H355" class="flow"/><text x="300" y="126" text-anchor="middle" class="small">commands · 명령</text>
+<rect x="780" y="58" width="260" height="90" rx="12" class="card"/><text x="910" y="93" text-anchor="middle" class="label">Runtime Node</text><text x="910" y="120" text-anchor="middle" class="small">declared operations · 기능</text>
+<rect x="780" y="188" width="260" height="90" rx="12" class="card"/><text x="910" y="223" text-anchor="middle" class="label">Resource Node</text><text x="910" y="250" text-anchor="middle" class="small">tools · documents · 도구</text>
+<path d="M645 118C700 118 715 104 770 104" class="flow"/><path d="M645 166C700 166 715 233 770 233" class="flow"/>
+<rect x="820" y="332" width="180" height="58" rx="10" class="lane"/><text x="910" y="357" text-anchor="middle" class="small">Event emitted</text><text x="910" y="377" text-anchor="middle" class="small">이벤트 발행</text>
+<rect x="365" y="332" width="280" height="58" rx="10" class="lane"/><text x="505" y="357" text-anchor="middle" class="small">active subscription · 활성 구독</text><text x="505" y="377" text-anchor="middle" class="small">source event → target operation</text>
+<path d="M820 361H655" class="sub"/><path d="M505 332C505 286 780 300 780 278" class="sub"/>
+<text x="689" y="320" text-anchor="middle" class="small">delivery path · 전달 경로</text>
+<text x="50" y="235" class="small">Registered ≠ reachable</text><text x="50" y="257" class="small">등록 ≠ 연결 가능</text>
+<rect x="48" y="300" width="260" height="108" rx="12" class="lane"/><text x="178" y="331" text-anchor="middle" class="label">Declaration ≠ delivery</text><text x="178" y="358" text-anchor="middle" class="small">구독 생성은 전달 증거가 아님</text><text x="178" y="382" text-anchor="middle" class="small">verify Event receipt + Call</text>
+<path d="M505 195V325" class="flow"/>
+<rect x="48" y="450" width="992" height="76" rx="12" class="lane"/>
+<text x="70" y="479" class="label">Call evidence · 호출 근거</text><text x="70" y="505" class="small">running → unknown → inspect same receipt → observed state · 같은 receipt 검사</text>
+<text x="650" y="479" class="small">Cancel ACK ≠ terminal · 취소 ACK ≠ 종료</text><text x="650" y="505" class="small">Registration never reports online status · 등록은 온라인 상태를 뜻하지 않음</text>
+</svg>

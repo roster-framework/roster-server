@@ -1,0 +1,79 @@
+# 로스터 서버
+
+[English](README.md) | [한국어](README.ko.md)
+
+중앙 Go Core와 로컬 대시보드, 선택형 로그 서비스를 실행합니다. Core는 공급자에 중립적인 Node를 등록하고 Call을 받아 결과를 관측하며 명시 구독 선언을 통해 이벤트를 전달합니다. 대시보드에서는 구독 선언을 만들고 현재 revision을 사용해 제거할 수 있습니다. Call 제출은 Core CLI에서 별도로 수행합니다.
+
+![Roster Server 구조: Core가 Runtime·Resource Node와 연결되고 로컬 대시보드는 Core 조회와 구독 관리를 담당합니다](docs/assets/server-architecture.svg)
+
+## 로컬 실행
+
+필요 도구는 Go 1.26, Node.js 24, npm입니다. 저장소 루트에서 각 서비스를 별도 터미널로 실행하세요.
+
+```sh
+cd core
+go run ./cmd/roster serve
+```
+
+```sh
+cd dashboard
+npm ci
+npm run build
+npm start
+```
+
+<http://127.0.0.1:7360>을 여세요. Core는 `127.0.0.1:7350`에서 실행되며 대시보드 gateway가 서버 쪽에서 Core 데이터를 조회합니다. Relations 화면에서 관측된 revision으로 구독을 제거할 수 있습니다. Call 제출은 별도 Core CLI 작업입니다.
+
+## 준비된 서비스 함께 시작하기
+
+`core/`에서 `go build -o roster-core.exe ./cmd/roster`로 Core를 빌드하고, `dashboard/`에서 `npm ci && npm run build`로 대시보드를 빌드하세요. 저장소 **밖에** 권한을 제한한 설정 JSON과 환경 JSON을 만들고 저장소 루트에서 실행합니다.
+
+```sh
+node scripts/launch.mjs --config ../local-config/server.json
+```
+
+설정에는 `schema: "roster-launch/1"`, `data_root`, `env_file`, `core_binary`, `dashboard_entry`(절대 경로인 `dashboard/build/src/gateway.js`)를 지정합니다. 빈 Core의 env 파일 형식은 `{ "env": {} }`입니다. 자격을 사용하는 Node를 가져올 때는 허용된 Core 토큰 환경변수를 `core_token_env`에 등록하세요. 실제 값은 외부 env 파일에만 둡니다. Core와 대시보드는 loopback의 7350·7360 포트에 바인딩합니다. Launcher는 준비 상태를 확인하고 자신이 실행한 자식 프로세스만 관리하며 데이터와 잠금 파일은 Git 밖에 둡니다. 그룹 실행·종료는 Linux Docker에서 검증했으며 Windows ACL·signal 동작은 아직 검증하지 않았습니다.
+
+## Node와 Call 조회
+
+CLI, HTTP, MCP는 같은 Core command registry를 사용합니다. `core/`에서 다음 명령으로 상태와 Node를 확인할 수 있습니다.
+
+```sh
+printf '%s\n' '{}' | go run ./cmd/roster core.status --file -
+printf '%s\n' '{}' | go run ./cmd/roster nodes.list --file -
+```
+
+Runtime 또는 Resource Node를 등록하기 전에 [Roster Node Client](https://github.com/roster-framework/roster-node-client)를 실행하세요. `nodes.register` 또는 로컬 Core 설정을 사용할 수 있습니다. `core/examples/local-stack.json`은 예제이며 Node ID, target ID, 공급자 URL과 `token_env` 이름을 실제 환경에 맞춰야 합니다. 자격 값은 Core 프로세스 환경에만 두고 Node binding·manifest·Git에는 넣지 마세요.
+
+Call은 `calls.submit`, `calls.get`, `calls.list`, `calls.inspect`, `calls.abort`로 제출·조회합니다. 연결 단절이나 timeout 뒤에는 Call이 `unknown`일 수 있으므로 같은 receipt를 확인한 뒤 조치하세요. 공급자 등록만으로 현재 연결 가능성이 증명되지는 않습니다. 구독 선언은 이후 이벤트 경로를 설정할 뿐 전달 성공을 증명하지 않습니다. Core 로그의 Event receipt와 생성된 Call 근거를 확인하세요. 구독을 제거해도 이미 생성된 Call은 취소되지 않습니다.
+
+## 커뮤니티 bundle 가져오기
+
+커뮤니티 패키지는 Node와 구독을 선언해 운영자가 명시적으로 가져올 수 있습니다. 전용 공급자 작업 공간에서 정확한 버전을 설치하고 install script 없이 공급자를 별도로 실행하세요.
+
+```sh
+npm install --ignore-scripts --save-exact <name>@<version>
+```
+
+`dashboard/`를 빌드한 뒤 저장소 루트에서 패키지를 검증하고 명시적으로 적용합니다. `<bindings.json>`은 `binding_ref`를 공급자 주소, target ID, **환경변수 이름**(`token_env`)에 연결하며 자격 값은 포함하지 않습니다. `validate`의 digest를 `import`에 전달하세요. 일부만 적용될 수 있으니 수동 조치 전 `applied`와 `unresolved`를 확인합니다. 가져오기 도구는 패키지 코드를 실행하거나 Call을 재시도하지 않습니다.
+
+```sh
+node dashboard/build/src/cli.js bundle validate --package <installed-package-dir> --bindings <bindings.json> --core http://127.0.0.1:7350
+node dashboard/build/src/cli.js bundle import --package <installed-package-dir> --bindings <bindings.json> --core http://127.0.0.1:7350 --apply --expected-digest <validated-sha256>
+```
+
+## 검증
+
+`core/`와 `log/`에서 각각 Docker 모듈 검사를 실행합니다.
+
+```sh
+docker run --rm -v "$PWD:/src:ro" -w /src golang:1.26 go test ./...
+```
+
+대시보드는 `dashboard/`에서 `npm test`를 실행합니다. 실제 Runtime·Resource HTTP, 구독, 1:1 응답과 그룹 대화를 모델 호출 없이 검사하려면 `../roster-node-client/runtime`을 먼저 빌드한 다음 저장소 루트에서 다음 격리 Docker fixture를 실행하세요.
+
+```sh
+pwsh -File core/scripts/verify-isolated.ps1
+```
+
+구성요소 사용법: [Core](core/README.md), [Dashboard](dashboard/README.md), [Log](log/README.md). 기여 안내: [CONTRIBUTING](CONTRIBUTING.md).

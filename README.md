@@ -1,12 +1,14 @@
-# Roster Server / 로스터 서버
+# Roster Server
 
-Run a central Go Core with a local dashboard. The Core calls declared Node operations through one Call contract; the dashboard shows registered Nodes, observed Call states, and subscription relations that operators can create or revision-check remove. Call submission remains a separate Core CLI action. An optional log service lives in `log/`.
+[English](README.md) | [한국어](README.ko.md)
 
-중앙 Go Core와 로컬 대시보드를 실행합니다. Core는 선언된 Node operation을 공통 Call 계약으로 호출하고, 대시보드는 등록된 Node·관측된 Call 상태·구독 관계를 보여 주며 구독 선언 생성과 revision 확인 제거를 지원합니다. Call 제출은 별도 Core CLI 작업입니다. 선택형 로그 서비스는 `log/`에 있습니다.
+Run the central Go Core with its local dashboard and optional log service. The Core registers provider-neutral Nodes, accepts Calls, observes results, and routes events through explicit subscription declarations. The dashboard can create a subscription declaration and remove one using its current revision; it does not submit Calls.
 
-## Run locally / 로컬 실행
+![Roster Server architecture: Core connects to Runtime and Resource Nodes, while the local dashboard reads Core and manages subscription declarations](docs/assets/server-architecture.svg)
 
-Requirements: Go 1.26, Node.js 24, npm. Run each block in a separate terminal from this repository. 필요 도구는 Go 1.26, Node.js 24, npm입니다. 각 블록을 별도 터미널에서 실행하세요.
+## Run locally
+
+Requirements: Go 1.26, Node.js 24, and npm. Run each service in a separate terminal from the repository root.
 
 ```sh
 cd core
@@ -20,51 +22,58 @@ npm run build
 npm start
 ```
 
-Open <http://127.0.0.1:7360>. The Core listens on `127.0.0.1:7350`; the dashboard gateway reads Core data server-side. Relations can create a subscription declaration or remove one using its observed revision. Call submission uses the separate Core CLI. 처음에는 등록된 Node가 없는 화면이 정상입니다. 대시보드는 Core를 조회하며 Relations에서 구독 선언을 만들거나 관측 revision을 확인해 제거할 수 있습니다. Call 제출은 별도 Core CLI로 수행합니다.
+Open <http://127.0.0.1:7360>. Core listens at `127.0.0.1:7350`; the dashboard gateway reads Core data server-side. Relations can create a subscription declaration or remove one with its observed revision. Call submission is a separate Core CLI action.
 
-To start both prepared services with one command, build the Core binary from `core/` with `go build -o roster-core.exe ./cmd/roster` and the dashboard from `dashboard/` with `npm ci && npm run build`. Create an owner-only config JSON and a separate owner-only env JSON **outside this repository**, then run from the repository root:
+## Start prepared services together
+
+Build the Core binary from `core/` with `go build -o roster-core.exe ./cmd/roster`, and build the dashboard from `dashboard/` with `npm ci && npm run build`. Create owner-only config and environment JSON files **outside this repository**, then run from the repository root:
 
 ```sh
 node scripts/launch.mjs --config ../local-config/server.json
 ```
 
-The config uses `schema: "roster-launch/1"`, `data_root`, `env_file`, `core_binary`, and `dashboard_entry` (the absolute path to `dashboard/build/src/gateway.js`). The env file has the shape `{ "env": {} }` for an empty Core; add only approved Core token environment names and list them in `core_token_env` if you will import Nodes later. Core and dashboard stay on loopback ports 7350 and 7360. The launcher checks readiness, owns only its child processes, and keeps its data/lock outside Git. Its grouped startup and shutdown have been verified in Linux Docker; native Windows ACL and signal behavior remain unverified. 두 서비스를 한 번에 시작하려면 위 빌드 산출물과 저장소 밖의 설정·환경 파일을 준비하세요. 자격 값은 저장소나 설정 본문에 넣지 마세요.
+The config uses `schema: "roster-launch/1"`, `data_root`, `env_file`, `core_binary`, and `dashboard_entry` (the absolute path to `dashboard/build/src/gateway.js`). The env file has the shape `{ "env": {} }` for an empty Core. If importing Nodes that use credentials, allowlist the Core token environment names with `core_token_env`; keep values in the external env file. Core and dashboard bind to loopback ports 7350 and 7360. The launcher checks readiness, owns only its child processes, and keeps data and locks outside Git. Grouped startup and shutdown are verified in Linux Docker; native Windows ACL and signal behavior remain unverified.
 
-In another terminal, query the same Core through its CLI. `catalog`, HTTP commands, and MCP use the same command registry. 다른 터미널에서 같은 Core를 CLI로 조회할 수 있습니다.
+## Inspect Nodes and Calls
+
+Use the same Core command registry from CLI, HTTP, and MCP. From `core/`:
 
 ```sh
-cd core
-'{}' | go run ./cmd/roster core.status --file -
-'{}' | go run ./cmd/roster nodes.list --file -
+printf '%s\n' '{}' | go run ./cmd/roster core.status --file -
+printf '%s\n' '{}' | go run ./cmd/roster nodes.list --file -
 ```
 
-To register a Runtime or Resource Node, start [Roster Node Client](https://github.com/roster-framework/roster-node-client) first, then use `nodes.register` or a local Core configuration. `core/examples/local-stack.json` is a fixture: set its Node IDs, target IDs, provider URLs and `token_env` names for your own hosts. Keep credential values in the process environment, outside JSON and Git. Runtime/Resource Node를 등록하려면 먼저 Node Client를 실행하고 `nodes.register` 또는 로컬 Core 설정을 사용하세요. 예제 설정의 ID·주소·환경변수 이름은 실제 환경에 맞게 수정해야 합니다.
+Start [Roster Node Client](https://github.com/roster-framework/roster-node-client) before registering its Runtime or Resource Node. Use `nodes.register` or a local Core configuration. `core/examples/local-stack.json` is a fixture: set Node IDs, target IDs, provider URLs, and `token_env` names for your environment. Put credential values in the Core process environment, never in a Node binding, manifest, or Git.
 
-Call inspection uses `calls.submit`, `calls.get`, `calls.list`, `calls.inspect`, and `calls.abort`. A disconnected provider or timeout can leave a Call `unknown`; inspect the same receipt before any operator decision. Provider registration alone does not prove current reachability. A subscription declaration only configures future event routing; it does not prove delivery. Verify an Event receipt and resulting Call evidence in Core logs. Removing a subscription does not cancel existing Calls. 호출은 같은 CLI/HTTP/MCP 명령으로 제출·조회하며, 연결 단절·timeout은 실패 확정이 아닙니다. 등록은 현재 접속 가능성을 증명하지 않습니다. 구독 선언은 이후 이벤트 경로를 설정할 뿐 전달 성공의 증거가 아닙니다. Core 로그의 Event receipt와 생성된 Call 근거를 확인하고, 구독 제거가 기존 Call을 취소하지 않는 점에 유의하세요.
+Calls use `calls.submit`, `calls.get`, `calls.list`, `calls.inspect`, and `calls.abort`. A disconnect or timeout can leave a Call `unknown`; inspect the same receipt before deciding what to do. Registering a provider does not prove it is reachable. A subscription declaration configures future event routing but does not prove delivery. Verify the Event receipt and resulting Call evidence in Core logs. Removing a subscription does not cancel existing Calls.
 
-Community packages can declare Nodes and subscriptions for an operator to import. Install an exact package version in a dedicated provider workspace with `npm install --ignore-scripts --save-exact <name>@<version>`, and run its provider separately. From this repository, build `dashboard/`, then validate and explicitly apply the bundle with the CLI below. `<bindings.json>` maps the package's `binding_ref` names to provider origins, target IDs, and **environment variable names** (`token_env`), never credential values. `validate` returns a digest; copy that value into `import`. An import may be partial, so inspect its `applied` and `unresolved` IDs before any manual follow-up. The importer never runs package code or retries Calls.
+## Import a community bundle
+
+A community package can declare Nodes and subscriptions for explicit operator import. Install an exact package version in a dedicated provider workspace without running install scripts, then run its provider separately:
+
+```sh
+npm install --ignore-scripts --save-exact <name>@<version>
+```
+
+Build `dashboard/`, then validate and explicitly apply the package from the repository root. `<bindings.json>` maps declared `binding_ref` names to provider origins, target IDs, and **environment variable names** (`token_env`), never credential values. Copy the digest from `validate` into `import`. Inspect `applied` and `unresolved` before any manual follow-up; import may be partial. The importer does not execute package code or retry Calls.
 
 ```sh
 node dashboard/build/src/cli.js bundle validate --package <installed-package-dir> --bindings <bindings.json> --core http://127.0.0.1:7350
 node dashboard/build/src/cli.js bundle import --package <installed-package-dir> --bindings <bindings.json> --core http://127.0.0.1:7350 --apply --expected-digest <validated-sha256>
 ```
 
-커뮤니티 패키지는 선언된 Node·구독을 등록할 수 있습니다. 정확한 버전을 전용 작업 공간에 설치하고 공급자 서비스를 별도로 실행하세요. `validate`의 digest를 `import --expected-digest`에 지정해야 변경이 적용됩니다. 부분 적용 결과의 `applied`·`unresolved`를 확인한 뒤 수동으로 조정하세요. 가져오기 도구는 패키지 코드를 실행하거나 Call을 자동 재시도하지 않습니다.
+## Verify
 
-## Verify / 검증
-
-Run module checks inside Docker from `core/` and `log/` separately. Docker에서 구성요소별로 검증합니다.
+Run module checks from `core/` and `log/` separately in Docker:
 
 ```sh
 docker run --rm -v "$PWD:/src:ro" -w /src golang:1.26 go test ./...
 ```
 
-For the dashboard, run `npm test` from `dashboard/`. To exercise real Runtime and Resource HTTP, subscriptions, a one-to-one reply, and a group conversation without a model call, first build `../roster-node-client/runtime`, then run this isolated Docker fixture from the server repository root:
+Run the dashboard suite from `dashboard/` with `npm test`. To exercise real Runtime and Resource HTTP, subscriptions, one-to-one replies, and a group conversation without a model call, first build `../roster-node-client/runtime`, then run this isolated Docker fixture from the repository root:
 
 ```sh
 pwsh -File core/scripts/verify-isolated.ps1
 ```
 
-대시보드는 `dashboard/`의 `npm test`로 검증합니다. 위 스크립트는 실제 Runtime·Resource 연결과 대화 흐름을 Docker에서 검증하며 모델 호출은 하지 않습니다.
-
-Usage details: [Core](core/README.md), [Dashboard](dashboard/README.md), [Log](log/README.md). Contribution goals and Issue/PR guidance: [CONTRIBUTING](CONTRIBUTING.md). Internal design documents are maintained separately. 사용법은 구성요소 README에, 기여 안내는 CONTRIBUTING에 있습니다. 내부 설계 문서는 별도로 관리합니다.
+Component guides: [Core](core/README.md), [Dashboard](dashboard/README.md), and [Log](log/README.md). Contribution guidance: [CONTRIBUTING](CONTRIBUTING.md).
