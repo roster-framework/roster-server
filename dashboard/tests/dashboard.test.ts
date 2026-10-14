@@ -577,6 +577,7 @@ test("deployment validate is read-only and apply confirms Runtime CAS before reu
 
     const planned = await runDeployment(["validate", "--file", declaration]);
     assert.equal(planned.code, 0); assert.equal(planned.result.status, "planned"); assert.match(planned.result.digest ?? "", /^[a-f0-9]{64}$/u);
+    assert.equal(Object.hasOwn(planned.result, "teams"), false);
     assert.equal(runtimeWrites.length, 0); assert.equal(coreWrites.length, 0);
     assert.equal(JSON.stringify(planned.result).includes("Echo safely."), false);
     const rejectedDigest = await runDeployment(["apply", "--file", declaration, "--expected-digest", "0".repeat(64)]);
@@ -613,6 +614,112 @@ test("deployment validate is read-only and apply confirms Runtime CAS before reu
     assert.equal(coreLost.code, 4); assert.equal(coreLost.result.status, "partial");
     assert.deepEqual(coreLost.result.unresolved, [{ service: "core", id: "notes-to-echo" }]);
     assert.equal(storedAgents.some((agent) => agent.id === "echo-agent-core-lost" && agent.version === 1), true);
+
+    const teamBundleDir = path.join(work, "team-bundle"); await mkdir(teamBundleDir);
+    const teamNodes = [
+      { id: "notes-node", connector_id: "resource", binding_ref: "notes" },
+      { id: "team-node-a", connector_id: "runtime", binding_ref: "team-a" },
+      { id: "team-node-b", connector_id: "runtime", binding_ref: "team-b" },
+    ];
+    await writeFile(path.join(teamBundleDir, "package.json"), JSON.stringify({ name: "@fixture/team-deployment", version: "1.0.0", roster: { manifest: "roster-bundle.json" } }));
+    await writeFile(path.join(teamBundleDir, "roster-bundle.json"), JSON.stringify({ schema: "roster-bundle/1", name: "@fixture/team-deployment", version: "1.0.0", client_profile: "roster-core-import/1", nodes: teamNodes, subscriptions: [] }));
+    const teamBindings = {
+      notes: { url: `http://127.0.0.1:${resourcePort}`, target_id: "notes", token_env: "ROSTER_DEPLOY_TEST_RESOURCE" },
+      "team-a": { url: `http://127.0.0.1:${runtimePort}`, target_id: "team-agent-a", token_env: "ROSTER_DEPLOY_TEST_RUNTIME" },
+      "team-b": { url: `http://127.0.0.1:${runtimePort}`, target_id: "team-agent-b", token_env: "ROSTER_DEPLOY_TEST_RUNTIME" },
+    };
+    const teamBindingsFile = path.join(work, "team-bindings.json"); await writeFile(teamBindingsFile, JSON.stringify({ bindings: teamBindings }));
+    const teamDeclaration = path.join(work, "team-deployment.json");
+    const teamBase = JSON.parse(await readFile(declaration, "utf8")) as Record<string, unknown>;
+    const team = [{ id: "delivery", name: "  Delivery Team  ", roles: [{ id: "reviewers", name: "  Reviewers  ", members: [
+      { agent_id: "team-agent-a", node_id: "team-node-a" }, { agent_id: "team-agent-b", node_id: "team-node-b" },
+    ] }] }];
+    const teamAgents = ["team-agent-a", "team-agent-b"].map((id) => ({ id, expected_version: 0, profile_ref: "echo", config: {}, skill_refs: [], mcp_refs: [], resource_refs: [] }));
+    const teamInput = { ...teamBase, id: "team-fixture", agents: teamAgents, teams: team,
+      bundle: { package_dir: "./team-bundle", bindings_file: "./team-bindings.json" } };
+    await writeFile(teamDeclaration, JSON.stringify(teamInput));
+    const noRuntimeWrites = runtimeWrites.length; const noCoreWrites = coreWrites.length;
+    const teamPlan = await runDeployment(["validate", "--file", teamDeclaration]);
+    assert.equal(teamPlan.code, 0); assert.equal(teamPlan.result.status, "planned");
+    assert.deepEqual(teamPlan.result.teams, [{ id: "delivery", name: "Delivery Team", roles: [{ id: "reviewers", name: "Reviewers", members: [
+      { agent_id: "team-agent-a", node_id: "team-node-a" }, { agent_id: "team-agent-b", node_id: "team-node-b" },
+    ] }] }]);
+    assert.equal(runtimeWrites.length, noRuntimeWrites); assert.equal(coreWrites.length, noCoreWrites);
+    const whitespaceTeamFile = path.join(work, "whitespace-team.json");
+    await writeFile(whitespaceTeamFile, JSON.stringify({ ...teamInput, teams: [{ ...team[0], name: "Delivery Team", roles: [{ ...team[0]!.roles[0], name: "Reviewers" }] }] }));
+    const whitespaceTeamPlan = await runDeployment(["validate", "--file", whitespaceTeamFile]);
+    assert.equal(whitespaceTeamPlan.code, 0); assert.equal(whitespaceTeamPlan.result.digest, teamPlan.result.digest);
+    const renamedTeamFile = path.join(work, "renamed-team.json");
+    await writeFile(renamedTeamFile, JSON.stringify({ ...teamInput, teams: [{ ...team[0], name: "Delivery Team v2" }] }));
+    const renamedPlan = await runDeployment(["validate", "--file", renamedTeamFile]);
+    assert.equal(renamedPlan.code, 0); assert.notEqual(renamedPlan.result.digest, teamPlan.result.digest);
+
+    const invalidTeams = [
+      [{ ...team[0], id: "delivery" }, { ...team[0], id: "delivery" }],
+      [{ ...team[0], roles: [team[0]!.roles[0], { ...team[0]!.roles[0], name: "Other" }] }],
+      [{ ...team[0], roles: [{ ...team[0]!.roles[0], members: [team[0]!.roles[0]!.members[0], { agent_id: "foreign-agent", node_id: "foreign-node" }] }] }],
+      [{ ...team[0], roles: [{ ...team[0]!.roles[0], members: [team[0]!.roles[0]!.members[0], { agent_id: "team-agent-a", node_id: "team-node-b" }] }] }],
+      [{ ...team[0], roles: [{ ...team[0]!.roles[0], members: [team[0]!.roles[0]!.members[0], { agent_id: "team-agent-b", node_id: "team-node-a" }] }] }],
+      [{ ...team[0], extra: "unknown" }],
+      Array.from({ length: 17 }, (_, index) => ({ ...team[0]!, id: `team-${index}` })),
+      [{ ...team[0], roles: Array.from({ length: 33 }, (_, index) => ({ id: `role-${index}`, name: "Role", members: [team[0]!.roles[0]!.members[0]] })) }],
+      [{ ...team[0], roles: [{ ...team[0]!.roles[0], members: Array.from({ length: 33 }, () => team[0]!.roles[0]!.members[0]) }] }],
+    ];
+    for (const [index, invalidTeam] of invalidTeams.entries()) {
+      const invalidTeamFile = path.join(work, `invalid-team-${index}.json`);
+      await writeFile(invalidTeamFile, JSON.stringify({ ...teamInput, teams: invalidTeam }));
+      const result = await runDeployment(["validate", "--file", invalidTeamFile]);
+      assert.equal(result.code, 2); assert.ok(["team_declaration_invalid", "team_reference_invalid"].includes(result.result.code), `team fixture ${index}: ${JSON.stringify(result.result)}`);
+      assert.equal(runtimeWrites.length, noRuntimeWrites); assert.equal(coreWrites.length, noCoreWrites);
+    }
+
+    const teamMismatchCases: Array<{ id: string; nodes?: typeof teamNodes; bindings?: typeof teamBindings }> = [
+      { id: "connector", nodes: teamNodes.map((node) => node.id === "team-node-a" ? { ...node, connector_id: "resource" } : node) },
+      { id: "target", bindings: { ...teamBindings, "team-a": { ...teamBindings["team-a"], target_id: "another-agent" } } },
+      { id: "origin", bindings: { ...teamBindings, "team-a": { ...teamBindings["team-a"], url: "http://127.0.0.1:9" } } },
+      { id: "token", bindings: { ...teamBindings, "team-a": { ...teamBindings["team-a"], token_env: "OTHER_RUNTIME_TOKEN" } } },
+    ];
+    for (const mismatchCase of teamMismatchCases) {
+      const mismatchDir = path.join(work, `team-${mismatchCase.id}-bundle`); await mkdir(mismatchDir);
+      const nodes = mismatchCase.nodes ?? teamNodes;
+      await writeFile(path.join(mismatchDir, "package.json"), JSON.stringify({ name: `@fixture/team-${mismatchCase.id}`, version: "1.0.0", roster: { manifest: "roster-bundle.json" } }));
+      await writeFile(path.join(mismatchDir, "roster-bundle.json"), JSON.stringify({ schema: "roster-bundle/1", name: `@fixture/team-${mismatchCase.id}`, version: "1.0.0", client_profile: "roster-core-import/1", nodes, subscriptions: [] }));
+      const bindingFile = path.join(work, `team-${mismatchCase.id}-bindings.json`);
+      await writeFile(bindingFile, JSON.stringify({ bindings: mismatchCase.bindings ?? teamBindings }));
+      const mismatchFile = path.join(work, `team-${mismatchCase.id}.json`);
+      await writeFile(mismatchFile, JSON.stringify({ ...teamInput, id: `team-${mismatchCase.id}`, bundle: { package_dir: `./team-${mismatchCase.id}-bundle`, bindings_file: `./team-${mismatchCase.id}-bindings.json` } }));
+      const result = await runDeployment(["validate", "--file", mismatchFile]);
+      assert.equal(result.code, 2); assert.equal(result.result.code, "team_node_mismatch");
+      assert.equal(runtimeWrites.length, noRuntimeWrites); assert.equal(coreWrites.length, noCoreWrites);
+    }
+    const foreignNodeFile = path.join(work, "team-foreign-node.json");
+    await writeFile(foreignNodeFile, JSON.stringify({ ...teamInput, id: "team-foreign-node", teams: [{ ...team[0], roles: [{ ...team[0]!.roles[0], members: [team[0]!.roles[0]!.members[0], { agent_id: "team-agent-b", node_id: "foreign-node" }] }] }] }));
+    const foreignNode = await runDeployment(["validate", "--file", foreignNodeFile]);
+    assert.equal(foreignNode.code, 2); assert.equal(foreignNode.result.code, "team_node_mismatch");
+    assert.equal(runtimeWrites.length, noRuntimeWrites); assert.equal(coreWrites.length, noCoreWrites);
+
+    runtimePreflightStatus = 503;
+    const teamFailure = await runDeployment(["validate", "--file", teamDeclaration]);
+    runtimePreflightStatus = 200;
+    assert.equal(teamFailure.code, 2); assert.deepEqual(teamFailure.result.teams, teamPlan.result.teams);
+
+    const teamApply = await runDeployment(["apply", "--file", teamDeclaration, "--expected-digest", teamPlan.result.digest!]);
+    assert.equal(teamApply.code, 0); assert.deepEqual(teamApply.result.teams, teamPlan.result.teams);
+    const beforeReapplyWrites = runtimeWrites.length;
+    const teamReapply = await runDeployment(["apply", "--file", teamDeclaration, "--expected-digest", teamPlan.result.digest!]);
+    assert.equal(teamReapply.code, 2); assert.equal(teamReapply.result.code, "agent_version_conflict");
+    assert.deepEqual(teamReapply.result.teams, teamPlan.result.teams); assert.equal(runtimeWrites.length, beforeReapplyWrites);
+
+    const teamUnknownFile = path.join(work, "team-unknown.json");
+    const teamUnknownInput = { ...teamInput, id: "team-unknown", agents: teamAgents.map((agent) => ({ ...agent, expected_version: 1 })) };
+    await writeFile(teamUnknownFile, JSON.stringify(teamUnknownInput));
+    const teamUnknownPlan = await runDeployment(["validate", "--file", teamUnknownFile]); assert.equal(teamUnknownPlan.code, 0);
+    dropRuntimeReply = true;
+    const teamUnknown = await runDeployment(["apply", "--file", teamUnknownFile, "--expected-digest", teamUnknownPlan.result.digest!]);
+    dropRuntimeReply = false;
+    assert.equal(teamUnknown.code, 4); assert.equal(teamUnknown.result.status, "partial");
+    assert.deepEqual(teamUnknown.result.teams, teamPlan.result.teams);
+    assert.deepEqual(teamUnknown.result.unresolved, [{ service: "runtime", id: "team-agent-a" }]);
     assert.ok(resourceReads >= 6);
   } finally {
     await close(runtime); await close(resource); await close(core);

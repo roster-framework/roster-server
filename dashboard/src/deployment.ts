@@ -16,19 +16,22 @@ const AGENT_FIELDS_COMPLETE = new Set(["id", "name", "description", "kind", "ver
 
 type JsonRecord = Record<string, unknown>;
 type Ref = { id: string; origin: string; token_env: string; expected_version: number; node_id: string };
+type TeamMember = { agent_id: string; node_id: string };
+type TeamRole = { id: string; name: string; members: TeamMember[] };
+type Team = { id: string; name: string; roles: TeamRole[] };
 type AgentDecl = { id: string; expected_version: number; profile_ref: string; config: JsonRecord; prompt_ref?: string; skill_refs: string[]; mcp_refs: string[]; resource_refs: string[] };
-type Deployment = { schema: string; id: string; runtime: { origin: string; token_env: string }; core: { origin: string }; profiles: Record<string, JsonRecord>; agents: AgentDecl[]; resources: Ref[]; bundle: { package_dir: string; bindings_file: string } };
+type Deployment = { schema: string; id: string; runtime: { origin: string; token_env: string }; core: { origin: string }; profiles: Record<string, JsonRecord>; agents: AgentDecl[]; resources: Ref[]; bundle: { package_dir: string; bindings_file: string }; teams?: Team[] };
 type AgentPlan = { id: string; version: number; payload: JsonRecord; prompt_hash: string | null };
 type Preflight = { declaration: Deployment; runtimeOrigin: string; runtimeId: string; coreOrigin: string; runtimeToken: string; resourceTokens: Map<string, string>; agents: AgentPlan[]; resources: Ref[]; bundle: BundlePlan; digest: string };
 type Entry = { service: string; id: string; revision: number | null };
 type Unresolved = { service: string; id: string };
-type Result = { schema: string; deployment_id: string; status: "planned" | "applied" | "partial" | "failed"; digest: string | null; applied: Entry[]; unresolved: Unresolved[]; code: string };
+type Result = { schema: string; deployment_id: string; status: "planned" | "applied" | "partial" | "failed"; digest: string | null; applied: Entry[]; unresolved: Unresolved[]; code: string; teams?: Team[] };
 
 function fail(stage: string, code: string, exitCode = 2): never { throw new BundleError(stage, code, undefined, exitCode); }
 function obj(value: unknown, code = "deployment_invalid"): JsonRecord { if (!value || typeof value !== "object" || Array.isArray(value)) fail("input", code); return value as JsonRecord; }
-function exact(value: JsonRecord, required: string[], optional: string[] = []): void {
+function exact(value: JsonRecord, required: string[], optional: string[] = [], code = "deployment_invalid"): void {
   const allow = new Set([...required, ...optional]);
-  if (Object.keys(value).some((key) => !allow.has(key)) || required.some((key) => !Object.hasOwn(value, key))) fail("input", "deployment_invalid");
+  if (Object.keys(value).some((key) => !allow.has(key)) || required.some((key) => !Object.hasOwn(value, key))) fail("input", code);
 }
 function identifier(value: unknown): value is string { return typeof value === "string" && ID.test(value); }
 function tokenEnv(value: unknown): value is string { return typeof value === "string" && TOKEN_ENV.test(value); }
@@ -82,7 +85,7 @@ function depthCheck(value: unknown, depth = 0): void {
   }
 }
 function normalizeDeployment(value: unknown): Deployment {
-  const root = obj(value); exact(root, ["schema", "id", "runtime", "core", "profiles", "agents", "resources", "bundle"]);
+  const root = obj(value); exact(root, ["schema", "id", "runtime", "core", "profiles", "agents", "resources", "bundle"], ["teams"]);
   if (root.schema !== DEPLOYMENT_SCHEMA || !identifier(root.id)) fail("input", "deployment_invalid");
   const runtime = obj(root.runtime); exact(runtime, ["origin", "token_env"]);
   const core = obj(root.core); exact(core, ["origin"]);
@@ -105,6 +108,30 @@ function normalizeDeployment(value: unknown): Deployment {
     if (row.prompt_ref !== undefined) relativePath(row.prompt_ref);
     return { id: row.id, expected_version: row.expected_version as number, profile_ref: row.profile_ref, config, ...(row.prompt_ref === undefined ? {} : { prompt_ref: row.prompt_ref as string }), skill_refs: row.skill_refs as string[], mcp_refs: row.mcp_refs as string[], resource_refs: row.resource_refs as string[] };
   });
+  let teams: Team[] | undefined;
+  if (root.teams !== undefined) {
+    if (!Array.isArray(root.teams) || root.teams.length > 16) fail("input", "team_declaration_invalid");
+    const teamIds = new Set<string>(); const placedAgents = new Set<string>(); const placedNodes = new Set<string>(); let memberCount = 0;
+    teams = root.teams.map((raw): Team => {
+      const row = obj(raw, "team_declaration_invalid"); exact(row, ["id", "name", "roles"], [], "team_declaration_invalid");
+      if (!identifier(row.id) || teamIds.has(row.id) || typeof row.name !== "string" || !Array.isArray(row.roles) || row.roles.length < 1 || row.roles.length > 32) fail("input", "team_declaration_invalid");
+      teamIds.add(row.id); const name = row.name.trim(); if (name.length < 1 || name.length > 100) fail("input", "team_declaration_invalid");
+      const roleIds = new Set<string>();
+      const roles = row.roles.map((rawRole): TeamRole => {
+        const role = obj(rawRole, "team_declaration_invalid"); exact(role, ["id", "name", "members"], [], "team_declaration_invalid");
+        if (!identifier(role.id) || roleIds.has(role.id) || typeof role.name !== "string" || !Array.isArray(role.members) || role.members.length < 1 || role.members.length > 32) fail("input", "team_declaration_invalid");
+        roleIds.add(role.id); const roleName = role.name.trim(); if (roleName.length < 1 || roleName.length > 100) fail("input", "team_declaration_invalid");
+        const members = role.members.map((rawMember): TeamMember => {
+          const member = obj(rawMember, "team_declaration_invalid"); exact(member, ["agent_id", "node_id"], [], "team_declaration_invalid");
+          if (!identifier(member.agent_id) || !agentIds.has(member.agent_id) || placedAgents.has(member.agent_id) || !identifier(member.node_id) || placedNodes.has(member.node_id) || memberCount >= 32) fail("team", "team_reference_invalid");
+          placedAgents.add(member.agent_id); placedNodes.add(member.node_id); memberCount++;
+          return { agent_id: member.agent_id, node_id: member.node_id };
+        });
+        return { id: role.id, name: roleName, members };
+      });
+      return { id: row.id, name, roles };
+    });
+  }
   if (!Array.isArray(root.resources) || root.resources.length > 32) fail("input", "deployment_invalid");
   const resourceIds = new Set<string>();
   const resources = root.resources.map((raw): Ref => {
@@ -116,7 +143,7 @@ function normalizeDeployment(value: unknown): Deployment {
   for (const agent of agents) if (agent.resource_refs.some((id) => !resourceIds.has(id))) fail("input", "resource_ref_invalid");
   const bundle = obj(root.bundle); exact(bundle, ["package_dir", "bindings_file"]);
   relativePath(bundle.package_dir); relativePath(bundle.bindings_file);
-  return { schema: DEPLOYMENT_SCHEMA, id: root.id, runtime: { origin: providerOrigin(runtime.origin), token_env: runtime.token_env }, core: { origin: coreOrigin(String(core.origin)) }, profiles, agents, resources, bundle: { package_dir: bundle.package_dir as string, bindings_file: bundle.bindings_file as string } };
+  return { schema: DEPLOYMENT_SCHEMA, id: root.id, runtime: { origin: providerOrigin(runtime.origin), token_env: runtime.token_env }, core: { origin: coreOrigin(String(core.origin)) }, profiles, agents, resources, bundle: { package_dir: bundle.package_dir as string, bindings_file: bundle.bindings_file as string }, ...(teams === undefined ? {} : { teams }) };
 }
 function buildPayload(agent: AgentDecl, profile: JsonRecord, instructions: string): JsonRecord {
   const merged = { ...profile, ...agent.config };
@@ -211,11 +238,11 @@ function ensureAgentMatches(current: JsonRecord, desired: JsonRecord, expectedVe
   for (const [key, value] of Object.entries(desired)) if (key !== "version" && !deepEqual(current[key], value)) return false;
   return true;
 }
-async function preflight(file: string, deadline: number, onDeclared?: (id: string) => void): Promise<Preflight> {
+async function preflight(file: string, deadline: number, onDeclared?: (declaration: Deployment) => void): Promise<Preflight> {
   const absoluteFile = path.resolve(file); const { text } = await readUtf8File(absoluteFile, 256 * 1024);
   let raw: unknown; try { raw = parseStrictJson(text); } catch { fail("input", "json_invalid"); }
   depthCheck(raw); const declaration = normalizeDeployment(raw);
-  onDeclared?.(declaration.id);
+  onDeclared?.(declaration);
   const base = path.dirname(absoluteFile);
   const packagePath = resolveRelative(base, declaration.bundle.package_dir);
   const bindingPath = resolveRelative(base, declaration.bundle.bindings_file);
@@ -263,12 +290,16 @@ async function preflight(file: string, deadline: number, onDeclared?: (id: strin
     return { id: resource.id, version: body.version };
   }));
   const bundle = await prepareBundle(packagePath, bindingPath, declaration.core.origin, deadline);
-  const resourceNodes = new Map(bundle.manifest.nodes.map((node) => [node.id, node]));
+  const bundleNodes = new Map(bundle.manifest.nodes.map((node) => [node.id, node]));
   for (const resource of resources) {
-    const node = resourceNodes.get(resource.node_id); const binding = node && bundle.bindings[node.binding_ref];
+    const node = bundleNodes.get(resource.node_id); const binding = node && bundle.bindings[node.binding_ref];
     if (!node || node.connector_id !== "resource" || !binding || binding.target_id !== resource.id || binding.url !== resource.origin || binding.token_env !== resource.token_env) fail("preflight", "resource_node_mismatch");
   }
   for (const agent of declaration.agents) for (const id of agent.resource_refs) if (!resources.some((resource) => resource.id === id && bundle.manifest.nodes.some((node) => node.id === resource.node_id))) fail("preflight", "resource_node_mismatch");
+  for (const team of declaration.teams ?? []) for (const role of team.roles) for (const member of role.members) {
+    const node = bundleNodes.get(member.node_id); const binding = node && bundle.bindings[node.binding_ref];
+    if (!node || node.connector_id !== "runtime" || !binding || binding.target_id !== member.agent_id || binding.url !== declaration.runtime.origin || binding.token_env !== declaration.runtime.token_env) fail("preflight", "team_node_mismatch");
+  }
   const referencedSkills = [...new Set(declaration.agents.flatMap((agent) => agent.skill_refs))].sort();
   const referencedMcp = [...new Set(declaration.agents.flatMap((agent) => agent.mcp_refs))].sort();
   const digestInput = { declaration: JSON.parse(canonical(declaration)), prompt_hashes: promptHashes,
@@ -278,15 +309,27 @@ async function preflight(file: string, deadline: number, onDeclared?: (id: strin
     resources: resourceSnapshots, bundle_plan: bundle.digest };
   return { declaration, runtimeOrigin, runtimeId, coreOrigin: declaration.core.origin, runtimeToken, resourceTokens, agents: agentPlans, resources, bundle, digest: sha(canonical(digestInput)) };
 }
-function output(deploymentId: string, status: Result["status"], digest: string | null, applied: Entry[], unresolved: Unresolved[], code: string): Result {
-  return { schema: RESULT_SCHEMA, deployment_id: deploymentId, status, digest, applied, unresolved, code };
+function output(deploymentId: string, status: Result["status"], digest: string | null, applied: Entry[], unresolved: Unresolved[], code: string, teams?: Team[]): Result {
+  const result: Result = { schema: RESULT_SCHEMA, deployment_id: deploymentId, status, digest, applied, unresolved, code };
+  if (teams !== undefined) {
+    result.teams = teams.map((team) => ({
+      id: team.id,
+      name: team.name,
+      roles: team.roles.map((role) => ({
+        id: role.id,
+        name: role.name,
+        members: role.members.map((member) => ({ agent_id: member.agent_id, node_id: member.node_id })),
+      })),
+    }));
+  }
+  return result;
 }
 function assertBundleNodeLink(plan: BundlePlan, declaration: Deployment): void {
   const nodes = new Map(plan.manifest.nodes.map((node) => [node.id, node]));
   for (const resource of declaration.resources) { const node = nodes.get(resource.node_id); const binding = node && plan.bindings[node.binding_ref]; if (!node || node.connector_id !== "resource" || !binding || binding.target_id !== resource.id || binding.url !== resource.origin || binding.token_env !== resource.token_env) fail("preflight", "resource_node_mismatch"); }
 }
 export async function runDeployment(argv: string[]): Promise<{ code: number; result: Result }> {
-  const started = Date.now(); let deploymentId = ""; let digest: string | null = null; const applied: Entry[] = []; const unresolved: Unresolved[] = [];
+  const started = Date.now(); let deploymentId = ""; let teams: Team[] | undefined; let digest: string | null = null; const applied: Entry[] = []; const unresolved: Unresolved[] = [];
   try {
     if (argv.length < 2 || (argv[0] !== "validate" && argv[0] !== "apply")) fail("arguments", "usage_invalid");
     const action = argv[0]!; const values = new Map<string, string>();
@@ -294,11 +337,11 @@ export async function runDeployment(argv: string[]): Promise<{ code: number; res
     if (!values.has("--file") || action === "validate" && values.has("--expected-digest") || action === "apply" && !/^[a-f0-9]{64}$/u.test(values.get("--expected-digest") ?? "")) fail("arguments", "usage_invalid");
     const deadline = started + 120_000;
     let plan: Preflight;
-    try { plan = await preflight(values.get("--file")!, deadline, (id) => { deploymentId = id; }); }
+    try { plan = await preflight(values.get("--file")!, deadline, (declaration) => { deploymentId = declaration.id; teams = declaration.teams; }); }
     catch (error) { if (error instanceof BundleError && error.exitCode === 4) throw new BundleError(error.stage, error.code, error.id, 2); throw error; }
     digest = plan.digest;
     assertBundleNodeLink(plan.bundle, plan.declaration);
-    if (action === "validate") return { code: 0, result: output(deploymentId, "planned", digest, [], [], "planned") };
+    if (action === "validate") return { code: 0, result: output(deploymentId, "planned", digest, [], [], "planned", teams) };
     if (values.get("--expected-digest") !== plan.digest) fail("digest", "digest_mismatch");
     for (const agent of plan.agents) {
       let sent = false;
@@ -306,7 +349,7 @@ export async function runDeployment(argv: string[]): Promise<{ code: number; res
         const response = await request(plan.runtimeOrigin, "/admin/agents", plan.runtimeToken, deadline, "PUT", agent.payload, () => { sent = true; });
         if (response.status >= 400 && response.status < 500) {
           const status = applied.length ? "partial" : "failed";
-          return { code: 3, result: output(deploymentId, status, digest, applied, unresolved, "runtime_rejected") };
+          return { code: 3, result: output(deploymentId, status, digest, applied, unresolved, "runtime_rejected", teams) };
         }
         if (response.status !== 200) throw new Error("unknown");
         const putManifest = recordOrFail(response.value);
@@ -321,17 +364,17 @@ export async function runDeployment(argv: string[]): Promise<{ code: number; res
         applied.push({ service: "runtime", id: agent.id, revision: agent.version + 1 });
       } catch {
         if (sent) unresolved.push({ service: "runtime", id: agent.id });
-        return { code: 4, result: output(deploymentId, sent || applied.length ? "partial" : "failed", digest, applied, unresolved, sent ? "runtime_unconfirmed" : "runtime_unavailable") };
+        return { code: 4, result: output(deploymentId, sent || applied.length ? "partial" : "failed", digest, applied, unresolved, sent ? "runtime_unconfirmed" : "runtime_unavailable", teams) };
       }
     }
     const bundleResult = await applyBundle(plan.bundle, plan.coreOrigin, deadline);
     applied.push(...bundleResult.applied.map((action) => ({ service: "core", id: action.id, revision: null })));
     unresolved.push(...bundleResult.unresolved.map((action) => ({ service: "core", id: action.id })));
     const bundleCode = applyExitCode(bundleResult);
-    if (bundleCode === 0) return { code: 0, result: output(deploymentId, "applied", digest, applied, unresolved, "applied") };
-    return { code: bundleResult.unresolved.length ? 4 : 3, result: output(deploymentId, "partial", digest, applied, unresolved, bundleResult.failure?.code ?? "core_partial") };
+    if (bundleCode === 0) return { code: 0, result: output(deploymentId, "applied", digest, applied, unresolved, "applied", teams) };
+    return { code: bundleResult.unresolved.length ? 4 : 3, result: output(deploymentId, "partial", digest, applied, unresolved, bundleResult.failure?.code ?? "core_partial", teams) };
   } catch (error) {
     const failure = error instanceof BundleError ? error : new BundleError("input", "deployment_invalid");
-    return { code: failure.exitCode, result: output(deploymentId, failure.exitCode === 4 && applied.length ? "partial" : "failed", digest, applied, unresolved, failure.code) };
+    return { code: failure.exitCode, result: output(deploymentId, failure.exitCode === 4 && applied.length ? "partial" : "failed", digest, applied, unresolved, failure.code, teams) };
   }
 }

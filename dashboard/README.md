@@ -78,6 +78,25 @@ Minimal declaration example (the referenced bundle files must already exist; put
 }
 ```
 
+Optionally add `teams` to describe existing deployments. Names are trimmed for the result. A role is only a label; every member must reference an agent in `agents` and a bundle Node whose connector is `runtime`, with binding target, URL, and token environment matching that Agent and Runtime. Multiple Agents can share one role; the declaration creates no Calls or permissions.
+
+팀은 선택 사항이며 이미 선언된 배치를 묶어 보여줍니다. 이름은 앞뒤 공백을 제거합니다. 역할 이름은 표시용이며, 각 구성원은 `agents`의 Agent와 해당 Agent/Runtime에 맞는 binding을 가진 bundle의 `runtime` Node를 지정해야 합니다. 여러 Agent를 한 역할에 둘 수 있지만, 팀 선언은 Call이나 권한을 만들지 않습니다.
+
+```json
+"teams": [{
+  "id": "delivery",
+  "name": "Delivery Team",
+  "roles": [{
+    "id": "reviewers",
+    "name": "Reviewers",
+    "members": [
+      { "agent_id": "planner", "node_id": "planner-node" },
+      { "agent_id": "reviewer", "node_id": "reviewer-node" }
+    ]
+  }]
+}]
+```
+
 ```sh
 node build/src/cli.js deployment validate --file ../deployment.json
 node build/src/cli.js deployment apply --file ../deployment.json --expected-digest <validated-sha256>
