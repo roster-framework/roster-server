@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
+	"github.com/roster-framework/roster-server/core/internal/observation"
 )
 
 // Root is the in-memory transaction boundary shared by every adapter view.
@@ -21,26 +22,31 @@ type Root struct {
 	messageOrder            map[string][]string
 	reserved                map[string]int
 	subscriptionSetRevision uint64
+	journal                 journalState
+	journalStore            *JournalStore
 }
 
 type Limits struct{ Nodes, Subscriptions, Conversations, Calls, Queue int }
 
 func NewRoot(l Limits) *Root {
 	r := &Root{published: map[string]c.PublishedAdmission{}, messages: map[string]c.MessageAdmission{}, pending: map[string]c.PendingReply{}, replyReceipts: map[string]string{}, messageOrder: map[string][]string{}, reserved: map[string]int{}}
-	r.nodes = rootStore[c.Node](l.Nodes, &r.mu, nil)
-	r.subscriptions = rootStore[c.Subscription](l.Subscriptions, &r.mu, func(c.Change[c.Subscription]) { r.subscriptionSetRevision++ })
-	r.conversations = rootStore[c.Conversation](l.Conversations, &r.mu, nil)
-	r.executions = newExecutions(rootStore[c.Execution](l.Calls, &r.mu, nil), l.Queue, r)
+	r.journal = journalState{entries: []observation.Entry{}, receipts: map[string]observation.StoredReceipt{}, ownerIndex: map[string]map[string]bool{}}
+	r.journalStore = &JournalStore{root: r}
+	r.nodes = rootStore[c.Node](l.Nodes, r, nil)
+	r.subscriptions = rootStore[c.Subscription](l.Subscriptions, r, func(c.Change[c.Subscription]) { r.subscriptionSetRevision++ })
+	r.conversations = rootStore[c.Conversation](l.Conversations, r, nil)
+	r.executions = newExecutions(rootStore[c.Execution](l.Calls, r, nil), l.Queue, r)
 	return r
 }
-func rootStore[T any](capacity int, mu *sync.RWMutex, applied func(c.Change[T])) *Store[T] {
-	return &Store[T]{mu: mu, entries: make(map[string]c.Snapshot[T]), capacity: capacity, applied: applied}
+func rootStore[T any](capacity int, root *Root, applied func(c.Change[T])) *Store[T] {
+	return &Store[T]{mu: &root.mu, entries: make(map[string]c.Snapshot[T]), capacity: capacity, applied: applied, root: root}
 }
 func (r *Root) Nodes() c.Store[c.Node]                 { return r.nodes }
 func (r *Root) Subscriptions() c.Store[c.Subscription] { return r.subscriptions }
 func (r *Root) Conversations() c.Store[c.Conversation] { return r.conversations }
 func (r *Root) Executions() c.ExecutionStore           { return r.executions }
 func (r *Root) Admissions() c.AdmissionState           { return r }
+func (r *Root) Journal() observation.Store             { return r.journalStore }
 
 func copyAdmissionEffect(effect c.AdmissionEffect) (c.AdmissionEffect, error) {
 	b, err := json.Marshal(effect)

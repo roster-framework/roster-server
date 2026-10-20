@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,9 +22,8 @@ import (
 )
 
 type flakyAckOutbox struct {
-	delivery c.Delivery
-	failed   bool
-	acked    bool
+	inner  c.Outbox
+	failed bool
 }
 
 func TestPrivateDeliveryDigestPreservesAndProtectsEmissions(t *testing.T) {
@@ -90,7 +90,7 @@ func (o *orderedOutbox) PendingDeliveries(limit int) ([]c.Delivery, error) {
 	}
 	return c.Clone(o.deliveries[:limit]), nil
 }
-func (o *orderedOutbox) AckDelivery(id string) error {
+func (o *orderedOutbox) AckDelivery(id string, _ ...string) error {
 	o.acked = append(o.acked, id)
 	for i, d := range o.deliveries {
 		if d.ID == id {
@@ -103,35 +103,34 @@ func (o *orderedOutbox) AckDelivery(id string) error {
 func (o *orderedOutbox) PendingDeliveryCount() (int, error) { return len(o.deliveries), nil }
 
 func (o *flakyAckOutbox) PendingDeliveries(limit int) ([]c.Delivery, error) {
-	if o.acked || limit < 1 {
-		return []c.Delivery{}, nil
-	}
-	return []c.Delivery{c.Clone(o.delivery)}, nil
+	return o.inner.PendingDeliveries(limit)
 }
-func (o *flakyAckOutbox) AckDelivery(string) error {
+func (o *flakyAckOutbox) AckDelivery(id string, releaseEventIDs ...string) error {
 	if !o.failed {
 		o.failed = true
 		return errors.New("simulated ACK loss")
 	}
-	o.acked = true
-	return nil
+	return o.inner.AckDelivery(id, releaseEventIDs...)
 }
 func (o *flakyAckOutbox) PendingDeliveryCount() (int, error) {
-	if o.acked {
-		return 0, nil
-	}
-	return 1, nil
+	return o.inner.PendingDeliveryCount()
 }
 
 func TestDrainReplayAfterAckLossAndJournalRingEviction(t *testing.T) {
-	j := observation.New(1)
+	root := memory.NewRoot(memory.Limits{Calls: 2, Queue: 2})
+	j := newJournal(t, root, 1)
 	ev := c.Event{ID: "stable-log", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "log", Category: "observation", Payload: c.Data{"text": "same"}}
-	outbox := &flakyAckOutbox{delivery: c.Delivery{ID: ev.ID, Event: &ev}}
-	drain := event.New(nil, nil, nil, j, nil)
+	if err := root.Executions().CommitBatch(nil, c.Delivery{ID: ev.ID, Kind: c.DeliveryJournal, Event: &ev}); err != nil {
+		t.Fatal(err)
+	}
+	outbox := &flakyAckOutbox{inner: root.Executions()}
+	drain := event.New(nil, nil, nil, nil)
 	if err := drain.Drain(outbox, j, nil); err == nil || mustPendingCount(t, outbox) != 1 {
 		t.Fatal("simulated ACK loss did not retain delivery")
 	}
-	j.Append(c.Event{ID: "evict", Name: "other", Category: "observation", Payload: c.Data{}})
+	if err := j.Append(c.Event{ID: "evict", Name: "other", Category: "observation", Payload: c.Data{}}); err != nil {
+		t.Fatal(err)
+	}
 	if err := drain.Drain(outbox, j, nil); err != nil || mustPendingCount(t, outbox) != 0 {
 		t.Fatalf("replay failed: %v", err)
 	}
@@ -141,12 +140,130 @@ func TestDrainReplayAfterAckLossAndJournalRingEviction(t *testing.T) {
 	}
 }
 
+func TestJournalFacadeProducersSerializeWithDrainAndChangedPublishRetry(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Calls: 4, Queue: 128})
+	producerJournal := newJournal(t, root, 256)
+	drainJournal := producerJournal
+	f := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{"complete": json.RawMessage(`{"type":"object"}`)}}}
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
+	calls := invocation.New(root.Executions(), cat, drainJournal, fixtureAuthority(t))
+	drainer := event.New(root.Subscriptions(), cat, calls, root.Admissions())
+	outbox := &flakyAckOutbox{inner: root.Executions()}
+	published := c.Event{ID: "retry-after-rejection", Source: c.Ref{Namespace: "nodes", ID: "late-node"}, Name: "complete", Category: "published", OccurredAt: c.Now(), Payload: c.Data{}}
+	origin := &c.AdmissionOrigin{Root: published.Source, Actor: published.Source, Kind: c.OriginSource}
+	delivery := c.Delivery{ID: "retry-after-rejection-delivery", Kind: c.DeliveryPublish, Event: &published, Origin: origin}
+	if err := root.Executions().CommitBatch(nil, delivery); err != nil {
+		t.Fatal(err)
+	}
+	priorRejection := c.Event{ID: c.ID(published.ID, "event.rejected", "forbidden"), Source: published.Source, Name: "event.rejected", Category: "observation", OccurredAt: published.OccurredAt, CorrelationID: published.ID, CausationID: published.ID, Payload: c.Data{"event_id": published.ID, "code": "forbidden"}}
+	priorRejectionTwo := c.Event{ID: c.ID(published.ID, "event.rejected", "invalid_schema"), Source: published.Source, Name: "event.rejected", Category: "observation", OccurredAt: published.OccurredAt, CorrelationID: published.ID, CausationID: published.ID, Payload: c.Data{"event_id": published.ID, "code": "invalid_schema"}}
+	for _, rejection := range []c.Event{priorRejection, priorRejectionTwo} {
+		if err := producerJournal.Record(rejection, delivery.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var producers sync.WaitGroup
+	producerErrors := make(chan error, 4)
+	producers.Add(4)
+	go func() {
+		defer producers.Done()
+		for i := 0; i < 24; i++ {
+			if err := producerJournal.Append(c.Event{ID: fmt.Sprintf("stress-append-%02d", i), Name: "stress", Category: "observation", Payload: c.Data{"n": i}}); err != nil {
+				producerErrors <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer producers.Done()
+		for i := 0; i < 24; i++ {
+			e := c.Event{ID: fmt.Sprintf("stress-record-%02d", i), Name: "stress", Category: "observation", Payload: c.Data{"n": i}}
+			if err := producerJournal.Record(e, ""); err != nil {
+				producerErrors <- err
+				return
+			}
+			if err := producerJournal.Release(e.ID); err != nil {
+				producerErrors <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer producers.Done()
+		for i := 0; i < 48; i++ {
+			if _, err := producerJournal.Query(observation.Filter{Limit: 8}); err != nil {
+				producerErrors <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer producers.Done()
+		for i := 0; i < 24; i++ {
+			e := c.Event{ID: fmt.Sprintf("stress-record-release-%02d", i), Name: "stress", Category: "observation", Payload: c.Data{}}
+			if err := producerJournal.Record(e, ""); err != nil {
+				producerErrors <- err
+				return
+			}
+			if _, err := producerJournal.Query(observation.Filter{Limit: 4}); err != nil {
+				producerErrors <- err
+				return
+			}
+			if err := producerJournal.Release(e.ID); err != nil {
+				producerErrors <- err
+				return
+			}
+		}
+	}()
+
+	firstDrain := make(chan error, 1)
+	go func() { firstDrain <- drainer.Drain(outbox, drainJournal, nil) }()
+	select {
+	case err := <-firstDrain:
+		if err == nil || err.Error() != "simulated ACK loss" || mustPendingCount(t, outbox) != 1 {
+			t.Fatalf("initial rejected Publish did not remain pending after simulated ACK loss: pending=%d err=%v", mustPendingCount(t, outbox), err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("initial rejection Drain did not complete")
+	}
+	firstRejectionID := c.ID(published.ID, "event.rejected", "not_found")
+	if _, err := cat.Register(context.Background(), c.Registration{ID: published.Source.ID, ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	secondDrain := make(chan error, 1)
+	go func() { secondDrain <- drainer.Drain(outbox, drainJournal, nil) }()
+	select {
+	case err := <-secondDrain:
+		if err != nil {
+			t.Fatalf("successful changed-disposition Publish retry failed during facade activity: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("successful Publish retry Drain did not complete")
+	}
+	producers.Wait()
+	close(producerErrors)
+	for err := range producerErrors {
+		t.Errorf("concurrent Journal producer failed: %v", err)
+	}
+	if pending := mustPendingCount(t, outbox); pending != 0 {
+		t.Fatalf("single Drain left deliveries pending: %d", pending)
+	}
+	for _, id := range []string{firstRejectionID, priorRejection.ID, priorRejectionTwo.ID} {
+		view, err := root.Journal().ReadRecord(id)
+		if err != nil || view.Receipt == nil || view.Receipt.Pinned || view.Head.PinnedCount != 0 {
+			t.Fatalf("successful retry ACK did not release rejection pin %q: %+v %v", id, view, err)
+		}
+	}
+}
+
 func TestTerminalCallbackErrorRetainsOriginalEnvelopeForRetry(t *testing.T) {
-	j := observation.New(10)
+	root := memory.NewRoot(memory.Limits{Calls: 2, Queue: 2})
+	j := newJournal(t, root, 10)
 	terminal := execution(c.Succeeded)
 	d := c.Delivery{ID: "terminal-callback-error", Kind: c.DeliveryCompletion, Execution: &terminal}
 	outbox := &orderedOutbox{deliveries: []c.Delivery{d}}
-	drain := event.New(nil, nil, nil, j, nil)
+	drain := event.New(nil, nil, nil, nil)
 	callbackErr := errors.New("reply commit failed")
 	if err := drain.Drain(outbox, j, func(c.Delivery) error { return callbackErr }); err != callbackErr || len(outbox.acked) != 0 || mustPendingCount(t, outbox) != 1 {
 		t.Fatalf("callback failure ACKed terminal delivery: err=%v acked=%v", err, outbox.acked)
@@ -186,14 +303,14 @@ func TestTwentyEmissionsAndReplyDrainWhenGeneralOutboxIsFull(t *testing.T) {
 	}
 	f.inspect = func(call c.Call) c.Result { return c.Result{CallID: call.ID, State: c.Running} }
 	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
-	j := observation.New(10000)
-	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New(), j)
+	j := newJournal(t, root, 10000)
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
 	calls := invocation.New(root.Executions(), cat, j, fixtureAuthority(t))
-	events := event.New(root.Subscriptions(), cat, calls, j, root.Admissions())
-	sessions := conversation.New(root.Conversations(), cat, calls, j, root.Admissions())
+	events := event.New(root.Subscriptions(), cat, calls, root.Admissions())
+	sessions := conversation.New(root.Conversations(), cat, calls, root.Admissions())
 	ownerCall := call("reservation-owner")
 	if _, err := calls.SubmitBatch(directOrigin(), []c.Call{ownerCall}); err != nil {
 		t.Fatal(err)
@@ -386,23 +503,33 @@ func countGeneralDeliveries(outbox c.Outbox) (int, error) {
 }
 
 func TestDrainRejectsFanoutDuringShutdownBeforeTerminalReply(t *testing.T) {
-	cat, calls, j, root := fixture(t, &fakeConnector{})
-	events := event.New(root.Subscriptions(), cat, calls, j, root.Admissions())
+	f := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{"complete": json.RawMessage(`{"type":"object"}`)}}}
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	j := newJournal(t, root, 100)
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
+	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	calls := invocation.New(root.Executions(), cat, j, fixtureAuthority(t))
+	events := event.New(root.Subscriptions(), cat, calls, root.Admissions())
 	sub := c.Subscription{ID: "drain-sub", Source: c.Ref{Namespace: "nodes", ID: "node"}, Event: "complete", Target: c.Ref{Namespace: "nodes", ID: "node"}, Operation: "run", Input: c.InputTemplate{Values: c.Data{}, Pointers: map[string]string{"text": "/summary"}}}
 	if _, err := events.Create(sub); err != nil {
 		t.Fatal(err)
 	}
-	calls.BeginDrain()
-	published := c.Event{ID: "late-emission", Source: sub.Source, Name: "complete", Category: "published", OccurredAt: c.Now(), CallID: "origin", CausationID: "origin", Payload: c.Data{"summary": "finished"}}
-	terminal := execution(c.Succeeded)
-	origin := &c.AdmissionOrigin{Root: sub.Source, Actor: sub.Source, Kind: c.OriginResult, ParentCallID: "origin"}
-	outbox := &orderedOutbox{deliveries: []c.Delivery{{ID: published.ID, Event: &published, Origin: origin}, {ID: "terminal-reply", Execution: &terminal}}}
-	var replied int
-	if err := events.Drain(outbox, j, func(c.Delivery) error { replied++; return nil }); err != nil {
+	if err := events.Drain(calls.Outbox(), j, nil); err != nil {
 		t.Fatal(err)
 	}
-	if replied != 1 || mustPendingCount(t, outbox) != 0 || len(outbox.acked) != 2 || outbox.acked[0] != published.ID || outbox.acked[1] != "terminal-reply" {
-		t.Fatalf("shutdown fanout blocked the terminal reply: replies=%d acked=%v pending=%d", replied, outbox.acked, mustPendingCount(t, outbox))
+	calls.BeginDrain()
+	published := c.Event{ID: "late-emission", Source: sub.Source, Name: "complete", Category: "published", OccurredAt: c.Now(), CallID: "origin", CausationID: "origin", Payload: c.Data{"summary": "finished"}}
+	origin := &c.AdmissionOrigin{Root: sub.Source, Actor: sub.Source, Kind: c.OriginResult, ParentCallID: "origin"}
+	if err := root.Executions().CommitBatch(nil, c.Delivery{ID: published.ID, Kind: c.DeliveryPublish, Event: &published, Origin: origin}); err != nil {
+		t.Fatal(err)
+	}
+	if err := events.Drain(calls.Outbox(), j, nil); err != nil {
+		t.Fatal(err)
+	}
+	if mustPendingCount(t, calls.Outbox()) != 0 {
+		t.Fatal("shutdown event rejection remained pending")
 	}
 	page, err := j.Query(observation.Filter{CallID: "origin"})
 	if err != nil || len(page.Entries) != 1 || page.Entries[0].Event.Name != "event.rejected" || page.Entries[0].Event.Payload["code"] != "busy" {
@@ -411,13 +538,23 @@ func TestDrainRejectsFanoutDuringShutdownBeforeTerminalReply(t *testing.T) {
 	if len(mustList(t, calls)) != 0 {
 		t.Fatal("draining event created a downstream call")
 	}
+	terminal := execution(c.Succeeded)
+	outbox := &orderedOutbox{deliveries: []c.Delivery{{ID: "terminal-reply", Execution: &terminal}}}
+	var replied int
+	if err := events.Drain(outbox, j, func(c.Delivery) error { replied++; return nil }); err != nil || replied != 1 || len(outbox.acked) != 1 {
+		t.Fatalf("shutdown rejection blocked a terminal reply: replied=%d acked=%v err=%v", replied, outbox.acked, err)
+	}
 }
 
 func TestDrainRejectsPublishedDeliveryWithoutServerOrigin(t *testing.T) {
-	j := observation.New(10)
-	events := event.New(nil, nil, nil, j, nil)
+	root := memory.NewRoot(memory.Limits{Calls: 2, Queue: 2})
+	j := newJournal(t, root, 10)
+	events := event.New(nil, nil, nil, nil)
 	published := c.Event{ID: "missing-origin", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "complete", Category: "published", OccurredAt: c.Now(), Payload: c.Data{}}
-	outbox := &orderedOutbox{deliveries: []c.Delivery{{ID: published.ID, Event: &published}}}
+	if err := root.Executions().CommitBatch(nil, c.Delivery{ID: published.ID, Kind: c.DeliveryPublish, Event: &published}); err != nil {
+		t.Fatal(err)
+	}
+	outbox := root.Executions()
 	if err := events.Drain(outbox, j, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -428,8 +565,8 @@ func TestDrainRejectsPublishedDeliveryWithoutServerOrigin(t *testing.T) {
 }
 
 func TestEventAtomicFanoutAndIdempotentSnapshot(t *testing.T) {
-	cat, calls, j, root := fixture(t, &fakeConnector{})
-	events := event.New(root.Subscriptions(), cat, calls, j, root.Admissions())
+	cat, calls, _, root := fixture(t, &fakeConnector{})
+	events := event.New(root.Subscriptions(), cat, calls, root.Admissions())
 	sub := c.Subscription{ID: "sub", Source: c.Ref{Namespace: "nodes", ID: "node"}, Event: "complete", Target: c.Ref{Namespace: "nodes", ID: "node"}, Operation: "run", Input: c.InputTemplate{Pointers: map[string]string{"text": "/summary"}}}
 	snap, err := events.Create(sub)
 	if err != nil {
@@ -496,8 +633,8 @@ func TestEventAtomicFanoutAndIdempotentSnapshot(t *testing.T) {
 }
 
 func TestConversationScopeRetryAndLateReply(t *testing.T) {
-	cat, calls, j, root := fixture(t, &fakeConnector{})
-	sessions := conversation.New(root.Conversations(), cat, calls, j, root.Admissions())
+	cat, calls, _, root := fixture(t, &fakeConnector{})
+	sessions := conversation.New(root.Conversations(), cat, calls, root.Admissions())
 	author := c.Ref{Namespace: "users", ID: "author"}
 	recipient := c.Ref{Namespace: "nodes", ID: "node"}
 	conv := c.Conversation{ID: "session", Title: "Review", Participants: []c.Participant{{Ref: author}, {Ref: recipient, Receiver: &c.Receiver{Target: recipient, Operation: "run", Input: c.InputTemplate{Pointers: map[string]string{"text": "/text"}}}}}}

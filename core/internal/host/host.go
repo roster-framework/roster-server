@@ -69,6 +69,7 @@ type Storage struct {
 	Conversations c.Store[c.Conversation]
 	Executions    c.ExecutionStore
 	Admissions    c.AdmissionState
+	Journal       observation.Store
 }
 
 func New(ctx context.Context, opts Options) (*Core, error) {
@@ -81,24 +82,28 @@ func New(ctx context.Context, opts Options) (*Core, error) {
 	if connectors == nil {
 		connectors = map[string]c.Connector{"runtime": runtimeadapter.New(nil, lookup), "resource": resourceadapter.New(nil, lookup)}
 	}
-	j := observation.New(5000)
 	storage := opts.Storage
 	if storage == nil {
 		root := memory.NewRoot(memory.Limits{Nodes: 256, Subscriptions: 512, Conversations: 128, Calls: 1000, Queue: 256})
-		storage = &Storage{Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: root.Executions(), Admissions: root.Admissions()}
+		storage = &Storage{Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: root.Executions(), Admissions: root.Admissions(), Journal: root.Journal()}
 	}
-	if storage.Nodes == nil || storage.Subscriptions == nil || storage.Conversations == nil || storage.Executions == nil || storage.Admissions == nil {
+	if storage.Nodes == nil || storage.Subscriptions == nil || storage.Conversations == nil || storage.Executions == nil || storage.Admissions == nil || storage.Journal == nil {
 		cancel()
-		return nil, c.Err("invalid_input", "Storage must provide every shared adapter view")
+		return nil, c.Err("invalid_input", "Storage must provide every shared adapter view, including Journal")
 	}
-	cat := catalog.New(storage.Nodes, connectors, schema.New(), j)
+	j, err := observation.NewWithStore(storage.Journal, 5000)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	cat := catalog.New(storage.Nodes, connectors, schema.New())
 	auth := opts.Authority
 	if auth == nil {
 		auth = authority.Empty()
 	}
 	calls := invocation.New(storage.Executions, cat, j, auth)
-	events := event.New(storage.Subscriptions, cat, calls, j, storage.Admissions)
-	conv := conversation.New(storage.Conversations, cat, calls, j, storage.Admissions)
+	events := event.New(storage.Subscriptions, cat, calls, storage.Admissions)
+	conv := conversation.New(storage.Conversations, cat, calls, storage.Admissions)
 	instanceID := c.ID(strconv.FormatInt(time.Now().UnixNano(), 10), "core")
 	core := &Core{Catalog: cat, Calls: calls, Events: events, Conversations: conv, Journal: j, Commands: command.New(), cancel: cancel, cancelSources: cancel, sourceContext: sourceContext, instanceID: instanceID, hostDone: make(chan struct{}), parentWatchDone: make(chan struct{})}
 	core.lifecycle = c.Snapshot[c.Lifecycle]{Subject: c.Ref{Namespace: "cores", ID: instanceID}, Revision: 1, Value: c.Lifecycle{State: c.Created, Reason: "host_created", UpdatedAt: c.Now()}}
@@ -133,7 +138,7 @@ func New(ctx context.Context, opts Options) (*Core, error) {
 			defer func() { core.mu.Lock(); core.sourceCount--; core.mu.Unlock() }()
 			defer func() {
 				if recover() != nil {
-					observation.Record(j, c.Ref{Namespace: "nodes", ID: node.ID}, "source.stopped", c.Data{"code": "connector_panic"})
+					core.recordSourceObservation(c.Event{Source: c.Ref{Namespace: "nodes", ID: node.ID}, Name: "source.stopped", Payload: c.Data{"code": "connector_panic"}})
 				}
 			}()
 			err := source.Watch(sourceContext, node.Binding, func(in c.SourceEvent) error {
@@ -148,7 +153,7 @@ func New(ctx context.Context, opts Options) (*Core, error) {
 				return e
 			})
 			if err != nil && sourceContext.Err() == nil {
-				observation.Record(j, c.Ref{Namespace: "nodes", ID: node.ID}, "source.stopped", c.Data{"code": c.AsFault(err).Code})
+				core.recordSourceObservation(c.Event{Source: c.Ref{Namespace: "nodes", ID: node.ID}, Name: "source.stopped", Payload: c.Data{"code": c.AsFault(err).Code}})
 			}
 		}()
 	}
@@ -178,11 +183,12 @@ func New(ctx context.Context, opts Options) (*Core, error) {
 	core.drainCancel = drainCancel
 	core.drainDone = make(chan struct{})
 	calls.OnCommit = core.wakeDelivery
-	calls.Start(context.Background(), workers)
 	if err := core.transitionLocked(c.Running, "workers_ready"); err != nil {
 		cancel()
+		drainCancel()
 		return nil, err
 	}
+	calls.Start(context.Background(), workers)
 	core.Commands.SetEnterHook(core.admitCommand)
 	go core.deliveryLoop(drainContext)
 	core.wakeDelivery()

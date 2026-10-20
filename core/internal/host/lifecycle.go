@@ -31,20 +31,32 @@ func (s *Core) transitionLocked(to c.State, reason string) error {
 	if err != nil {
 		return err
 	}
-	s.lifecycle = c.Snapshot[c.Lifecycle]{Subject: ch.Subject, Revision: ch.AfterRevision, Value: ch.After}
 	ev := lifecycle.StateEvent(ch, c.Event{})
 	ev.Name = "core.state"
 	ev.Payload["revision"] = ch.AfterRevision
-	if err := observation.Project(s.Journal, ev); err != nil {
+	if err := s.Journal.Append(ev); err != nil {
 		return err
 	}
-	s.Journal.Release(ev.ID)
+	s.lifecycle = c.Snapshot[c.Lifecycle]{Subject: ch.Subject, Revision: ch.AfterRevision, Value: ch.After}
 	return nil
+}
+
+func (s *Core) recordSourceObservation(event c.Event) {
+	if err := observation.Record(s.Journal, event.Source, event.Name, event.Payload); err != nil {
+		s.mu.Lock()
+		if s.lifecycleErr == nil {
+			s.lifecycleErr = err
+		}
+		s.mu.Unlock()
+	}
 }
 
 func (s *Core) Status() (Status, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.lifecycleErr != nil {
+		return Status{}, s.lifecycleErr
+	}
 	ids := []string{}
 	calls, err := s.Calls.List()
 	if err != nil {
@@ -77,7 +89,9 @@ func (s *Core) BeginDrain() {
 	}
 	s.closing = true
 	if s.lifecycle.Value.State == c.Running {
-		s.lifecycleErr = s.transitionLocked(c.Cancelling, "host_shutdown")
+		if err := s.transitionLocked(c.Cancelling, "host_shutdown"); err != nil && s.lifecycleErr == nil {
+			s.lifecycleErr = err
+		}
 	}
 	if s.cancelSources != nil {
 		s.cancelSources()
@@ -272,6 +286,7 @@ stopDrain:
 		}
 	}
 	s.mu.Lock()
+	recordError(s.lifecycleErr)
 	ids := []string{}
 	completionKnown := true
 	calls, listErr := s.Calls.List()
