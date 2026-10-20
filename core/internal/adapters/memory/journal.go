@@ -52,14 +52,20 @@ func (s *JournalStore) ReadPage(expectedRevision, afterSequence uint64, limit in
 		return observation.EntryPage{}, c.Err("conflict", "Journal revision changed")
 	}
 	page := observation.EntryPage{Head: journalHeadLocked(r), Entries: []observation.Entry{}}
-	for _, entry := range r.journal.entries {
-		if entry.Sequence <= afterSequence {
-			continue
-		}
-		page.Entries = append(page.Entries, c.Clone(entry))
-		if len(page.Entries) == limit {
-			break
-		}
+	entries := r.journal.entries
+	if len(entries) == 0 || afterSequence >= r.journal.sequence {
+		return page, nil
+	}
+	oldest := entries[0].Sequence
+	var start uint64
+	if afterSequence >= oldest {
+		start = afterSequence - oldest + 1
+	}
+	if start >= uint64(len(entries)) {
+		return page, nil
+	}
+	for i := int(start); i < len(entries) && len(page.Entries) < limit; i++ {
+		page.Entries = append(page.Entries, c.Clone(entries[i]))
 	}
 	return page, nil
 }
@@ -94,12 +100,7 @@ func journalRecordViewLocked(r *Root, eventID string) observation.RecordView {
 		if receipt, ok := r.journal.receipts[eventID]; ok {
 			copy := c.Clone(receipt)
 			view.Receipt = &copy
-		}
-		for _, entry := range r.journal.entries {
-			if entry.Event.ID == eventID {
-				view.Retained = true
-				break
-			}
+			view.Retained = journalReceiptRetainedLocked(&r.journal, receipt)
 		}
 	}
 	if len(r.journal.entries) > 0 {
@@ -111,6 +112,13 @@ func journalRecordViewLocked(r *Root, eventID string) observation.RecordView {
 		}
 	}
 	return view
+}
+
+func journalReceiptRetainedLocked(state *journalState, receipt observation.StoredReceipt) bool {
+	if len(state.entries) == 0 || receipt.Sequence < state.entries[0].Sequence {
+		return false
+	}
+	return receipt.Sequence <= state.sequence
 }
 
 func validateJournalMutationLocked(r *Root, m observation.JournalMutation) error {
@@ -141,11 +149,6 @@ func validateJournalMutationLocked(r *Root, m observation.JournalMutation) error
 		entry := m.Append[0]
 		if entry.Sequence != m.Sequence || entry.Event.ID == "" {
 			return c.Err("invalid_input", "Journal append identity is invalid")
-		}
-		for _, old := range state.entries {
-			if old.Event.ID == entry.Event.ID {
-				return c.Err("conflict", "Journal Event ID is already retained")
-			}
 		}
 		if _, exists := state.receipts[entry.Event.ID]; exists {
 			return c.Err("conflict", "Journal Event ID already has a receipt")
@@ -187,13 +190,10 @@ func validateJournalMutationLocked(r *Root, m observation.JournalMutation) error
 		return c.Err("invalid_input", "Append mutation contains unrelated receipt changes")
 	}
 	seenDelete := map[string]bool{}
-	retained := map[string]bool{}
-	for _, entry := range state.entries {
-		retained[entry.Event.ID] = true
-	}
 	for _, id := range m.DeleteReceiptIDs {
 		receipt, ok := state.receipts[id]
-		if !ok || seenDelete[id] || retained[id] && !(len(m.EvictEventIDs) == 1 && m.EvictEventIDs[0] == id && !receipt.Pinned) || receipt.Pinned && retained[id] {
+		retained := ok && journalReceiptRetainedLocked(state, receipt)
+		if !ok || seenDelete[id] || retained && !(len(m.EvictEventIDs) == 1 && m.EvictEventIDs[0] == id && !receipt.Pinned) || receipt.Pinned && retained {
 			return c.Err("conflict", "Journal receipt deletion target changed")
 		}
 		if !receipt.Pinned && (len(m.EvictEventIDs) != 1 || m.EvictEventIDs[0] != id) {
@@ -201,7 +201,7 @@ func validateJournalMutationLocked(r *Root, m observation.JournalMutation) error
 		}
 		if receipt.Pinned {
 			// A receipt outside the retained window is released by deletion.
-			if retained[id] {
+			if retained {
 				return c.Err("conflict", "Pinned Journal receipt is still retained")
 			}
 		}

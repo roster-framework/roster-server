@@ -2,6 +2,8 @@ package memory
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"reflect"
 	"sort"
@@ -28,6 +30,10 @@ type Executions struct {
 	queue            *Queue
 	outboxMu         sync.Mutex
 	pending          []c.Delivery
+	pendingSlots     map[string]c.PendingObservation
+	storeID          string
+	nextSequence     uint64
+	deliverySequence map[string]uint64
 	receipts         map[string]deliveryReceipt
 	terminalReceipts map[string]deliveryReceipt
 	ackOrder         []string
@@ -39,7 +45,21 @@ func NewExecutions(records, queue int) *Executions {
 	return newExecutions(NewStore[c.Execution](records), queue, nil)
 }
 func newExecutions(store *Store[c.Execution], queue int, root *Root) *Executions {
-	return &Executions{Store: store, queue: NewQueue(queue), pending: []c.Delivery{}, receipts: map[string]deliveryReceipt{}, terminalReceipts: map[string]deliveryReceipt{}, reserved: map[string]int{}, root: root}
+	storeID, err := newStoreID()
+	if err != nil {
+		panic("generate memory store identity: " + err.Error())
+	}
+	return newExecutionsWithID(store, queue, root, storeID)
+}
+func newExecutionsWithID(store *Store[c.Execution], queue int, root *Root, storeID string) *Executions {
+	return &Executions{Store: store, queue: NewQueue(queue), pending: []c.Delivery{}, pendingSlots: map[string]c.PendingObservation{}, receipts: map[string]deliveryReceipt{}, terminalReceipts: map[string]deliveryReceipt{}, reserved: map[string]int{}, deliverySequence: map[string]uint64{}, storeID: storeID, root: root}
+}
+func newStoreID() (string, error) {
+	var entropy [32]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		return "", err
+	}
+	return c.ID("memory-store/1", hex.EncodeToString(entropy[:])), nil
 }
 func (s *Executions) Claim(ctx context.Context) (string, error) { return s.queue.Claim(ctx) }
 
@@ -131,12 +151,21 @@ func (s *Executions) CommitAdmission(admission c.AdmissionCommit) error {
 }
 
 func (s *Executions) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], error) {
-	for i, d := range m.Deliveries {
+	deliveries := append([]c.Delivery{}, m.Deliveries...)
+	if m.Pending != nil {
+		deliveries = append(deliveries, m.Pending.Deliveries...)
+		pendingCopy, err := stagePendingMutation(*m.Pending)
+		if err != nil {
+			return c.Snapshot[c.Execution]{}, c.Err("invalid_input", "Pending observation cannot be stored")
+		}
+		m.Pending = &pendingCopy
+	}
+	for i, d := range deliveries {
 		staged, err := copyDelivery(d)
 		if err != nil {
 			return c.Snapshot[c.Execution]{}, c.Err("invalid_input", "Delivery cannot be stored")
 		}
-		m.Deliveries[i] = staged
+		deliveries[i] = staged
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -149,11 +178,22 @@ func (s *Executions) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], err
 	if !exists || old.Revision != m.ExpectedRevision || old.Value.Call.ID != m.Subject.ID {
 		return c.Snapshot[c.Execution]{}, c.Err("conflict", "Execution revision conflict")
 	}
-	if len(m.Changes) == 0 {
-		if err := s.checkDeliveriesLocked(m.Deliveries, nil); err != nil {
+	if m.Pending != nil {
+		if m.Pending.CallID != m.Subject.ID {
+			return c.Snapshot[c.Execution]{}, c.Err("invalid_input", "Pending observation must belong to the execution")
+		}
+		if err := s.checkPendingLocked(*m.Pending); err != nil {
 			return c.Snapshot[c.Execution]{}, err
 		}
-		s.appendDeliveriesLocked(m.Deliveries, nil)
+	}
+	if len(m.Changes) == 0 {
+		if err := s.checkDeliveriesLocked(deliveries, nil); err != nil {
+			return c.Snapshot[c.Execution]{}, err
+		}
+		s.appendDeliveriesLocked(deliveries, nil)
+		if m.Pending != nil {
+			s.applyPendingLocked(*m.Pending)
+		}
 		return c.Clone(old), nil
 	}
 	current := c.Clone(old)
@@ -166,12 +206,153 @@ func (s *Executions) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], err
 		}
 		current = c.Snapshot[c.Execution]{Subject: ch.Subject, Revision: ch.AfterRevision, Value: c.Clone(ch.After)}
 	}
-	if err := s.checkDeliveriesLocked(m.Deliveries, nil); err != nil {
+	if err := s.checkDeliveriesLocked(deliveries, nil); err != nil {
 		return c.Snapshot[c.Execution]{}, err
 	}
 	s.entries[m.Subject.Key()] = c.Clone(current)
-	s.appendDeliveriesLocked(m.Deliveries, nil)
+	s.appendDeliveriesLocked(deliveries, nil)
+	if m.Pending != nil {
+		s.applyPendingLocked(*m.Pending)
+	}
 	return c.Clone(current), nil
+}
+
+func copyReport(r c.Report) (c.Report, error) {
+	b, err := json.Marshal(r)
+	if err != nil {
+		return c.Report{}, err
+	}
+	var out c.Report
+	if err = json.Unmarshal(b, &out); err != nil {
+		return c.Report{}, err
+	}
+	if r.Result != nil && out.Result != nil {
+		b, err = json.Marshal(r.Result.Emissions)
+		if err != nil {
+			return c.Report{}, err
+		}
+		if err = json.Unmarshal(b, &out.Result.Emissions); err != nil {
+			return c.Report{}, err
+		}
+	}
+	return out, nil
+}
+func copyPendingObservation(p c.PendingObservation) (c.PendingObservation, error) {
+	r, err := copyReport(p.Report)
+	if err != nil {
+		return c.PendingObservation{}, err
+	}
+	p.Report = r
+	return p, nil
+}
+func stagePendingMutation(m c.PendingMutation) (c.PendingMutation, error) {
+	if m.After != nil {
+		copy, err := copyPendingObservation(*m.After)
+		if err != nil {
+			return c.PendingMutation{}, err
+		}
+		m.After = &copy
+	}
+	m.Deliveries = append([]c.Delivery{}, m.Deliveries...)
+	return m, nil
+}
+func (s *Executions) PendingObservation(callID string) (c.PendingObservation, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p, ok := s.pendingSlots[callID]
+	if !ok {
+		return c.PendingObservation{}, false, nil
+	}
+	out, err := copyPendingObservation(p)
+	return out, true, err
+}
+func (s *Executions) PendingObservations() ([]c.PendingObservation, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := make([]string, 0, len(s.pendingSlots))
+	for id := range s.pendingSlots {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]c.PendingObservation, 0, len(ids))
+	for _, id := range ids {
+		p, err := copyPendingObservation(s.pendingSlots[id])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+func (s *Executions) checkPendingLocked(m c.PendingMutation) error {
+	if !c.ValidID(m.CallID) {
+		return c.Err("invalid_input", "Pending observation Call ID is invalid")
+	}
+	current, exists := s.pendingSlots[m.CallID]
+	if exists {
+		if m.ExpectedRevision != current.Revision || m.ExpectedIdentity != current.Identity {
+			return c.Err("conflict", "Pending observation revision conflict")
+		}
+	} else if m.ExpectedRevision != 0 || m.ExpectedIdentity != "" {
+		return c.Err("conflict", "Pending observation revision conflict")
+	}
+	if m.After == nil {
+		if !exists {
+			return c.Err("conflict", "Pending observation is no longer present")
+		}
+		return nil
+	}
+	after := *m.After
+	if after.CallID != m.CallID || after.Revision != m.ExpectedRevision+1 || !c.ValidID(after.Identity) {
+		return c.Err("invalid_input", "Pending observation identity or revision is invalid")
+	}
+	if after.Report.Evidence.CallID != m.CallID || after.Report.Result != nil && after.Report.Result.CallID != m.CallID {
+		return c.Err("invalid_input", "Pending observation report reference is invalid")
+	}
+	call, ok := s.entries[(c.Ref{Namespace: "calls", ID: m.CallID}).Key()]
+	if !ok || after.Origin != call.Value.Origin {
+		return c.Err("conflict", "Pending observation provenance changed")
+	}
+	if _, err := copyReport(after.Report); err != nil {
+		return c.Err("invalid_input", "Pending observation cannot be stored")
+	}
+	return nil
+}
+func (s *Executions) applyPendingLocked(m c.PendingMutation) {
+	if m.After == nil {
+		delete(s.pendingSlots, m.CallID)
+		return
+	}
+	s.pendingSlots[m.CallID] = *m.After
+}
+func (s *Executions) CommitPending(m c.PendingMutation) error {
+	stagedMutation, err := stagePendingMutation(m)
+	if err != nil {
+		return c.Err("invalid_input", "Pending observation cannot be stored")
+	}
+	m = stagedMutation
+	deliveries := make([]c.Delivery, len(m.Deliveries))
+	for i, d := range m.Deliveries {
+		copied, err := copyDelivery(d)
+		if err != nil {
+			return c.Err("invalid_input", "Delivery cannot be stored")
+		}
+		deliveries[i] = copied
+	}
+	m.Deliveries = deliveries
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.outboxMu.Lock()
+	defer s.outboxMu.Unlock()
+	if err := s.checkPendingLocked(m); err != nil {
+		return err
+	}
+	if err := s.checkDeliveriesLocked(m.Deliveries, nil); err != nil {
+		return err
+	}
+	s.appendDeliveriesLocked(m.Deliveries, nil)
+	s.applyPendingLocked(m)
+	return nil
 }
 
 func deliveryDigest(d c.Delivery) (string, error) {
@@ -276,6 +457,7 @@ func (s *Executions) pruneReceiptsLocked(needed int) {
 }
 func (s *Executions) checkDeliveriesLocked(ds []c.Delivery, newCalls map[string]bool) error {
 	newPending := 0
+	newIntents := 0
 	newReceipts := 0
 	newReserved := map[string]int{}
 	batchIDs := map[string]string{}
@@ -327,6 +509,7 @@ func (s *Executions) checkDeliveriesLocked(ds []c.Delivery, newCalls map[string]
 			}
 			continue
 		}
+		newIntents++
 		if !reserved {
 			newReceipts++
 		}
@@ -360,6 +543,9 @@ func (s *Executions) checkDeliveriesLocked(ds []c.Delivery, newCalls map[string]
 	}
 	if len(s.receipts)+newReceipts-min(prunable, max(0, len(s.receipts)+newReceipts-generalReceiptLimit)) > generalReceiptLimit {
 		return c.Err("busy", "Delivery receipt capacity exhausted")
+	}
+	if uint64(newIntents) > ^uint64(0)-s.nextSequence {
+		return c.Err("busy", "Outbox sequence exhausted")
 	}
 	return nil
 }
@@ -403,6 +589,8 @@ func (s *Executions) appendDeliveriesLocked(ds []c.Delivery, newCalls map[string
 	s.pruneReceiptsLocked(newReceipts)
 	for _, item := range planned {
 		d := item.delivery
+		s.nextSequence++
+		s.deliverySequence[d.ID] = s.nextSequence
 		if item.reserved {
 			s.reserved[item.owner]--
 		}
@@ -428,6 +616,41 @@ func (s *Executions) PendingDeliveries(limit int) ([]c.Delivery, error) {
 		out[i] = cloneDelivery(s.pending[i])
 	}
 	return out, nil
+}
+func (s *Executions) ScanPending(after c.OutboxCursor, limit int) ([]c.PendingDelivery, c.OutboxCursor, error) {
+	s.outboxMu.Lock()
+	defer s.outboxMu.Unlock()
+	if limit <= 0 || limit > 64 {
+		return nil, c.OutboxCursor{}, c.Err("invalid_input", "Outbox scan limit must be between 1 and 64")
+	}
+	if after == (c.OutboxCursor{}) {
+		after = c.OutboxCursor{StoreID: s.storeID, Through: s.nextSequence}
+	} else if after.StoreID != s.storeID || after.After > after.Through || after.Through > s.nextSequence {
+		return nil, c.OutboxCursor{}, c.Err("invalid_input", "Outbox cursor is invalid for this store")
+	}
+	out := make([]c.PendingDelivery, 0, limit)
+	for _, d := range s.pending {
+		seq := s.deliverySequence[d.ID]
+		if seq <= after.After || seq > after.Through {
+			continue
+		}
+		cursor := c.OutboxCursor{StoreID: s.storeID, After: seq, Through: after.Through}
+		out = append(out, c.PendingDelivery{Delivery: cloneDelivery(d), Cursor: cursor})
+		if len(out) == limit {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return out, c.OutboxCursor{}, nil
+	}
+	last := out[len(out)-1].Cursor
+	for _, d := range s.pending {
+		seq := s.deliverySequence[d.ID]
+		if seq > last.After && seq <= after.Through {
+			return out, last, nil
+		}
+	}
+	return out, c.OutboxCursor{}, nil
 }
 func (s *Executions) AckDelivery(id string, releaseEventIDs ...string) error {
 	if s.root == nil {
@@ -504,6 +727,7 @@ func (s *Executions) AckDelivery(id string, releaseEventIDs ...string) error {
 		s.receipts[id] = r
 	}
 	s.pending = append(s.pending[:pendingIndex], s.pending[pendingIndex+1:]...)
+	delete(s.deliverySequence, id)
 	if !terminal {
 		s.ackOrder = append(s.ackOrder, id)
 	}
@@ -535,6 +759,7 @@ func (s *Executions) ackLocked(id string) error {
 	for i, d := range s.pending {
 		if d.ID == id {
 			s.pending = append(s.pending[:i], s.pending[i+1:]...)
+			delete(s.deliverySequence, id)
 			break
 		}
 	}

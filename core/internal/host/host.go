@@ -49,7 +49,7 @@ type Core struct {
 	drainWake         chan struct{}
 	drainCancel       context.CancelFunc
 	drainDone         chan struct{}
-	lastDeliveryError *c.Fault
+	lastDeliveryError error
 	ingress           int
 	ingressZero       chan struct{}
 	sourceCount       int
@@ -219,20 +219,55 @@ func (s *Core) deliveryLoop(ctx context.Context) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		s.Calls.RetryPending()
-		drainErr := s.Events.Drain(s.Calls.Outbox(), s.Journal, func(delivery c.Delivery) error {
-			if s.Calls.OnResult != nil {
-				return s.Calls.OnResult(delivery)
-			}
-			return c.Err("internal", "Terminal delivery sink is not configured")
-		})
-		pending, countErr := s.Calls.Outbox().PendingDeliveryCount()
+		retryErr := s.Calls.RetryPending()
+		var drainErr error
+		if retryErr == nil || !invocation.IsPendingReadFailure(retryErr) && !invocation.IsPendingPersistenceFailure(retryErr) && transientDeliveryError(retryErr) {
+			drainErr = s.Events.Drain(s.Calls.Outbox(), s.Journal, func(delivery c.Delivery) error {
+				if s.Calls.OnResult != nil {
+					return s.Calls.OnResult(delivery)
+				}
+				return c.Err("internal", "Terminal delivery sink is not configured")
+			})
+		} else {
+			drainErr = retryErr
+		}
+		pending, deliveryCountErr := s.Calls.Outbox().PendingDeliveryCount()
+		observations, observationCountErr := s.Calls.PendingObservationCount()
+		retryCause := invocation.PendingReadCause(retryErr)
+		if retryCause == nil {
+			retryCause = invocation.PendingPersistenceCause(retryErr)
+		}
+		if retryCause == nil {
+			retryCause = retryErr
+		}
 		s.mu.Lock()
-		if countErr != nil {
-			s.lastDeliveryError = c.AsFault(countErr)
+		var closingErr error
+		switch {
+		case invocation.IsPendingReadFailure(retryErr):
+			closingErr = invocation.PendingReadCause(retryErr)
+		case invocation.IsPendingPersistenceFailure(retryErr):
+			closingErr = invocation.PendingPersistenceCause(retryErr)
+		case deliveryCountErr != nil:
+			closingErr = deliveryCountErr
+		case observationCountErr != nil:
+			closingErr = observationCountErr
+		case drainErr != nil && !transientDeliveryError(drainErr):
+			closingErr = drainErr
+		}
+		if s.closing && s.lifecycleErr == nil && closingErr != nil {
+			s.lifecycleErr = closingErr
+		}
+		if retryErr != nil && (invocation.IsPendingPersistenceFailure(retryErr) || !transientDeliveryError(retryErr)) {
+			s.lastDeliveryError = retryCause
+		} else if deliveryCountErr != nil {
+			s.lastDeliveryError = deliveryCountErr
+		} else if observationCountErr != nil {
+			s.lastDeliveryError = observationCountErr
 		} else if drainErr != nil {
-			s.lastDeliveryError = c.AsFault(drainErr)
-		} else if pending == 0 {
+			s.lastDeliveryError = drainErr
+		} else if retryErr != nil {
+			s.lastDeliveryError = retryCause
+		} else if retryErr == nil && pending == 0 && observations == 0 {
 			s.lastDeliveryError = nil
 		}
 		s.mu.Unlock()
@@ -243,6 +278,14 @@ func (s *Core) deliveryLoop(ctx context.Context) {
 		case <-ticker.C:
 		}
 	}
+}
+
+func transientDeliveryError(err error) bool {
+	if err == nil {
+		return false
+	}
+	code := c.AsFault(err).Code
+	return code == "busy" || code == "conflict"
 }
 func (c *Core) Handler() http.Handler {
 	mux := http.NewServeMux()

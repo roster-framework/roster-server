@@ -8,6 +8,7 @@ import (
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
 	"github.com/roster-framework/roster-server/core/internal/interfaces/command"
 	httpapi "github.com/roster-framework/roster-server/core/internal/interfaces/http"
+	"github.com/roster-framework/roster-server/core/internal/invocation"
 	"github.com/roster-framework/roster-server/core/internal/lifecycle"
 	"github.com/roster-framework/roster-server/core/internal/observation"
 	"net/http"
@@ -78,7 +79,11 @@ func (s *Core) Status() (Status, error) {
 		return Status{}, err
 	}
 	ready := s.lifecycle.Value.State == c.Running && !s.closing && pendingDeliveries == 0 && pendingObservations == 0
-	return Status{InstanceID: s.instanceID, Lifecycle: c.Clone(s.lifecycle), Ready: ready, LocalStopped: stopped, UnresolvedCallIDs: ids, PendingDeliveryCount: pendingDeliveries, PendingObservationCount: pendingObservations, LastDeliveryError: c.Clone(s.lastDeliveryError)}, nil
+	var lastDeliveryFault *c.Fault
+	if s.lastDeliveryError != nil {
+		lastDeliveryFault = command.PublicFault(s.lastDeliveryError)
+	}
+	return Status{InstanceID: s.instanceID, Lifecycle: c.Clone(s.lifecycle), Ready: ready, LocalStopped: stopped, UnresolvedCallIDs: ids, PendingDeliveryCount: pendingDeliveries, PendingObservationCount: pendingObservations, LastDeliveryError: lastDeliveryFault}, nil
 }
 
 func (s *Core) BeginDrain() {
@@ -265,13 +270,38 @@ func (s *Core) finishClose(ctx context.Context, done chan struct{}) {
 		if pendingDeliveries == 0 && pendingObservations == 0 {
 			break
 		}
-		s.Calls.RetryPending()
+		retryErr := s.Calls.RetryPending()
+		if retryErr != nil && (invocation.IsPendingReadFailure(retryErr) || invocation.IsPendingPersistenceFailure(retryErr) || !transientDeliveryError(retryErr)) {
+			if invocation.IsPendingReadFailure(retryErr) {
+				recordError(invocation.PendingReadCause(retryErr))
+			} else if invocation.IsPendingPersistenceFailure(retryErr) {
+				recordError(invocation.PendingPersistenceCause(retryErr))
+			} else {
+				recordError(retryErr)
+			}
+			break
+		}
 		s.wakeDelivery()
 		select {
 		case <-ctx.Done():
 			recordError(c.Err("shutdown_timeout", "Core delivery drain exceeded its deadline"))
 			goto stopDrain
 		case <-drainTick.C:
+			s.mu.Lock()
+			lastDeliveryErr := error(nil)
+			if s.lastDeliveryError != nil {
+				lastDeliveryErr = s.lastDeliveryError
+			}
+			s.mu.Unlock()
+			if lastDeliveryErr != nil && (invocation.IsPendingReadFailure(lastDeliveryErr) || invocation.IsPendingPersistenceFailure(lastDeliveryErr) || !transientDeliveryError(lastDeliveryErr)) {
+				if invocation.IsPendingReadFailure(lastDeliveryErr) {
+					lastDeliveryErr = invocation.PendingReadCause(lastDeliveryErr)
+				} else if invocation.IsPendingPersistenceFailure(lastDeliveryErr) {
+					lastDeliveryErr = invocation.PendingPersistenceCause(lastDeliveryErr)
+				}
+				recordError(lastDeliveryErr)
+				goto stopDrain
+			}
 		}
 	}
 stopDrain:

@@ -296,6 +296,84 @@ func TestMemoryBatchAllOrNothing(t *testing.T) {
 	}
 }
 
+func TestPendingObservationStoreCASCopyAndAtomicConsumption(t *testing.T) {
+	store := memory.NewExecutions(2, 2)
+	if err := store.CommitBatch(queued("pending-cas")); err != nil {
+		t.Fatal(err)
+	}
+	old, err := store.Get(c.Ref{Namespace: "calls", ID: "pending-cas"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstReport := c.Report{Evidence: c.Evidence{CallID: "pending-cas", ReportID: "one"}, Result: &c.Result{CallID: "pending-cas", State: c.Unknown, Emissions: []c.Emission{{Name: "event", Payload: c.Data{"value": 1}}}}}
+	first := c.PendingMutation{CallID: "pending-cas", After: &c.PendingObservation{CallID: "pending-cas", Revision: 1, Identity: c.ID("slot-one"), Report: firstReport}}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*c.PendingObservation)
+	}{
+		{name: "foreign report", mutate: func(slot *c.PendingObservation) { slot.Report.Evidence.CallID = "other-call" }},
+		{name: "foreign result", mutate: func(slot *c.PendingObservation) { slot.Report.Result.CallID = "other-call" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			malformed := first
+			copy := *first.After
+			copy.Report = c.Clone(copy.Report)
+			tc.mutate(&copy)
+			malformed.After = &copy
+			if err := store.CommitPending(malformed); err == nil || c.AsFault(err).Code != "invalid_input" {
+				t.Fatalf("foreign pending reference accepted: %v", err)
+			}
+			if _, ok, err := store.PendingObservation("pending-cas"); err != nil || ok {
+				t.Fatalf("malformed pending reference mutated state: ok=%v err=%v", ok, err)
+			}
+		})
+	}
+	bad := first
+	bad.Deliveries = []c.Delivery{{ID: "invalid"}}
+	if err := store.CommitPending(bad); err == nil {
+		t.Fatal("invalid audit delivery partially saved pending slot")
+	}
+	if _, ok, err := store.PendingObservation("pending-cas"); err != nil || ok {
+		t.Fatalf("failed pending mutation was visible: ok=%v err=%v", ok, err)
+	}
+	if err := store.CommitPending(first); err != nil {
+		t.Fatal(err)
+	}
+	read, ok, err := store.PendingObservation("pending-cas")
+	if err != nil || !ok {
+		t.Fatalf("pending slot missing: %v", err)
+	}
+	read.Report.Result.Emissions[0].Payload["value"] = "caller mutation"
+	read, _, err = store.PendingObservation("pending-cas")
+	if err != nil || read.Report.Result.Emissions[0].Payload["value"] != float64(1) {
+		t.Fatalf("pending emissions were not deeply copied: %+v %v", read, err)
+	}
+	secondReport := firstReport
+	secondReport.Evidence.ReportID = "two"
+	secondReport.Result = &c.Result{CallID: "pending-cas", State: c.Unknown, Emissions: []c.Emission{{Name: "event", Payload: c.Data{"value": 2}}}}
+	secondID := c.ID("slot-two")
+	second := c.PendingMutation{CallID: "pending-cas", ExpectedRevision: 1, ExpectedIdentity: first.After.Identity, After: &c.PendingObservation{CallID: "pending-cas", Revision: 2, Identity: secondID, Report: secondReport}}
+	if err := store.CommitPending(second); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitPending(c.PendingMutation{CallID: "pending-cas", ExpectedRevision: 1, ExpectedIdentity: first.After.Identity}); err == nil || c.AsFault(err).Code != "conflict" {
+		t.Fatalf("stale slot identity consumed newer slot: %v", err)
+	}
+	if _, err := store.Commit(c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: old.Revision, Pending: &c.PendingMutation{CallID: "pending-cas", ExpectedRevision: 2, ExpectedIdentity: secondID}}); err != nil {
+		t.Fatalf("atomic pending consumption failed: %v", err)
+	}
+	if _, ok, err := store.PendingObservation("pending-cas"); err != nil || ok {
+		t.Fatalf("pending slot remained after execution commit: ok=%v err=%v", ok, err)
+	}
+	third := c.PendingMutation{CallID: "pending-cas", After: &c.PendingObservation{CallID: "pending-cas", Revision: 1, Identity: c.ID("slot-three"), Report: firstReport}}
+	if err := store.CommitPending(third); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitPending(c.PendingMutation{CallID: "pending-cas", ExpectedRevision: 1, ExpectedIdentity: secondID}); err == nil || c.AsFault(err).Code != "conflict" {
+		t.Fatalf("old incarnation consumed recreated slot: %v", err)
+	}
+}
+
 func TestTerminalDeliveryUsesAdmissionReservationWhenGeneralOutboxIsFull(t *testing.T) {
 	store := memory.NewExecutions(1, 1)
 	if err := store.CommitBatch(queued("reserved-terminal")); err != nil {
@@ -603,6 +681,52 @@ func TestJournalRuntimeReadsStayBoundedAndDoNotReload(t *testing.T) {
 	}
 }
 
+func TestMemoryJournalSequenceWindowBoundaries(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Calls: 4, Queue: 4})
+	journal := newJournal(t, root, 3)
+	for _, id := range []string{"window-a", "window-b", "window-c"} {
+		if err := journal.Append(c.Event{ID: id, Name: "window", Category: "observation", Payload: c.Data{}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkPage := func(after uint64, want ...string) {
+		t.Helper()
+		page, err := root.Journal().ReadPage(0, after, 10)
+		if err != nil {
+			t.Fatalf("ReadPage after %d: %v", after, err)
+		}
+		got := make([]string, len(page.Entries))
+		for i := range page.Entries {
+			got[i] = page.Entries[i].Event.ID
+		}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("ReadPage after %d = %v, want %v", after, got, want)
+		}
+	}
+	checkPage(0, "window-a", "window-b", "window-c")
+	checkPage(1, "window-b", "window-c")
+	checkPage(3)
+	checkPage(4)
+	checkPage(^uint64(0))
+	if err := journal.Record(c.Event{ID: "window-pinned", Name: "window", Category: "observation", Payload: c.Data{}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"window-d", "window-e", "window-f"} {
+		if err := journal.Append(c.Event{ID: id, Name: "window", Category: "observation", Payload: c.Data{}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pinnedEvicted, err := root.Journal().ReadRecord("window-pinned")
+	if err != nil || pinnedEvicted.Retained || pinnedEvicted.Receipt == nil || !pinnedEvicted.Receipt.Pinned {
+		t.Fatalf("pinned evicted receipt must remain readable outside the sequence window: %+v %v", pinnedEvicted, err)
+	}
+	unpinnedEvicted, err := root.Journal().ReadRecord("window-b")
+	if err != nil || unpinnedEvicted.Retained || unpinnedEvicted.Receipt != nil {
+		t.Fatalf("unpinned evicted receipt must be removed: %+v %v", unpinnedEvicted, err)
+	}
+	checkPage(1, "window-d", "window-e", "window-f")
+}
+
 func TestJournalPinOwnershipAndAppendSemantics(t *testing.T) {
 	root := memory.NewRoot(memory.Limits{Calls: 4, Queue: 4})
 	journal := newJournal(t, root, 2)
@@ -807,6 +931,39 @@ func TestJournalStoreRejectsReceiptLineageMetadataTampering(t *testing.T) {
 	after, readErr := root.Journal().Load()
 	if readErr != nil || after.Revision != before.Revision || len(after.Entries) != 0 || len(after.Receipts) != 0 {
 		t.Fatalf("invalid typed delta partially applied: before=%+v after=%+v err=%v", before, after, readErr)
+	}
+}
+
+func BenchmarkJournalRecordAckRetention(b *testing.B) {
+	for _, capacity := range []int{64, 5000} {
+		b.Run(fmt.Sprintf("capacity=%d", capacity), func(b *testing.B) {
+			root := memory.NewRoot(memory.Limits{Calls: 8, Queue: 8})
+			journal, err := observation.NewWithStore(root.Journal(), capacity)
+			if err != nil {
+				b.Fatal(err)
+			}
+			for i := 0; i < capacity; i++ {
+				if err := journal.Append(c.Event{ID: c.ID("benchmark-seed", fmt.Sprint(i)), Name: "benchmark", Category: "observation", Payload: c.Data{}}); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				id := c.ID("benchmark-delivery", fmt.Sprint(i))
+				event := c.Event{ID: c.ID("benchmark-event", fmt.Sprint(i)), Name: "benchmark", Category: "observation", Payload: c.Data{}}
+				delivery := c.Delivery{ID: id, Kind: c.DeliveryJournal, Event: &event}
+				if err := root.Executions().CommitBatch(nil, delivery); err != nil {
+					b.Fatal(err)
+				}
+				if err := journal.Record(event, id); err != nil {
+					b.Fatal(err)
+				}
+				if err := root.Executions().AckDelivery(id, event.ID); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 
@@ -1365,10 +1522,44 @@ func TestReportSinkRejectsTerminalResultAndForeignCallIdentity(t *testing.T) {
 
 type interceptExecutionStore struct {
 	c.ExecutionStore
-	mu             sync.Mutex
-	listErr        error
-	failures       map[c.State]int
-	afterNextState map[c.State]func()
+	mu                sync.Mutex
+	listErr           error
+	getErr            error
+	getErrOnce        bool
+	pendingReadErr    error
+	pendingListErr    error
+	pendingWriteErr   error
+	failures          map[c.State]int
+	afterNextState    map[c.State]func()
+	conflictOnce      func(c.ExecutionMutation) error
+	afterPendingList  func([]c.PendingObservation)
+	lastMutation      *c.ExecutionMutation
+	pendingWriteCalls int
+}
+
+type faultNodeStore struct {
+	c.Store[c.Node]
+	getErr error
+}
+
+func (s *faultNodeStore) Get(ref c.Ref) (c.Snapshot[c.Node], error) {
+	if s.getErr != nil {
+		return c.Snapshot[c.Node]{}, s.getErr
+	}
+	return s.Store.Get(ref)
+}
+
+func (s *interceptExecutionStore) Get(ref c.Ref) (c.Snapshot[c.Execution], error) {
+	s.mu.Lock()
+	err := s.getErr
+	if err != nil && s.getErrOnce {
+		s.getErr, s.getErrOnce = nil, false
+	}
+	s.mu.Unlock()
+	if err != nil {
+		return c.Snapshot[c.Execution]{}, err
+	}
+	return s.ExecutionStore.Get(ref)
 }
 
 func (s *interceptExecutionStore) List() ([]c.Snapshot[c.Execution], error) {
@@ -1381,12 +1572,51 @@ func (s *interceptExecutionStore) List() ([]c.Snapshot[c.Execution], error) {
 	return s.ExecutionStore.List()
 }
 
+func (s *interceptExecutionStore) PendingObservation(id string) (c.PendingObservation, bool, error) {
+	s.mu.Lock()
+	err := s.pendingReadErr
+	s.mu.Unlock()
+	if err != nil {
+		return c.PendingObservation{}, false, err
+	}
+	return s.ExecutionStore.PendingObservation(id)
+}
+
+func (s *interceptExecutionStore) PendingObservations() ([]c.PendingObservation, error) {
+	s.mu.Lock()
+	err := s.pendingListErr
+	hook := s.afterPendingList
+	s.afterPendingList = nil
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	items, err := s.ExecutionStore.PendingObservations()
+	if err == nil && hook != nil {
+		hook(items)
+	}
+	return items, err
+}
+
+func (s *interceptExecutionStore) CommitPending(m c.PendingMutation) error {
+	s.mu.Lock()
+	err := s.pendingWriteErr
+	s.pendingWriteCalls++
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return s.ExecutionStore.CommitPending(m)
+}
+
 func (s *interceptExecutionStore) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], error) {
 	var state c.State
 	for _, change := range m.Changes {
 		state = change.After.Lifecycle.State
 	}
 	s.mu.Lock()
+	copyMutation := m
+	s.lastMutation = &copyMutation
 	if s.failures[state] > 0 {
 		s.failures[state]--
 		s.mu.Unlock()
@@ -1394,7 +1624,12 @@ func (s *interceptExecutionStore) Commit(m c.ExecutionMutation) (c.Snapshot[c.Ex
 	}
 	callback := s.afterNextState[state]
 	delete(s.afterNextState, state)
+	conflictOnce := s.conflictOnce
+	s.conflictOnce = nil
 	s.mu.Unlock()
+	if conflictOnce != nil {
+		return c.Snapshot[c.Execution]{}, conflictOnce(m)
+	}
 	snap, err := s.ExecutionStore.Commit(m)
 	if err == nil && callback != nil {
 		callback()
@@ -1422,6 +1657,533 @@ func TestSubmitBatchPropagatesListFailureWithoutMutation(t *testing.T) {
 	existingAfter, getErr := base.Get(existingBefore.Subject)
 	if len(items) != 1 || items[0].Value.Call.ID != existingBefore.Value.Call.ID || getErr != nil || existingAfter.Revision != existingBefore.Revision || existingAfter.Value.Lifecycle.State != existingBefore.Value.Lifecycle.State || mustPendingCount(t, base) != 0 {
 		t.Fatalf("List failure changed existing state or admitted work: calls=%d before=%+v after=%+v pending=%d err=%v", len(items), existingBefore, existingAfter, mustPendingCount(t, base), getErr)
+	}
+}
+
+func TestRetryPendingPreservesTypedPendingReadFailures(t *testing.T) {
+	cat, _, journal, _ := fixture(t, &fakeConnector{})
+	base := memory.NewExecutions(8, 8)
+	if err := base.CommitBatch(queued("pending-read-error")); err != nil {
+		t.Fatal(err)
+	}
+	call, err := base.Get(c.Ref{Namespace: "calls", ID: "pending-read-error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := c.Report{Evidence: c.Evidence{CallID: call.Value.Call.ID, ReportID: "pending-report"}, Result: &c.Result{CallID: call.Value.Call.ID, State: c.Unknown}}
+	if err := base.CommitPending(c.PendingMutation{CallID: call.Value.Call.ID, After: &c.PendingObservation{CallID: call.Value.Call.ID, Revision: 1, Identity: c.ID("pending-read-slot"), Origin: call.Value.Origin, Report: report}}); err != nil {
+		t.Fatal(err)
+	}
+	store := &interceptExecutionStore{ExecutionStore: base}
+	s := invocation.New(store, cat, journal, fixtureAuthority(t))
+	listErr := c.Err("busy", "injected pending-list read failure")
+	store.pendingListErr = listErr
+	err = s.RetryPending()
+	if !invocation.IsPendingReadFailure(err) || c.AsFault(err).Code != "busy" || !strings.Contains(err.Error(), listErr.Error()) {
+		t.Fatalf("pending-list read failure was masked or lost its type: %v", err)
+	}
+	store.pendingListErr = nil
+	slotErr := c.Err("conflict", "injected pending-slot read failure")
+	store.pendingReadErr = slotErr
+	err = s.RetryPending()
+	if !invocation.IsPendingReadFailure(err) || c.AsFault(err).Code != "conflict" || !strings.Contains(err.Error(), slotErr.Error()) {
+		t.Fatalf("pending-slot read failure was masked or lost its type: %v", err)
+	}
+	if got, err := base.PendingObservations(); err != nil || len(got) != 1 {
+		t.Fatalf("read failure changed the pending slot: count=%d err=%v", len(got), err)
+	}
+}
+
+func TestPendingSuccessfulResultKeepsExecutionAndCatalogReadFailures(t *testing.T) {
+	for _, failCatalogRead := range []bool{false, true} {
+		name := "execution_store"
+		if failCatalogRead {
+			name = "catalog_store"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+			nodes := &faultNodeStore{Store: root.Nodes()}
+			f := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}}}
+			cat := catalog.New(nodes, map[string]c.Connector{"fake": f}, schema.New())
+			if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+				t.Fatal(err)
+			}
+			base := root.Executions()
+			store := &interceptExecutionStore{ExecutionStore: base}
+			j := newJournal(t, root, 100)
+			s := invocation.New(store, cat, j, fixtureAuthority(t))
+			if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("pending-success-read")}); err != nil {
+				t.Fatal(err)
+			}
+			current, err := base.Get(c.Ref{Namespace: "calls", ID: "pending-success-read"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			report := c.Report{Evidence: c.Evidence{CallID: current.Value.Call.ID, RemoteID: current.Value.Call.ID, ReportID: "success-report", Confirmed: true}, Result: &c.Result{CallID: current.Value.Call.ID, State: c.Succeeded, Output: c.Data{"answer": "ok"}}}
+			if err := base.CommitPending(c.PendingMutation{CallID: current.Value.Call.ID, After: &c.PendingObservation{CallID: current.Value.Call.ID, Revision: 1, Identity: c.ID("pending-success-slot"), Origin: current.Value.Origin, Report: report}}); err != nil {
+				t.Fatal(err)
+			}
+			outboxBefore := mustPendingCount(t, base)
+			readErr := c.Err("busy", "injected success-result read failure")
+			if failCatalogRead {
+				nodes.getErr = readErr
+			} else {
+				store.getErr, store.getErrOnce = readErr, true
+			}
+			err = s.RetryPending()
+			if !invocation.IsPendingReadFailure(err) || c.AsFault(err).Code != "busy" || !strings.Contains(err.Error(), readErr.Error()) {
+				t.Fatalf("success normalization hid typed read failure: %v", err)
+			}
+			latest, getErr := base.Get(current.Subject)
+			pendingSlots, pendingErr := base.PendingObservations()
+			pendingCount := len(pendingSlots)
+			outboxCount := mustPendingCount(t, base)
+			if getErr != nil || pendingErr != nil || latest.Revision != current.Revision || latest.Value.Lifecycle.State != current.Value.Lifecycle.State || pendingCount != 1 || outboxCount != outboxBefore {
+				t.Fatalf("failed normalization mutated execution, pending slot, or effects: call=%+v pending=%d outbox=%d err=%v/%v", latest, pendingCount, outboxCount, getErr, pendingErr)
+			}
+		})
+	}
+}
+
+func TestPendingAuditWriteFailureIsNotMaskedByReportConflict(t *testing.T) {
+	for _, tc := range []struct {
+		code           string
+		wantAttempts   int
+		wantRetryLimit bool
+	}{{code: "conflict", wantAttempts: 8, wantRetryLimit: true}, {code: "storage_write", wantAttempts: 1}} {
+		t.Run(tc.code, func(t *testing.T) {
+			base := memory.NewExecutions(8, 8)
+			if err := base.CommitBatch(queued("pending-audit-priority")); err != nil {
+				t.Fatal(err)
+			}
+			current, err := base.Get(c.Ref{Namespace: "calls", ID: "pending-audit-priority"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			original := c.Report{Evidence: c.Evidence{CallID: "pending-audit-priority", ReportID: "reused-report"}, State: c.Unknown, Payload: c.Data{"version": "old"}}
+			if err := base.CommitPending(c.PendingMutation{CallID: original.Evidence.CallID, After: &c.PendingObservation{CallID: original.Evidence.CallID, Revision: 1, Identity: "slot-old", Origin: current.Value.Origin, Report: original}}); err != nil {
+				t.Fatal(err)
+			}
+			replacement := original
+			replacement.Payload = c.Data{"version": "new"}
+			writeErr := c.Err(tc.code, "injected pending-audit write failure")
+			store := &interceptExecutionStore{ExecutionStore: base, pendingWriteErr: writeErr}
+			store.afterPendingList = func(items []c.PendingObservation) {
+				if len(items) != 1 || items[0].Identity != "slot-old" {
+					t.Errorf("unexpected pending snapshot before interleaved replacement: %+v", items)
+					return
+				}
+				next := c.PendingObservation{CallID: replacement.Evidence.CallID, Revision: 2, Identity: "slot-new", Origin: current.Value.Origin, Report: replacement}
+				if err := base.CommitPending(c.PendingMutation{CallID: next.CallID, ExpectedRevision: items[0].Revision, ExpectedIdentity: items[0].Identity, After: &next}); err != nil {
+					t.Errorf("replace pending slot for deterministic audit race: %v", err)
+				}
+			}
+			cat, _, journal, _ := fixture(t, &fakeConnector{})
+			service := invocation.New(store, cat, journal, fixtureAuthority(t))
+			before := mustPendingCount(t, base)
+			gotErr := service.RetryPending()
+			store.mu.Lock()
+			writeCalls := store.pendingWriteCalls
+			store.mu.Unlock()
+			if writeCalls != tc.wantAttempts {
+				t.Fatalf("CommitPending attempts=%d, want %d", writeCalls, tc.wantAttempts)
+			}
+			if tc.wantRetryLimit {
+				if gotErr == nil || c.AsFault(gotErr).Code != "conflict" || !strings.Contains(gotErr.Error(), "exceeded CAS retry limit") || strings.Contains(gotErr.Error(), "reused with different content") {
+					t.Fatalf("audit CAS retry exhaustion was masked by the domain report conflict: %v", gotErr)
+				}
+			} else if invocation.PendingPersistenceCause(gotErr) != writeErr {
+				t.Fatalf("pending audit write error=%v, want original cause %v", gotErr, writeErr)
+			}
+			slots, err := base.PendingObservations()
+			if err != nil || len(slots) != 1 || slots[0].Identity != "slot-new" || slots[0].Revision != 2 || mustPendingCount(t, base) != before {
+				t.Fatalf("audit failure changed replacement slot or outbox: slots=%+v pending=%d/%d err=%v", slots, mustPendingCount(t, base), before, err)
+			}
+		})
+	}
+}
+
+func TestInspectPropagatesObservationReadAndAuditWriteFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		result    c.State
+		readError bool
+	}{
+		{name: "report-read", result: c.Unknown, readError: true},
+		{name: "pending-audit-write", result: c.Succeeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var store *interceptExecutionStore
+			readErr := c.Err("conflict", "injected observation read failure")
+			writeErr := c.Err("storage_write", "injected pending audit write failure")
+			f := &fakeConnector{
+				descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`), Capabilities: c.Capabilities{Abort: true, Inspect: true}}}, Events: map[string]c.Schema{}},
+				invoke: func(call c.Call, _ c.ReportSink) c.Result {
+					return c.Result{CallID: call.ID, State: c.Unknown}
+				},
+				inspect: func(call c.Call) c.Result {
+					if tc.readError {
+						store.mu.Lock()
+						store.getErr, store.getErrOnce = readErr, true
+						store.mu.Unlock()
+					}
+					result := c.Result{CallID: call.ID, State: tc.result}
+					if tc.result == c.Succeeded {
+						result.Output = c.Data{"answer": "ok"}
+					}
+					return result
+				},
+			}
+			root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
+			journal := newJournal(t, root, 100)
+			cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
+			if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+				t.Fatal(err)
+			}
+			failures := map[c.State]int{}
+			if !tc.readError {
+				failures[c.Succeeded] = 1
+			}
+			store = &interceptExecutionStore{ExecutionStore: root.Executions(), failures: failures, afterNextState: map[c.State]func(){}}
+			if !tc.readError {
+				store.pendingWriteErr = writeErr
+			}
+			service := invocation.New(store, cat, journal, fixtureAuthority(t))
+			id := "inspect-error-" + tc.name
+			if _, err := service.SubmitBatch(directOrigin(), []c.Call{call(id)}); err != nil {
+				t.Fatal(err)
+			}
+			base := root.Executions()
+			current, err := base.Get(c.Ref{Namespace: "calls", ID: id})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, state := range []c.State{c.Preparing, c.Dispatching} {
+				change, moveErr := lifecycle.Move(current, c.Transition{Subject: current.Subject, ExpectedRevision: current.Revision, From: current.Value.Lifecycle.State, To: state, Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}})
+				if moveErr != nil {
+					t.Fatal(moveErr)
+				}
+				current, err = base.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: []c.Change[c.Execution]{change}})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			running := lifecycle.Observe(current, c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id, ReportID: "initial-running", Confirmed: true}, State: c.Running})
+			if running.Err != nil {
+				t.Fatal(running.Err)
+			}
+			current, err = base.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: running.Changes, Deliveries: running.Deliveries})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = service.Inspect(context.Background(), id)
+			if tc.readError {
+				if err != readErr {
+					t.Fatalf("Inspect hid the original read error: %v", err)
+				}
+			} else if err != writeErr {
+				t.Fatalf("Inspect hid the pending-audit write error: %v", err)
+			}
+			latest, getErr := base.Get(c.Ref{Namespace: "calls", ID: id})
+			pending, pendingErr := root.Executions().PendingObservations()
+			if getErr != nil || latest.Value.Lifecycle.State != c.Reconciling || pendingErr != nil || len(pending) != 0 {
+				t.Fatalf("failed inspection changed report state or retained a failed audit: state=%s pending=%d errs=%v/%v", latest.Value.Lifecycle.State, len(pending), getErr, pendingErr)
+			}
+		})
+	}
+}
+
+func TestRetryPendingConsumesRejectedReportAndNextRetryIsNoop(t *testing.T) {
+	base := memory.NewExecutions(8, 8)
+	if err := base.CommitBatch(queued("rejected-pending-retry")); err != nil {
+		t.Fatal(err)
+	}
+	ref := c.Ref{Namespace: "calls", ID: "rejected-pending-retry"}
+	current, err := base.Get(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []c.State{c.Preparing, c.Dispatching} {
+		change, e := lifecycle.Move(current, c.Transition{Subject: ref, ExpectedRevision: current.Revision, From: current.Value.Lifecycle.State, To: state, Evidence: c.Evidence{CallID: ref.ID, Local: true, Confirmed: true}})
+		if e != nil {
+			t.Fatal(e)
+		}
+		current, e = base.Commit(c.ExecutionMutation{Subject: ref, ExpectedRevision: current.Revision, Changes: []c.Change[c.Execution]{change}})
+		if e != nil {
+			t.Fatal(e)
+		}
+	}
+	cat, _, journal, _ := fixture(t, &fakeConnector{})
+	store := &interceptExecutionStore{ExecutionStore: base}
+	service := invocation.New(store, cat, journal, fixtureAuthority(t))
+	accepted := c.Report{Evidence: c.Evidence{CallID: ref.ID, ReportID: "duplicate-receipt", Confirmed: true}, State: c.Running, Payload: c.Data{"value": "accepted"}}
+	change := lifecycle.Observe(current, accepted)
+	if change.Err != nil {
+		t.Fatal(change.Err)
+	}
+	if _, err = base.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: change.Changes, Deliveries: change.Deliveries}); err != nil {
+		t.Fatal(err)
+	}
+	conflicting := accepted
+	conflicting.Payload = c.Data{"value": "conflicting"}
+	pending := c.PendingObservation{CallID: ref.ID, Revision: 1, Identity: "rejected-slot", Origin: current.Value.Origin, Report: conflicting}
+	if err := base.CommitPending(c.PendingMutation{CallID: ref.ID, After: &pending}); err != nil {
+		t.Fatal(err)
+	}
+	firstErr := service.RetryPending()
+	if firstErr == nil || c.AsFault(firstErr).Code != "conflict" {
+		t.Fatalf("first retry did not surface the consumed report rejection: %v", firstErr)
+	}
+	if got := mustPendingObservations(t, service); got != 0 {
+		latest, getErr := base.Get(ref)
+		deliveries, outboxErr := base.PendingDeliveries(20)
+		stored, storedOK, storedErr := base.PendingObservation(ref.ID)
+		store.mu.Lock()
+		mutation := store.lastMutation
+		store.mu.Unlock()
+		names := make([]string, 0, len(mutation.Deliveries))
+		for _, delivery := range mutation.Deliveries {
+			if delivery.Event != nil {
+				names = append(names, delivery.Event.Name)
+			}
+		}
+		t.Fatalf("rejected report was not consumed atomically with its audit: pending=%d state=%s revision=%d deliveries=%d names=%v pendingMutation=%+v stored=%+v/%v/%v incoming=%+v errors=%v/%v first=%v", got, latest.Value.Lifecycle.State, latest.Revision, len(deliveries), names, mutation, stored, storedOK, storedErr, conflicting, getErr, outboxErr, firstErr)
+	}
+	rejected := 0
+	deliveries, err := base.PendingDeliveries(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, delivery := range deliveries {
+		if delivery.Event != nil && delivery.Event.Name == "report.rejected" {
+			rejected++
+		}
+	}
+	if rejected != 1 {
+		t.Fatalf("rejected report produced %d audits, want exactly one", rejected)
+	}
+	if err := service.RetryPending(); err != nil {
+		t.Fatalf("retry after consumed rejection should be a no-op: %v", err)
+	}
+	if got := mustPendingObservations(t, service); got != 0 {
+		t.Fatalf("no-op retry restored a rejected pending slot: %d", got)
+	}
+	deliveries, err = base.PendingDeliveries(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, delivery := range deliveries {
+		if delivery.Event != nil && delivery.Event.Name == "report.rejected" {
+			rejected--
+		}
+	}
+	if rejected != 0 {
+		t.Fatal("no-op retry emitted another rejection audit")
+	}
+}
+
+func TestRejectedNewerObservationDoesNotConsumeOlderPendingInspection(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var base c.ExecutionStore
+	f := &fakeConnector{}
+	f.invoke = func(call c.Call, sink c.ReportSink) c.Result {
+		current, err := base.Get(c.Ref{Namespace: "calls", ID: call.ID})
+		if err != nil {
+			panic(err)
+		}
+		prior := c.Report{Evidence: c.Evidence{CallID: call.ID, RemoteID: call.ID, ReportID: "occupied-receipt", Confirmed: true}, State: c.Running, Payload: c.Data{"version": "accepted"}, ObservedRevision: current.Revision}
+		if err := sink(prior); err != nil {
+			panic(err)
+		}
+		current, err = base.Get(c.Ref{Namespace: "calls", ID: call.ID})
+		if err != nil {
+			panic(err)
+		}
+		terminalResult := c.Result{CallID: call.ID, State: c.Failed, Error: &c.Fault{Code: "remote_failed", Message: "original terminal result"}}
+		terminal := lifecycle.Observe(current, c.Report{Evidence: c.Evidence{CallID: call.ID, RemoteID: call.ID, ReportID: "original-terminal", Confirmed: true}, Result: &terminalResult})
+		if terminal.Err != nil {
+			panic(terminal.Err)
+		}
+		current, err = base.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: terminal.Changes, Deliveries: terminal.Deliveries})
+		if err != nil {
+			panic(err)
+		}
+		oldQuery := c.Report{Evidence: c.Evidence{CallID: call.ID, RemoteID: call.ID, ReportID: "older-query"}, State: c.Unknown, ObservedRevision: current.Revision - 1}
+		slot := c.PendingObservation{CallID: call.ID, Revision: 1, Identity: "older-query-slot", Origin: current.Value.Origin, Report: oldQuery}
+		if err := base.CommitPending(c.PendingMutation{CallID: call.ID, After: &slot}); err != nil {
+			panic(err)
+		}
+		conflict := prior
+		conflict.Payload = c.Data{"version": "conflicting"}
+		conflict.ObservedRevision = current.Revision
+		if conflict.ObservedRevision <= oldQuery.ObservedRevision || conflict.Evidence.ReportID == "" || oldQuery.Evidence.ReportID == "" {
+			panic("rejected report must be a newer inspection query with a colliding report ID")
+		}
+		err = sink(conflict)
+		entered <- struct{}{}
+		<-release
+		if err != nil {
+			return c.Result{CallID: call.ID, State: c.Unknown}
+		}
+		return c.Result{CallID: call.ID, State: c.Unknown}
+	}
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
+	base = root.Executions()
+	journal := newJournal(t, root, 100)
+	f.descriptor = c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`), Capabilities: c.Capabilities{Abort: true, Inspect: true}}}, Events: map[string]c.Schema{}}
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
+	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	service := invocation.New(base, cat, journal, fixtureAuthority(t))
+	if _, err := service.SubmitBatch(directOrigin(), []c.Call{call("rejected-newer-does-not-clear")}); err != nil {
+		t.Fatal(err)
+	}
+	start(t, service)
+	defer close(release)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("connector did not submit the conflicting newer observation")
+	}
+	slot, ok, err := base.PendingObservation("rejected-newer-does-not-clear")
+	if err != nil || !ok || slot.Identity != "older-query-slot" || slot.Report.Evidence.ReportID != "older-query" {
+		t.Fatalf("rejected newer inspection consumed an older pending slot: slot=%+v ok=%v err=%v", slot, ok, err)
+	}
+	audits := 0
+	deliveries, err := base.PendingDeliveries(32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, delivery := range deliveries {
+		if delivery.Event != nil && delivery.Event.Name == "report.rejected" {
+			audits++
+		}
+	}
+	if audits != 1 {
+		t.Fatalf("conflicting observation produced %d rejection audits, want one", audits)
+	}
+}
+
+func TestPendingRetryCASConflictThenConsumesOnce(t *testing.T) {
+	base := memory.NewExecutions(8, 8)
+	if err := base.CommitBatch(queued("pending-cas-once")); err != nil {
+		t.Fatal(err)
+	}
+	ref := c.Ref{Namespace: "calls", ID: "pending-cas-once"}
+	current, err := base.Get(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []c.State{c.Preparing, c.Dispatching} {
+		change, e := lifecycle.Move(current, c.Transition{Subject: ref, ExpectedRevision: current.Revision, From: current.Value.Lifecycle.State, To: state, Evidence: c.Evidence{CallID: ref.ID, Local: true, Confirmed: true}})
+		if e != nil {
+			t.Fatal(e)
+		}
+		current, e = base.Commit(c.ExecutionMutation{Subject: ref, ExpectedRevision: current.Revision, Changes: []c.Change[c.Execution]{change}})
+		if e != nil {
+			t.Fatal(e)
+		}
+	}
+	report := c.Report{Evidence: c.Evidence{CallID: ref.ID, ReportID: "pending-cas-report", Confirmed: true}, State: c.Running}
+	pending := c.PendingObservation{CallID: ref.ID, Revision: 1, Identity: "pending-cas-slot", Origin: current.Value.Origin, Report: report}
+	if err := base.CommitPending(c.PendingMutation{CallID: ref.ID, After: &pending}); err != nil {
+		t.Fatal(err)
+	}
+	cat, _, journal, _ := fixture(t, &fakeConnector{})
+	store := &interceptExecutionStore{ExecutionStore: base}
+	attempts := 0
+	store.conflictOnce = func(c.ExecutionMutation) error {
+		attempts++
+		return c.Err("conflict", "one injected execution CAS conflict")
+	}
+	service := invocation.New(store, cat, journal, fixtureAuthority(t))
+	if err := service.RetryPending(); err != nil {
+		t.Fatalf("single CAS conflict followed by a committed retry should return nil: %v", err)
+	}
+	final, err := base.Get(ref)
+	if err != nil || final.Value.Lifecycle.State != c.Running || attempts != 1 || mustPendingObservations(t, service) != 0 {
+		t.Fatalf("successful CAS retry did not consume exactly once: state=%s attempts=%d pending=%d err=%v", final.Value.Lifecycle.State, attempts, mustPendingObservations(t, service), err)
+	}
+	deliveries, err := base.PendingDeliveries(10)
+	if err != nil || len(deliveries) != 1 || deliveries[0].Event == nil || deliveries[0].Event.Name != "state.changed" {
+		t.Fatalf("successful pending retry emitted %d effects, want one state projection: %+v err=%v", len(deliveries), deliveries, err)
+	}
+	if err := service.RetryPending(); err != nil {
+		t.Fatalf("retry after successful consumption should be nil: %v", err)
+	}
+	deliveriesAfter, err := base.PendingDeliveries(10)
+	if err != nil || len(deliveriesAfter) != 1 || mustPendingObservations(t, service) != 0 {
+		t.Fatalf("no-op retry duplicated an effect or restored pending work: deliveries=%d pending=%d err=%v", len(deliveriesAfter), mustPendingObservations(t, service), err)
+	}
+}
+
+func TestCASRetryDoesNotLeakPriorObservationError(t *testing.T) {
+	var store *interceptExecutionStore
+	secondReportErr := make(chan error, 1)
+	f := &fakeConnector{
+		descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}},
+		invoke: func(call c.Call, report c.ReportSink) c.Result {
+			first := c.Report{Evidence: c.Evidence{CallID: call.ID, RemoteID: call.ID, ReportID: "receipt-reuse", Confirmed: true}, State: c.Running}
+			if err := report(first); err != nil {
+				return c.Result{CallID: call.ID, State: c.Failed, Error: c.AsFault(err)}
+			}
+			store.mu.Lock()
+			store.conflictOnce = func(m c.ExecutionMutation) error {
+				if len(m.Changes) == 0 || m.Changes[0].Reason != "report.rejected" {
+					return c.Err("internal", "CAS retry fixture did not intercept the rejection attempt")
+				}
+				current, err := store.ExecutionStore.Get(m.Subject)
+				if err != nil {
+					return err
+				}
+				next := current.Value
+				next.Observation = c.ObservationCursor{Reports: map[string]string{}, ReportOrder: []string{}}
+				change := lifecycle.Replace(current, next, "test_receipt_eviction")
+				if _, err = store.ExecutionStore.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: []c.Change[c.Execution]{change}}); err != nil {
+					return err
+				}
+				return c.Err("conflict", "simulated concurrent receipt eviction")
+			}
+			store.mu.Unlock()
+			second := c.Report{Evidence: c.Evidence{CallID: call.ID, RemoteID: call.ID, ReportID: "receipt-reuse", Confirmed: true}, State: c.Running, Payload: c.Data{"changed": true}}
+			secondReportErr <- report(second)
+			return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{"answer": "ok"}}
+		},
+	}
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	journal := newJournal(t, root, 100)
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
+	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	store = &interceptExecutionStore{ExecutionStore: root.Executions()}
+	calls := invocation.New(store, cat, journal, fixtureAuthority(t))
+	if _, err := calls.SubmitBatch(directOrigin(), []c.Call{call("cas-error-retry")}); err != nil {
+		t.Fatal(err)
+	}
+	start(t, calls)
+	select {
+	case err := <-secondReportErr:
+		if err != nil {
+			t.Fatalf("successful CAS retry returned stale first-attempt error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("connector did not complete the conflicting report retry")
+	}
+	final := waitState(t, calls, "cas-error-retry", c.Succeeded)
+	if final.Value.Observation.Reports["receipt-reuse"] == "" || mustPendingObservations(t, calls) != 0 {
+		t.Fatalf("successful retry did not persist its receipt and clear pending work: %+v pending=%d", final.Value.Observation, mustPendingObservations(t, calls))
+	}
+	deliveries, err := calls.Outbox().PendingDeliveries(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, delivery := range deliveries {
+		if delivery.Event != nil && delivery.Event.Name == "report.rejected" {
+			t.Fatalf("uncommitted rejected CAS attempt leaked an effect: %+v", delivery.Event)
+		}
 	}
 }
 
@@ -1917,6 +2679,10 @@ func TestNewerInspectionPendingReplacesAndRetriesOnlyItsLineage(t *testing.T) {
 	if err != nil || firstPendingState.Value.Lifecycle.State != c.Reconciling || mustPendingObservations(t, s) != 1 {
 		t.Fatalf("first failed inspection was not retained: %+v err=%v pending=%d", firstPendingState, err, mustPendingObservations(t, s))
 	}
+	firstPending, ok, err := base.PendingObservation("newer-inspect-pending")
+	if err != nil || !ok {
+		t.Fatalf("first pending inspection missing: ok=%v err=%v", ok, err)
+	}
 	unknown, err := base.Get(c.Ref{Namespace: "calls", ID: "newer-inspect-pending"})
 	if err != nil {
 		t.Fatal(err)
@@ -1937,6 +2703,23 @@ func TestNewerInspectionPendingReplacesAndRetriesOnlyItsLineage(t *testing.T) {
 	}
 	if got := mustPendingObservations(t, s); got != 1 {
 		t.Fatalf("newer query did not replace the bounded pending slot: %d", got)
+	}
+	latestPending, ok, err := base.PendingObservation("newer-inspect-pending")
+	if err != nil || !ok || latestPending.Identity == firstPending.Identity {
+		t.Fatalf("newer query did not atomically replace the original slot: latest=%+v ok=%v err=%v", latestPending, ok, err)
+	}
+	deliveries, err := base.PendingDeliveries(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	audits := 0
+	for _, delivery := range deliveries {
+		if delivery.Event != nil && delivery.Event.Name == "report.rejected" && delivery.Event.Payload["report_id"] == firstPending.Report.Evidence.ReportID {
+			audits++
+		}
+	}
+	if audits != 1 {
+		t.Fatalf("replaced pending report must be audited exactly once, got %d", audits)
 	}
 	s.RetryPending()
 	final, err := s.Get("newer-inspect-pending")
