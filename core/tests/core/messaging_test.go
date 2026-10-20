@@ -29,7 +29,7 @@ type flakyAckOutbox struct {
 
 func TestPrivateDeliveryDigestPreservesAndProtectsEmissions(t *testing.T) {
 	store := memory.NewExecutions(2, 2)
-	if err := store.CommitBatch(queued("emission-copy")); err != nil {
+	if err := store.CommitAdmission(c.AdmissionCommit{Changes: queued("emission-copy"), Deliveries: nil}); err != nil {
 		t.Fatal(err)
 	}
 	old, err := store.Get(c.Ref{Namespace: "calls", ID: "emission-copy"})
@@ -247,7 +247,7 @@ func TestBusyPublishBlocksOnlyItsSourceForTheCurrentPass(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := root.Executions().CommitBatch(queued("queue-occupant")); err != nil {
+	if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: queued("queue-occupant"), Deliveries: nil}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := root.Subscriptions().Apply(c.Change[c.Subscription]{ID: "sub-create", Subject: c.Ref{Namespace: "subscriptions", ID: "sub"}, AfterRevision: 1, After: c.Subscription{ID: "sub", Source: c.Ref{Namespace: "nodes", ID: "source-a"}, Event: "complete", Target: c.Ref{Namespace: "nodes", ID: "target"}, Operation: "run", Input: c.InputTemplate{}}}); err != nil {
@@ -266,7 +266,7 @@ func TestBusyPublishBlocksOnlyItsSourceForTheCurrentPass(t *testing.T) {
 		deliveries = append(deliveries, c.Delivery{ID: fmt.Sprintf("publish-a-%02d", i), Kind: c.DeliveryPublish, Event: &published, Origin: ptrOrigin(sourceOrigin("source-a"))})
 	}
 	deliveries = append(deliveries, c.Delivery{ID: "journal-between", Kind: c.DeliveryJournal, Event: &journal}, complete, c.Delivery{ID: "publish-b", Kind: c.DeliveryPublish, Event: &otherSource, Origin: ptrOrigin(sourceOrigin("source-b"))})
-	if err := root.Executions().CommitBatch(nil, deliveries...); err != nil {
+	if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: deliveries}); err != nil {
 		t.Fatal(err)
 	}
 	journalStore := newJournal(t, root, 32)
@@ -350,7 +350,7 @@ func TestOutboxScanUsesFixedThroughAndResumesAcrossAckHoles(t *testing.T) {
 		ev := c.Event{ID: id, Name: "log", Category: "observation", OccurredAt: c.Now(), Payload: c.Data{}}
 		deliveries[i] = c.Delivery{ID: id, Kind: c.DeliveryJournal, Event: &ev}
 	}
-	if err := store.CommitBatch(nil, deliveries...); err != nil {
+	if err := store.CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: deliveries}); err != nil {
 		t.Fatal(err)
 	}
 	first, next, err := store.ScanPending(c.OutboxCursor{}, 64)
@@ -361,7 +361,7 @@ func TestOutboxScanUsesFixedThroughAndResumesAcrossAckHoles(t *testing.T) {
 		t.Fatal(err)
 	}
 	newEvent := c.Event{ID: "scan-new", Name: "log", Category: "observation", OccurredAt: c.Now(), Payload: c.Data{}}
-	if err := store.CommitBatch(nil, c.Delivery{ID: newEvent.ID, Kind: c.DeliveryJournal, Event: &newEvent}); err != nil {
+	if err := store.CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{c.Delivery{ID: newEvent.ID, Kind: c.DeliveryJournal, Event: &newEvent}}}); err != nil {
 		t.Fatal(err)
 	}
 	second, done, err := store.ScanPending(next, 64)
@@ -423,7 +423,7 @@ func TestDrainReplayAfterAckLossAndJournalRingEviction(t *testing.T) {
 	root := memory.NewRoot(memory.Limits{Calls: 2, Queue: 2})
 	j := newJournal(t, root, 1)
 	ev := c.Event{ID: "stable-log", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "log", Category: "observation", Payload: c.Data{"text": "same"}}
-	if err := root.Executions().CommitBatch(nil, c.Delivery{ID: ev.ID, Kind: c.DeliveryJournal, Event: &ev}); err != nil {
+	if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{c.Delivery{ID: ev.ID, Kind: c.DeliveryJournal, Event: &ev}}}); err != nil {
 		t.Fatal(err)
 	}
 	outbox := &flakyAckOutbox{inner: root.Executions()}
@@ -455,7 +455,7 @@ func TestJournalFacadeProducersSerializeWithDrainAndChangedPublishRetry(t *testi
 	published := c.Event{ID: "retry-after-rejection", Source: c.Ref{Namespace: "nodes", ID: "late-node"}, Name: "complete", Category: "published", OccurredAt: c.Now(), Payload: c.Data{}}
 	origin := &c.AdmissionOrigin{Root: published.Source, Actor: published.Source, Kind: c.OriginSource}
 	delivery := c.Delivery{ID: "retry-after-rejection-delivery", Kind: c.DeliveryPublish, Event: &published, Origin: origin}
-	if err := root.Executions().CommitBatch(nil, delivery); err != nil {
+	if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{delivery}}); err != nil {
 		t.Fatal(err)
 	}
 	priorRejection := c.Event{ID: c.ID(published.ID, "event.rejected", "forbidden"), Source: published.Source, Name: "event.rejected", Category: "observation", OccurredAt: published.OccurredAt, CorrelationID: published.ID, CausationID: published.ID, Payload: c.Data{"event_id": published.ID, "code": "forbidden"}}
@@ -830,7 +830,7 @@ func TestDrainRejectsFanoutDuringShutdownBeforeTerminalReply(t *testing.T) {
 	calls.BeginDrain()
 	published := c.Event{ID: "late-emission", Source: sub.Source, Name: "complete", Category: "published", OccurredAt: c.Now(), CallID: "origin", CausationID: "origin", Payload: c.Data{"summary": "finished"}}
 	origin := &c.AdmissionOrigin{Root: sub.Source, Actor: sub.Source, Kind: c.OriginResult, ParentCallID: "origin"}
-	if err := root.Executions().CommitBatch(nil, c.Delivery{ID: published.ID, Kind: c.DeliveryPublish, Event: &published, Origin: origin}); err != nil {
+	if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{c.Delivery{ID: published.ID, Kind: c.DeliveryPublish, Event: &published, Origin: origin}}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := events.Drain(calls.Outbox(), j, nil); err != nil {
@@ -859,7 +859,7 @@ func TestDrainRejectsPublishedDeliveryWithoutServerOrigin(t *testing.T) {
 	j := newJournal(t, root, 10)
 	events := event.New(nil, nil, nil, nil)
 	published := c.Event{ID: "missing-origin", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "complete", Category: "published", OccurredAt: c.Now(), Payload: c.Data{}}
-	if err := root.Executions().CommitBatch(nil, c.Delivery{ID: published.ID, Kind: c.DeliveryPublish, Event: &published}); err != nil {
+	if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{c.Delivery{ID: published.ID, Kind: c.DeliveryPublish, Event: &published}}}); err != nil {
 		t.Fatal(err)
 	}
 	outbox := root.Executions()

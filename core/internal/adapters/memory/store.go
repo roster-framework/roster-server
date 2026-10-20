@@ -8,15 +8,23 @@ import (
 
 // Store provides the same atomic revision contract to every owning module.
 type Store[T any] struct {
-	mu       *sync.RWMutex
-	entries  map[string]c.Snapshot[T]
-	capacity int
-	applied  func(c.Change[T])
-	root     *Root
+	mu        *sync.RWMutex
+	entries   map[string]c.Snapshot[T]
+	capacity  int
+	applied   func(c.Change[T])
+	root      *Root
+	copyValue func(T) T
 }
 
 func NewStore[T any](capacity int) *Store[T] {
-	return &Store[T]{mu: &sync.RWMutex{}, entries: make(map[string]c.Snapshot[T]), capacity: capacity}
+	return newStore[T](capacity, c.Clone[T])
+}
+func newStore[T any](capacity int, copyValue func(T) T) *Store[T] {
+	return &Store[T]{mu: &sync.RWMutex{}, entries: make(map[string]c.Snapshot[T]), capacity: capacity, copyValue: copyValue}
+}
+func (s *Store[T]) copy(snapshot c.Snapshot[T]) c.Snapshot[T] {
+	snapshot.Value = s.copyValue(snapshot.Value)
+	return snapshot
 }
 func (s *Store[T]) Get(ref c.Ref) (c.Snapshot[T], error) {
 	s.mu.RLock()
@@ -25,14 +33,14 @@ func (s *Store[T]) Get(ref c.Ref) (c.Snapshot[T], error) {
 	if !ok {
 		return v, c.Err("not_found", "Record not found")
 	}
-	return c.Clone(v), nil
+	return s.copy(v), nil
 }
 func (s *Store[T]) List() ([]c.Snapshot[T], error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := []c.Snapshot[T]{}
 	for _, v := range s.entries {
-		out = append(out, c.Clone(v))
+		out = append(out, s.copy(v))
 	}
 	return out, nil
 }
@@ -48,7 +56,7 @@ func (s *Store[T]) Apply(ch c.Change[T], deliveries ...c.Delivery) (c.Snapshot[T
 	if len(stagedDeliveries) > 0 && s.root == nil {
 		return c.Snapshot[T]{}, c.Err("invalid_input", "Atomic delivery intents require a shared Root")
 	}
-	next := c.Snapshot[T]{Subject: ch.Subject, Revision: ch.AfterRevision, Value: c.Clone(ch.After)}
+	next := c.Snapshot[T]{Subject: ch.Subject, Revision: ch.AfterRevision, Value: s.copyValue(ch.After)}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(stagedDeliveries) > 0 {
@@ -74,7 +82,7 @@ func (s *Store[T]) Apply(ch c.Change[T], deliveries ...c.Delivery) (c.Snapshot[T
 	if len(stagedDeliveries) > 0 {
 		s.root.executions.appendDeliveriesLocked(stagedDeliveries, nil)
 	}
-	return c.Clone(next), nil
+	return s.copy(next), nil
 }
 
 type Queue struct {

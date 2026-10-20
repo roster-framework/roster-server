@@ -20,18 +20,40 @@ var allowed = map[c.State][]c.State{
 func Create[T any](ref c.Ref, value T, reason string) c.Change[T] {
 	return c.Change[T]{ID: c.ID(ref.Key(), reason, c.Now().String()), Subject: ref, AfterRevision: 1, After: value, Reason: reason, At: c.Now()}
 }
-func Replace[T any](old c.Snapshot[T], value T, reason string) c.Change[T] {
-	before := c.Clone(old.Value)
-	return c.Change[T]{ID: c.ID(old.Subject.Key(), reason, c.Now().String()), Subject: old.Subject, BeforeRevision: old.Revision, AfterRevision: old.Revision + 1, Before: &before, After: value, Reason: reason, At: c.Now()}
+func Replace[T any](old c.Snapshot[T], value T, reason string, copyValue ...func(T) T) c.Change[T] {
+	return replace(old, value, reason, copyValue...)
+}
+func replace[T any](old c.Snapshot[T], value T, reason string, copyValue ...func(T) T) c.Change[T] {
+	copyFn := c.Clone[T]
+	if len(copyValue) > 0 && copyValue[0] != nil {
+		copyFn = copyValue[0]
+	}
+	before := copyFn(old.Value)
+	after := copyFn(value)
+	return c.Change[T]{ID: c.ID(old.Subject.Key(), reason, c.Now().String()), Subject: old.Subject, BeforeRevision: old.Revision, AfterRevision: old.Revision + 1, Before: &before, After: after, Reason: reason, At: c.Now()}
 }
 func Move(old c.Snapshot[c.Execution], tr c.Transition) (c.Change[c.Execution], error) {
 	state, err := MoveState(c.Snapshot[c.Lifecycle]{Subject: old.Subject, Revision: old.Revision, Value: old.Value.Lifecycle}, tr, old.Value.Call.ID)
 	if err != nil {
 		return c.Change[c.Execution]{}, err
 	}
-	next := c.Clone(old.Value)
+	next := c.CopyExecution(old.Value)
 	next.Lifecycle = state.After
-	ch := Replace(old, next, tr.Reason)
+	ch := replace(old, next, tr.Reason, c.CopyExecution)
+	return ch, nil
+}
+
+// Dispatch plans the sole transition that binds a local execution to a
+// captured node revision and connector identity.
+func Dispatch(old c.Snapshot[c.Execution], identity c.DispatchIdentity) (c.Change[c.Execution], error) {
+	ch, err := Move(old, c.Transition{Subject: old.Subject, ExpectedRevision: old.Revision, From: old.Value.Lifecycle.State, To: c.Dispatching, Reason: "dispatch", Evidence: c.Evidence{CallID: old.Value.Call.ID, Local: true, Confirmed: true}})
+	if err != nil {
+		return c.Change[c.Execution]{}, err
+	}
+	if old.Value.Lifecycle.State != c.Preparing || old.Value.Dispatch != nil {
+		return c.Change[c.Execution]{}, c.Err("conflict", "Execution is not ready for dispatch")
+	}
+	ch.After.Dispatch = &identity
 	return ch, nil
 }
 
@@ -117,7 +139,7 @@ func Observe(old c.Snapshot[c.Execution], r c.Report) (out Observation) {
 		out.Deliveries = append(projected, out.Deliveries...)
 	}()
 	advance := func(reason string, value c.Execution) {
-		ch := Replace(old, value, reason)
+		ch := Replace(old, value, reason, c.CopyExecution)
 		out.Changes = append(out.Changes, ch)
 		old = c.Snapshot[c.Execution]{Subject: ch.Subject, Revision: ch.AfterRevision, Value: ch.After}
 	}
@@ -160,7 +182,7 @@ func Observe(old c.Snapshot[c.Execution], r c.Report) (out Observation) {
 	}
 	advanceCursor := func(reason string) {
 		remember()
-		next := c.Clone(old.Value)
+		next := c.CopyExecution(old.Value)
 		next.Observation = cur
 		advance(reason, next)
 	}
@@ -246,9 +268,9 @@ func Observe(old c.Snapshot[c.Execution], r c.Report) (out Observation) {
 	}
 	// A report receipt is itself a revisioned Change, including when no lifecycle edge applies.
 	appendCursor := func(reason string) {
-		next := c.Clone(old.Value)
+		next := c.CopyExecution(old.Value)
 		next.Observation = cur
-		ch := Replace(old, next, reason)
+		ch := Replace(old, next, reason, c.CopyExecution)
 		out.Changes = append(out.Changes, ch)
 		old = c.Snapshot[c.Execution]{Subject: ch.Subject, Revision: ch.AfterRevision, Value: ch.After}
 	}
@@ -285,7 +307,7 @@ func Observe(old c.Snapshot[c.Execution], r c.Report) (out Observation) {
 	if r.Result != nil && r.State.Terminal() {
 		public := c.Clone(*r.Result)
 		public.Emissions = nil
-		next := c.Clone(old.Value)
+		next := c.CopyExecution(old.Value)
 		next.Result = &public
 		next.Observation = cur
 		ch, moveErr := Move(old, c.Transition{Subject: old.Subject, ExpectedRevision: old.Revision, From: old.Value.Lifecycle.State, To: r.State, Reason: "remote_result", Evidence: r.Evidence})
@@ -347,7 +369,8 @@ func Observe(old c.Snapshot[c.Execution], r c.Report) (out Observation) {
 		}
 	}
 	if r.State.Terminal() {
-		snap := c.Clone(old)
+		snap := old
+		snap.Value = c.CopyExecution(old.Value)
 		id := c.ID(call.ID, "terminal", strconv.FormatUint(old.Revision, 10))
 		out.Deliveries = append(out.Deliveries, c.Delivery{ID: id, Execution: &snap})
 	}

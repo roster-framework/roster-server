@@ -39,11 +39,15 @@ func NewRoot(l Limits) *Root {
 	r.nodes = rootStore[c.Node](l.Nodes, r, nil)
 	r.subscriptions = rootStore[c.Subscription](l.Subscriptions, r, func(c.Change[c.Subscription]) { r.subscriptionSetRevision++ })
 	r.conversations = rootStore[c.Conversation](l.Conversations, r, nil)
-	r.executions = newExecutionsWithID(rootStore[c.Execution](l.Calls, r, nil), l.Queue, r, r.storeID)
+	r.executions = newExecutionsWithID(rootStore[c.Execution](l.Calls, r, nil, c.CopyExecution), l.Queue, r, r.storeID)
 	return r
 }
-func rootStore[T any](capacity int, root *Root, applied func(c.Change[T])) *Store[T] {
-	return &Store[T]{mu: &root.mu, entries: make(map[string]c.Snapshot[T]), capacity: capacity, applied: applied, root: root}
+func rootStore[T any](capacity int, root *Root, applied func(c.Change[T]), copyValue ...func(T) T) *Store[T] {
+	copyFn := c.Clone[T]
+	if len(copyValue) > 0 && copyValue[0] != nil {
+		copyFn = copyValue[0]
+	}
+	return &Store[T]{mu: &root.mu, entries: make(map[string]c.Snapshot[T]), capacity: capacity, applied: applied, root: root, copyValue: copyFn}
 }
 func (r *Root) Nodes() c.Store[c.Node]                 { return r.nodes }
 func (r *Root) Subscriptions() c.Store[c.Subscription] { return r.subscriptions }

@@ -35,6 +35,14 @@ type Execution struct {
 	AbortRequested bool              `json:"abort_requested"`
 	AbortReason    string            `json:"abort_reason,omitempty"`
 	Observation    ObservationCursor `json:"observation,omitempty"`
+	Dispatch       *DispatchIdentity `json:"-"`
+}
+type DispatchIdentity struct {
+	NodeID        string `json:"node_id"`
+	NodeRevision  uint64 `json:"node_revision"`
+	ConnectorID   string `json:"connector_id"`
+	BindingDigest string `json:"binding_digest"`
+	RemoteID      string `json:"remote_id"`
 }
 type Event struct {
 	ID             string    `json:"id"`
@@ -109,8 +117,8 @@ type Caller interface {
 	Get(string) (Snapshot[Execution], error)
 }
 type ExecutionStore interface {
-	Store[Execution]
-	CommitBatch([]Change[Execution], ...Delivery) error
+	Get(Ref) (Snapshot[Execution], error)
+	List() ([]Snapshot[Execution], error)
 	CommitAdmission(AdmissionCommit) error
 	Commit(ExecutionMutation) (Snapshot[Execution], error)
 	PendingObservation(callID string) (PendingObservation, bool, error)
@@ -119,6 +127,21 @@ type ExecutionStore interface {
 	Outbox
 	Claim(Context) (string, error)
 }
+
+// CopyExecution returns an independent, lossless copy of an execution,
+// including private connector and emission data that public JSON omits.
+func CopyExecution(value Execution) Execution {
+	out := Clone(value)
+	if value.Dispatch != nil {
+		dispatch := *value.Dispatch
+		out.Dispatch = &dispatch
+	}
+	if value.Result != nil {
+		out.Result.Emissions = Clone(value.Result.Emissions)
+	}
+	return out
+}
+
 type Delivery struct {
 	ID                string               `json:"id"`
 	Origin            *AdmissionOrigin     `json:"origin,omitempty"`
@@ -189,6 +212,7 @@ type ExecutionMutation struct {
 	Changes          []Change[Execution]
 	Deliveries       []Delivery
 	Pending          *PendingMutation
+	NodeRevision     *RevisionRef
 }
 type OutboxCursor struct {
 	StoreID        string

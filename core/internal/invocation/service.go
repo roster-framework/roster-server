@@ -187,6 +187,9 @@ func (s *Service) SubmitBatch(origin c.AdmissionOrigin, calls []c.Call, effects 
 			return nil, c.Err("invalid_input", "Call input exceeds JSON limit")
 		}
 		if _, _, err = s.catalog.Validate(call.Target, call.Operation, call.Input); err != nil {
+			if cause := catalog.ReadCause(err); cause != nil {
+				return nil, cause
+			}
 			return nil, err
 		}
 		data := c.Execution{Call: call, Origin: origin, Lifecycle: c.Lifecycle{State: c.Created, UpdatedAt: c.Now()}}
@@ -256,37 +259,85 @@ func (s *Service) run(id string) {
 			s.failPanic(id)
 		}
 	}()
-	call, n, ready := s.prepare(id)
+	call, n, connector, ready := s.prepare(id)
 	if !ready {
 		return
 	}
 	ctx, cancel := context.WithDeadline(s.ctx, call.Deadline)
 	defer cancel()
-	result := s.catalog.Connector(n.ConnectorID).Invoke(ctx, n.Binding, call, func(report c.Report) error { return s.report(id, report) })
+	result := connector.Invoke(ctx, n.Binding, call, func(report c.Report) error { return s.report(id, report) })
 	s.finish(id, result)
 }
-func (s *Service) prepare(id string) (c.Call, c.Node, bool) {
-	old, err := s.store.Get(ref(id))
-	if err != nil || old.Value.Lifecycle.State != c.Queued {
-		return c.Call{}, c.Node{}, false
+func (s *Service) prepare(id string) (c.Call, c.Node, c.Connector, bool) {
+	for attempt := 0; attempt < 8; attempt++ {
+		old, err := s.store.Get(ref(id))
+		if err != nil {
+			return c.Call{}, c.Node{}, nil, false
+		}
+		state := old.Value.Lifecycle.State
+		if state != c.Queued && state != c.Preparing || old.Value.Dispatch != nil {
+			return c.Call{}, c.Node{}, nil, false
+		}
+		if state == c.Queued {
+			obs := lifecycle.Observe(old, c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Preparing, Payload: c.Data{"reason": "preparing"}})
+			if obs.Err != nil || len(obs.Changes) != 1 {
+				return c.Call{}, c.Node{}, nil, false
+			}
+			old, err = s.store.Commit(c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: old.Revision, Changes: obs.Changes, Deliveries: obs.Deliveries})
+			if err != nil {
+				if c.AsFault(err).Code == "conflict" {
+					continue
+				}
+				return c.Call{}, c.Node{}, nil, false
+			}
+		}
+		call := old.Value.Call
+		if !call.Deadline.After(c.Now()) {
+			_ = s.applyReportAt(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Expired, Payload: c.Data{"reason": "deadline_expired"}}, &old.Revision)
+			return c.Call{}, c.Node{}, nil, false
+		}
+		if s.authority == nil || s.authority.Authorize(old.Value.Origin, "invoke", call.Target, call.Operation) != nil {
+			_ = s.applyReportAt(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Cancelled, Payload: c.Data{"reason": "invoke_authority_revoked"}}, &old.Revision)
+			return c.Call{}, c.Node{}, nil, false
+		}
+		node, _, err := s.catalog.Validate(call.Target, call.Operation, call.Input)
+		if err != nil {
+			if catalog.ReadCause(err) != nil {
+				return c.Call{}, c.Node{}, nil, false
+			}
+			result := c.Result{CallID: id, State: c.Failed, Error: c.AsFault(err)}
+			_ = s.applyReportAt(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, Result: &result}, &old.Revision)
+			return c.Call{}, c.Node{}, nil, false
+		}
+		connector := s.catalog.Connector(node.Value.ConnectorID)
+		if connector == nil {
+			result := c.Result{CallID: id, State: c.Failed, Error: &c.Fault{Code: "connector_unavailable", Message: "Node connector is unavailable"}}
+			_ = s.applyReportAt(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, Result: &result}, &old.Revision)
+			return c.Call{}, c.Node{}, nil, false
+		}
+		bindingDigest, err := c.CanonicalJSONDigest(node.Value.Binding)
+		if err != nil {
+			result := c.Result{CallID: id, State: c.Failed, Error: &c.Fault{Code: "invalid_input", Message: "Node binding is invalid"}}
+			_ = s.applyReportAt(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, Result: &result}, &old.Revision)
+			return c.Call{}, c.Node{}, nil, false
+		}
+		identity := c.DispatchIdentity{NodeID: node.Value.ID, NodeRevision: node.Revision, ConnectorID: node.Value.ConnectorID, BindingDigest: bindingDigest, RemoteID: call.ID}
+		change, err := lifecycle.Dispatch(old, identity)
+		if err != nil {
+			return c.Call{}, c.Node{}, nil, false
+		}
+		event := lifecycle.StateEvent(c.Change[c.Lifecycle]{ID: change.ID, Subject: change.Subject, BeforeRevision: change.BeforeRevision, AfterRevision: change.AfterRevision, After: change.After.Lifecycle, Reason: change.Reason, At: change.At}, c.Event{CallID: call.ID, CorrelationID: call.CorrelationID, ConversationID: call.ConversationID})
+		carrier := c.RevisionRef{Subject: node.Subject, Revision: node.Revision}
+		if _, err = s.store.Commit(c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: old.Revision, Changes: []c.Change[c.Execution]{change}, Deliveries: []c.Delivery{{ID: event.ID, Event: &event}}, NodeRevision: &carrier}); err != nil {
+			if c.AsFault(err).Code == "conflict" {
+				continue
+			}
+			return c.Call{}, c.Node{}, nil, false
+		}
+		return call, node.Value, connector, true
 	}
-	old, err = s.localMove(old, c.Preparing)
-	if err != nil {
-		return c.Call{}, c.Node{}, false
-	}
-	call := old.Value.Call
-	if !call.Deadline.After(c.Now()) {
-		_, _ = s.localMove(old, c.Expired)
-		return c.Call{}, c.Node{}, false
-	}
-	n, _, err := s.catalog.Validate(call.Target, call.Operation, call.Input)
-	if err != nil {
-		result := c.Result{CallID: id, State: c.Failed, Error: c.AsFault(err)}
-		_ = s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, Result: &result})
-		return c.Call{}, c.Node{}, false
-	}
-	old, err = s.localMove(old, c.Dispatching)
-	return call, n, err == nil
+	_ = s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, Name: "observation", Payload: c.Data{"reason": "prepare_revalidation_exhausted"}})
+	return c.Call{}, c.Node{}, nil, false
 }
 func (s *Service) report(id string, r c.Report) error {
 	if r.Evidence.CallID == "" {
@@ -308,6 +359,29 @@ func (s *Service) report(id string, r c.Report) error {
 }
 func (s *Service) finish(id string, result c.Result) {
 	_ = s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id, Confirmed: result.State.Terminal() || result.State == c.Waiting}, Result: &result})
+}
+
+func (s *Service) dispatchRoute(execution c.Snapshot[c.Execution]) (c.Snapshot[c.Node], c.Operation, c.Connector, error) {
+	dispatch := execution.Value.Dispatch
+	if dispatch == nil || dispatch.RemoteID != execution.Value.Call.ID {
+		return c.Snapshot[c.Node]{}, c.Operation{}, nil, c.Err("conflict", "Execution has no matching dispatch identity")
+	}
+	node, op, err := s.catalog.Validate(execution.Value.Call.Target, execution.Value.Call.Operation, execution.Value.Call.Input)
+	if err != nil {
+		if cause := catalog.ReadCause(err); cause != nil {
+			return c.Snapshot[c.Node]{}, c.Operation{}, nil, pendingReadFailure{cause: cause}
+		}
+		return c.Snapshot[c.Node]{}, c.Operation{}, nil, c.Err("conflict", "Node no longer matches dispatch identity")
+	}
+	digest, err := c.CanonicalJSONDigest(node.Value.Binding)
+	if err != nil || node.Subject.ID != dispatch.NodeID || node.Revision != dispatch.NodeRevision || node.Value.ID != dispatch.NodeID || node.Value.ConnectorID != dispatch.ConnectorID || digest != dispatch.BindingDigest {
+		return c.Snapshot[c.Node]{}, c.Operation{}, nil, c.Err("conflict", "Node no longer matches dispatch identity")
+	}
+	connector := s.catalog.Connector(dispatch.ConnectorID)
+	if connector == nil {
+		return c.Snapshot[c.Node]{}, c.Operation{}, nil, c.Err("conflict", "Dispatch connector is unavailable")
+	}
+	return node, op, connector, nil
 }
 
 func (s *Service) normalizeResult(id string, result c.Result, allowProgress bool) (c.Result, error) {
@@ -766,11 +840,13 @@ func (s *Service) abort(ctx context.Context, id, reason string, expectedRevision
 		}
 		return current, nil
 	}
-	n, err := s.catalog.Get(old.Value.Call.Target.ID)
+	n, op, connector, err := s.dispatchRoute(old)
 	if err != nil {
-		return old, pendingReadFailure{cause: err}
+		if cause := PendingReadCause(err); cause != nil && !hostShutdown {
+			return old, cause
+		}
+		return old, err
 	}
-	op := n.Operations[old.Value.Call.Operation]
 	if !op.Capabilities.Abort {
 		return old, c.Err("unsupported", "Node does not support remote cancellation")
 	}
@@ -797,7 +873,7 @@ func (s *Service) abort(ctx context.Context, id, reason string, expectedRevision
 	if old.Value.Lifecycle.State.Terminal() || old.Value.Lifecycle.State != c.Cancelling {
 		return old, nil
 	}
-	obs, e := safeAbort(ctx, s.catalog.Connector(n.ConnectorID), n, old.Value.Call)
+	obs, e := safeAbort(ctx, connector, n.Value, old.Value.Call)
 	if e != nil {
 		result := c.Result{CallID: id, State: c.Unknown, Error: c.AsFault(e)}
 		if reportErr := s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id}, Result: &result}); pendingControlFailureCause(reportErr) != nil {
@@ -828,11 +904,14 @@ func (s *Service) Inspect(ctx context.Context, id string) (c.Snapshot[c.Executio
 	if old.Value.Lifecycle.State.Terminal() {
 		return old, nil
 	}
-	n, err := s.catalog.Get(old.Value.Call.Target.ID)
+	n, op, connector, err := s.dispatchRoute(old)
 	if err != nil {
+		if cause := PendingReadCause(err); cause != nil {
+			return old, cause
+		}
 		return old, err
 	}
-	if !n.Operations[old.Value.Call.Operation].Capabilities.Inspect {
+	if !op.Capabilities.Inspect {
 		return old, c.Err("unsupported", "Node does not support receipt lookup")
 	}
 	state := old.Value.Lifecycle.State
@@ -868,9 +947,13 @@ func (s *Service) Inspect(ctx context.Context, id string) (c.Snapshot[c.Executio
 		if old.Value.Lifecycle.State != c.Reconciling {
 			return old, c.Err("conflict", "Call changed before remote inspection")
 		}
+	} else {
+		if _, err = s.store.Commit(c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: old.Revision}); err != nil {
+			return old, err
+		}
 	}
 	observedRevision := old.Revision
-	r := safeInspect(ctx, s.catalog.Connector(n.ConnectorID), n, old.Value.Call)
+	r := safeInspect(ctx, connector, n.Value, old.Value.Call)
 	if r.CallID != id {
 		r = c.Result{CallID: id, State: c.Unknown, Error: &c.Fault{Code: "foreign_result", Message: "Receipt does not belong to requested execution"}}
 	}

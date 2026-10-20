@@ -2,10 +2,26 @@ package catalog
 
 import (
 	"context"
+	"errors"
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
 	"github.com/roster-framework/roster-server/core/internal/lifecycle"
 	"sort"
 )
+
+type nodeReadFailure struct{ cause error }
+
+func (e nodeReadFailure) Error() string { return e.cause.Error() }
+func (e nodeReadFailure) Unwrap() error { return e.cause }
+
+// ReadCause identifies a storage lookup failure separately from descriptor or
+// input validation faults, preserving the original error for lifecycle owners.
+func ReadCause(err error) error {
+	var failure nodeReadFailure
+	if errors.As(err, &failure) {
+		return failure.cause
+	}
+	return nil
+}
 
 type Service struct {
 	store        c.Store[c.Node]
@@ -74,15 +90,15 @@ func (s *Service) List() ([]c.Node, error) {
 	return out, nil
 }
 func (s *Service) Connector(id string) c.Connector { return s.connectors[id] }
-func (s *Service) Validate(target c.Ref, operation string, input c.Data) (c.Node, c.Operation, error) {
+func (s *Service) Validate(target c.Ref, operation string, input c.Data) (c.Snapshot[c.Node], c.Operation, error) {
 	if target.Namespace != "nodes" || !target.Valid() {
-		return c.Node{}, c.Operation{}, c.Err("invalid_input", "Target must be a node reference")
+		return c.Snapshot[c.Node]{}, c.Operation{}, c.Err("invalid_input", "Target must be a node reference")
 	}
-	n, err := s.Get(target.ID)
+	n, err := s.store.Get(target)
 	if err != nil {
-		return n, c.Operation{}, err
+		return n, c.Operation{}, nodeReadFailure{cause: err}
 	}
-	op, ok := n.Operations[operation]
+	op, ok := n.Value.Operations[operation]
 	if !ok {
 		return n, op, c.Err("not_found", "Operation not declared")
 	}

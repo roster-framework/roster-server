@@ -385,7 +385,7 @@ func prepareDispatchingCall(t *testing.T, store *memory.Root, id string) c.Snaps
 		changes = append(changes, change)
 		current = c.Snapshot[c.Execution]{Subject: ref, Revision: change.AfterRevision, Value: change.After}
 	}
-	if err := store.Executions().CommitBatch(changes); err != nil {
+	if err := store.Executions().CommitAdmission(c.AdmissionCommit{Changes: changes, Deliveries: nil}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.Executions().Claim(context.Background()); err != nil {
@@ -731,7 +731,7 @@ drainedPendingReads:
 func TestPendingReadFailureStopsOutboxDrain(t *testing.T) {
 	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
 	preloaded := c.Event{ID: "must-wait-for-pending-read", Name: "observation", Category: "observation", Payload: c.Data{}}
-	if err := root.Executions().CommitBatch(nil, c.Delivery{ID: "preloaded-journal", Kind: c.DeliveryJournal, Event: &preloaded}); err != nil {
+	if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{c.Delivery{ID: "preloaded-journal", Kind: c.DeliveryJournal, Event: &preloaded}}}); err != nil {
 		t.Fatal(err)
 	}
 	store := &faultExecutionStore{ExecutionStore: root.Executions(), pendingFailures: make(chan struct{}, 1)}
@@ -777,7 +777,7 @@ func TestTransientPendingBusyDrainsAndClosesAfterRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	filler := c.Event{ID: "independent-drain-before-retry", Source: c.Ref{Namespace: "calls", ID: current.Value.Call.ID}, CallID: current.Value.Call.ID, Name: "independent", Category: "observation", Payload: c.Data{}}
-	if err := root.Executions().CommitBatch(nil, c.Delivery{ID: filler.ID, Kind: c.DeliveryJournal, Event: &filler}); err != nil {
+	if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{c.Delivery{ID: filler.ID, Kind: c.DeliveryJournal, Event: &filler}}}); err != nil {
 		t.Fatal(err)
 	}
 	store := &faultExecutionStore{
@@ -865,7 +865,7 @@ func TestPendingRejectedAuditRecoversAfterRealOutboxCapacityBusy(t *testing.T) {
 		ev := c.Event{ID: c.ID("capacity-fill", fmt.Sprint(i)), Source: c.Ref{Namespace: "calls", ID: current.Value.Call.ID}, CallID: current.Value.Call.ID, Name: "capacity_fill", Category: "observation", Payload: c.Data{}}
 		filler[i] = c.Delivery{ID: ev.ID, Kind: c.DeliveryJournal, Event: &ev}
 	}
-	if err := root.Executions().CommitBatch(nil, filler...); err != nil {
+	if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: filler}); err != nil {
 		t.Fatal(err)
 	}
 	if count, err := root.Executions().PendingDeliveryCount(); err != nil || count != generalLimit {
@@ -947,7 +947,7 @@ func mustPendingDeliveries(t *testing.T, outbox interface {
 func TestPostDrainCountFailureKeepsPriorAckAndPublicFaultBounded(t *testing.T) {
 	root := memory.NewRoot(memory.Limits{Nodes: 2, Subscriptions: 2, Conversations: 2, Calls: 2, Queue: 2})
 	event := c.Event{ID: "count-failure-after-ack", Source: c.Ref{Namespace: "calls", ID: "count-failure-call"}, CallID: "count-failure-call", Name: "count_check", Category: "observation", Payload: c.Data{}}
-	if err := root.Executions().CommitBatch(nil, c.Delivery{ID: event.ID, Kind: c.DeliveryJournal, Event: &event}); err != nil {
+	if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{c.Delivery{ID: event.ID, Kind: c.DeliveryJournal, Event: &event}}}); err != nil {
 		t.Fatal(err)
 	}
 	countErr := c.Err(strings.Repeat("x", 100), strings.Repeat("private detail ", 100))
