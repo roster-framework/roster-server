@@ -2,8 +2,11 @@ package connectors_test
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -213,6 +216,141 @@ func TestPrivateTransportBoundary(t *testing.T) {
 	}
 	if _, err := h.New(nil, func(string) string { return "" }).Do(context.Background(), b, http.MethodGet, "/state", nil); c.AsFault(err).Code != "credentials" {
 		t.Fatalf("%v", err)
+	}
+}
+
+type observedBody struct{ marshaled int }
+
+func (b *observedBody) MarshalJSON() ([]byte, error) {
+	b.marshaled++
+	return []byte(`{"ok":true}`), nil
+}
+
+type observedRoundTripper struct{ requests int }
+
+func (r *observedRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	r.requests++
+	return nil, fmt.Errorf("unexpected request")
+}
+
+func TestPrivateTransportRejectsRemoteHTTPAndUnsafePathsBeforePreparation(t *testing.T) {
+	for _, raw := range []string{
+		`{"url":"http://127.0.0.1:7350/base","target_id":"target"}`,
+		`{"url":"http://[::1]:7350/base","target_id":"target"}`,
+		`{"url":"http://localhost:7350/base","target_id":"target"}`,
+	} {
+		if _, err := h.Parse(json.RawMessage(raw)); err != nil {
+			t.Fatalf("loopback binding rejected: %v", err)
+		}
+	}
+	for _, raw := range []string{
+		`{"url":"http://example.test:7350/base","target_id":"target"}`,
+		`{"url":"http://localhost.example:7350/base","target_id":"target"}`,
+		`{"url":"http://192.0.2.1:7350/base","target_id":"target"}`,
+	} {
+		if _, err := h.Parse(json.RawMessage(raw)); err == nil {
+			t.Fatalf("remote HTTP binding accepted: %s", raw)
+		}
+	}
+
+	lookups := 0
+	roundTripper := &observedRoundTripper{}
+	client := h.New(&http.Client{Transport: roundTripper}, func(string) string { lookups++; return "private-token" })
+	body := &observedBody{}
+	for _, tc := range []struct {
+		name string
+		b    h.Binding
+		path string
+	}{
+		{"direct remote HTTP binding", h.Binding{URL: "http://example.test:7350", TargetID: "target", TokenEnv: "SERVER_TOKEN"}, "/state"},
+		{"path changes authority", h.Binding{URL: "https://api.example.test", TargetID: "target", TokenEnv: "SERVER_TOKEN"}, ".evil/state"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := client.Do(context.Background(), tc.b, http.MethodPost, tc.path, body)
+			if c.AsFault(err).Code != "request_prepare" {
+				t.Fatalf("expected pre-send rejection, got %v", err)
+			}
+		})
+	}
+	if lookups != 0 || roundTripper.requests != 0 || body.marshaled != 0 {
+		t.Fatalf("rejected request reached preparation: lookups=%d requests=%d marshaled=%d", lookups, roundTripper.requests, body.marshaled)
+	}
+
+	missingTokenTransport := &observedRoundTripper{}
+	missingToken := h.New(&http.Client{Transport: missingTokenTransport}, func(string) string { return "" })
+	_, err := missingToken.Do(context.Background(), h.Binding{URL: "http://localhost:7350", TargetID: "target", TokenEnv: "SERVER_TOKEN"}, http.MethodGet, "/state", nil)
+	if c.AsFault(err).Code != "credentials" || missingTokenTransport.requests != 0 {
+		t.Fatalf("missing token was not rejected before send: err=%v requests=%d", err, missingTokenTransport.requests)
+	}
+}
+
+func TestPrivateTransportTLSAndBothConnectors(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer private-token" {
+			t.Error("credential missing")
+		}
+		switch r.URL.Path {
+		case "/state":
+			fmt.Fprint(w, `{"protocol":"roster/0.1","runtime_id":"runtime","agents":[{"id":"target","statuses":["needs_help"],"events":["complete"]}]}`)
+		case "/executions":
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			fmt.Fprintln(w, `{"type":"result","result":{"status":"needs_help","summary":"done","output":{},"events":[],"metrics":{"duration_ms":1},"artifacts":[]}}`)
+		case "/v1/resources/target":
+			fmt.Fprint(w, `{"id":"target","operations":["tools.call"]}`)
+		case "/v1/resources/target/invoke":
+			fmt.Fprint(w, `{"content":[{"text":"done"}],"isError":false}`)
+		default:
+			t.Errorf("unexpected HTTPS path: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	trustedTransport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}
+	defer trustedTransport.CloseIdleConnections()
+	trusted := &http.Client{Transport: trustedTransport}
+	runtimeConnector := runtime.New(trusted, lookup)
+	resourceConnector := resource.New(trusted, lookup)
+
+	runtimeBinding := binding(server.URL)
+	if _, err := runtimeConnector.Describe(context.Background(), runtimeBinding); err != nil {
+		t.Fatalf("trusted runtime Describe failed: %v", err)
+	}
+	if result := runtimeConnector.Invoke(context.Background(), runtimeBinding, call(), nil); result.State != c.Succeeded {
+		t.Fatalf("trusted runtime Invoke failed: %+v", result)
+	}
+	resourceBinding := binding(server.URL)
+	if _, err := resourceConnector.Describe(context.Background(), resourceBinding); err != nil {
+		t.Fatalf("trusted resource Describe failed: %v", err)
+	}
+	resourceCall := call()
+	resourceCall.Operation = "tools.call"
+	resourceCall.Input = c.Data{"tool": "read", "arguments": map[string]any{"id": "doc"}}
+	if result := resourceConnector.Invoke(context.Background(), resourceBinding, resourceCall, nil); result.State != c.Succeeded {
+		t.Fatalf("trusted resource Invoke failed: %+v", result)
+	}
+
+	untrustedRuntime := runtime.New(&http.Client{}, lookup)
+	if _, err := untrustedRuntime.Describe(context.Background(), runtimeBinding); err == nil {
+		t.Fatal("runtime Describe accepted an untrusted TLS certificate")
+	}
+	if result := resource.New(&http.Client{}, lookup).Invoke(context.Background(), resourceBinding, resourceCall, nil); result.State != c.Unknown {
+		t.Fatalf("resource Invoke accepted an untrusted TLS certificate: %+v", result)
+	}
+
+	wrongHostURL := strings.Replace(server.URL, "127.0.0.1", "wrong.example", 1)
+	dialer := &net.Dialer{}
+	wrongHostTransport := &http.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: roots},
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, server.Listener.Addr().String())
+		},
+	}
+	defer wrongHostTransport.CloseIdleConnections()
+	if _, err := runtime.New(&http.Client{Transport: wrongHostTransport}, lookup).Describe(context.Background(), binding(wrongHostURL)); err == nil {
+		t.Fatal("runtime Describe accepted a hostname mismatch")
 	}
 }
 

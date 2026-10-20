@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -54,14 +55,38 @@ func Parse(raw json.RawMessage) (Binding, error) {
 	if dec.Decode(&extra) != io.EOF {
 		return b, c.Err("binding", "Invalid private HTTP binding")
 	}
-	u, err := url.Parse(b.URL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || !c.ValidID(b.TargetID) || (b.TokenEnv != "" && !envName.MatchString(b.TokenEnv)) {
+	if _, err := validateBinding(b); err != nil {
 		return b, c.Err("binding", "Invalid private HTTP binding")
 	}
 	b.URL = strings.TrimRight(b.URL, "/")
 	return b, nil
 }
+
+func validateBinding(b Binding) (*url.URL, error) {
+	u, err := url.Parse(b.URL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || !c.ValidID(b.TargetID) || (b.TokenEnv != "" && !envName.MatchString(b.TokenEnv)) {
+		return nil, c.Err("binding", "Invalid private HTTP binding")
+	}
+	if u.Scheme == "http" {
+		host := u.Hostname()
+		ip := net.ParseIP(host)
+		if !(ip != nil && ip.IsLoopback()) && !strings.EqualFold(host, "localhost") {
+			return nil, c.Err("binding", "Invalid private HTTP binding")
+		}
+	}
+	return u, nil
+}
+
 func (h *Client) Do(ctx context.Context, b Binding, method, path string, body any) (*http.Response, error) {
+	base, err := validateBinding(b)
+	if err != nil || !strings.HasPrefix(path, "/") {
+		return nil, c.Err("request_prepare", "Unable to prepare the remote request")
+	}
+	requestURL := b.URL + path
+	final, err := url.Parse(requestURL)
+	if err != nil || !strings.EqualFold(base.Scheme, final.Scheme) || !strings.EqualFold(base.Host, final.Host) {
+		return nil, c.Err("request_prepare", "Unable to prepare the remote request")
+	}
 	var reader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -70,7 +95,7 @@ func (h *Client) Do(ctx context.Context, b Binding, method, path string, body an
 		}
 		reader = bytes.NewReader(data)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, b.URL+path, reader)
+	req, err := http.NewRequestWithContext(ctx, method, requestURL, reader)
 	if err != nil {
 		return nil, c.Err("request_prepare", "Unable to prepare the remote request")
 	}
