@@ -27,6 +27,35 @@ func fault(t *testing.T, err error, code string) {
 		t.Fatalf("want %s, got %v", code, err)
 	}
 }
+
+func mustList[T any](t *testing.T, source interface {
+	List() ([]c.Snapshot[T], error)
+}) []c.Snapshot[T] {
+	t.Helper()
+	items, err := source.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return items
+}
+
+func mustPendingCount(t *testing.T, outbox interface{ PendingDeliveryCount() (int, error) }) int {
+	t.Helper()
+	count, err := outbox.PendingDeliveryCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func mustPendingObservations(t *testing.T, source interface{ PendingObservationCount() (int, error) }) int {
+	t.Helper()
+	count, err := source.PendingObservationCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
 func execution(state c.State) c.Snapshot[c.Execution] {
 	return c.Snapshot[c.Execution]{Subject: c.Ref{Namespace: "calls", ID: "call"}, Revision: 7, Value: c.Execution{Call: c.Call{ID: "call"}, Lifecycle: c.Lifecycle{State: state}}}
 }
@@ -240,7 +269,7 @@ func TestMemoryBatchAllOrNothing(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := memory.NewExecutions(tt.records, tt.queue)
 			fault(t, s.CommitBatch(append(queued("a"), queued("b")...)), "busy")
-			if len(s.List()) != 0 {
+			if len(mustList(t, s)) != 0 {
 				t.Fatal("partial records after failed batch")
 			}
 			if err := s.CommitBatch(queued("a")); err != nil {
@@ -262,7 +291,7 @@ func TestMemoryBatchAllOrNothing(t *testing.T) {
 	}
 	s := memory.NewExecutions(4, 4)
 	fault(t, s.CommitBatch(append(queued("same"), queued("same")...)), "conflict")
-	if len(s.List()) != 0 {
+	if len(mustList(t, s)) != 0 {
 		t.Fatal("duplicate batch partially committed")
 	}
 }
@@ -314,7 +343,7 @@ func TestTerminalDeliveryUsesAdmissionReservationWhenGeneralOutboxIsFull(t *test
 	if err != nil {
 		t.Fatalf("terminal commit blocked by general outbox capacity: %v", err)
 	}
-	if got := store.PendingDeliveryCount(); got != 8194 {
+	if got := mustPendingCount(t, store); got != 8194 {
 		t.Fatalf("pending deliveries=%d, want 8194", got)
 	}
 }
@@ -361,7 +390,7 @@ func TestReconciledTerminalBundleUsesAdmissionReservationWhenGeneralOutboxIsFull
 	if _, err = store.Commit(c.ExecutionMutation{Subject: ref, ExpectedRevision: current.Revision, Changes: obs.Changes, Deliveries: obs.Deliveries}); err != nil {
 		t.Fatalf("reconciling terminal bundle was blocked by general outbox: %v", err)
 	}
-	if got := store.PendingDeliveryCount(); got != 8195 {
+	if got := mustPendingCount(t, store); got != 8195 {
 		t.Fatalf("pending deliveries=%d, want general 8192 plus reserved bundle 3", got)
 	}
 }
@@ -442,8 +471,8 @@ func TestInvocationConcurrentDuplicateSubmission(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	if accepted.Load() != 1 || len(s.List()) != 1 {
-		t.Fatalf("duplicate race accepted %d, records %d", accepted.Load(), len(s.List()))
+	if accepted.Load() != 1 || len(mustList(t, s)) != 1 {
+		t.Fatalf("duplicate race accepted %d, records %d", accepted.Load(), len(mustList(t, s)))
 	}
 }
 
@@ -540,7 +569,7 @@ func TestHostShutdownUsesInstanceCapabilityWithoutAbortGrant(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := calls.Close(ctx); err != nil {
+	if err := calls.Close(ctx, nil); err != nil {
 		t.Fatalf("host shutdown should cancel its queued Call: %v", err)
 	}
 	snap, err := calls.Get("shutdown-queued")
@@ -569,7 +598,7 @@ func start(t *testing.T, s *invocation.Service) {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		if err := s.Close(ctx); err != nil {
+		if err := s.Close(ctx, nil); err != nil {
 			t.Error(err)
 		}
 	})
@@ -583,7 +612,8 @@ func TestCatalogPrivateBindingAndDeclaredSchema(t *testing.T) {
 		t.Fatal("internal binding lost")
 	}
 	public := catalog.Public(n)
-	if len(public.Binding) != 0 || len(cat.List()[0].Binding) != 0 {
+	nodes, listErr := cat.List()
+	if listErr != nil || len(public.Binding) != 0 || len(nodes[0].Binding) != 0 {
 		t.Fatal("public binding exposed")
 	}
 	n.Binding[0] = 'x'
@@ -597,19 +627,19 @@ func TestCatalogPrivateBindingAndDeclaredSchema(t *testing.T) {
 	bad.Input = c.Data{"text": 3}
 	_, err = s.SubmitBatch(directOrigin(), []c.Call{call("valid"), bad})
 	fault(t, err, "invalid_input")
-	if len(s.List()) != 0 {
+	if len(mustList(t, s)) != 0 {
 		t.Fatal("schema-invalid batch partially accepted")
 	}
 	foreignTarget := call("foreign-target")
 	foreignTarget.Target = c.Ref{Namespace: "nodes", ID: "other"}
 	_, err = s.SubmitBatch(directOrigin(), []c.Call{call("valid"), foreignTarget})
 	fault(t, err, "forbidden")
-	if len(s.List()) != 0 {
+	if len(mustList(t, s)) != 0 {
 		t.Fatal("denied member partially committed a call batch")
 	}
 	_, err = s.SubmitBatch(sourceOrigin("spoofed-source"), []c.Call{call("spoofed-origin")})
 	fault(t, err, "forbidden")
-	if len(s.List()) != 0 {
+	if len(mustList(t, s)) != 0 {
 		t.Fatal("ungranted source origin was accepted")
 	}
 	page, err := j.Query(observation.Filter{})
@@ -902,8 +932,19 @@ func TestReportSinkRejectsTerminalResultAndForeignCallIdentity(t *testing.T) {
 type interceptExecutionStore struct {
 	c.ExecutionStore
 	mu             sync.Mutex
+	listErr        error
 	failures       map[c.State]int
 	afterNextState map[c.State]func()
+}
+
+func (s *interceptExecutionStore) List() ([]c.Snapshot[c.Execution], error) {
+	s.mu.Lock()
+	err := s.listErr
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return s.ExecutionStore.List()
 }
 
 func (s *interceptExecutionStore) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], error) {
@@ -925,6 +966,29 @@ func (s *interceptExecutionStore) Commit(m c.ExecutionMutation) (c.Snapshot[c.Ex
 		callback()
 	}
 	return snap, err
+}
+
+func TestSubmitBatchPropagatesListFailureWithoutMutation(t *testing.T) {
+	cat, _, journal, _ := fixture(t, &fakeConnector{})
+	base := memory.NewExecutions(8, 8)
+	if err := base.CommitBatch(queued("existing-before-list-error")); err != nil {
+		t.Fatal(err)
+	}
+	existingBefore, err := base.Get(c.Ref{Namespace: "calls", ID: "existing-before-list-error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readErr := c.Err("storage_read", "injected call-list failure")
+	store := &interceptExecutionStore{ExecutionStore: base, listErr: readErr}
+	calls := invocation.New(store, cat, journal, fixtureAuthority(t))
+	if _, err := calls.SubmitBatch(directOrigin(), []c.Call{call("list-read-fails")}); err != readErr {
+		t.Fatalf("SubmitBatch error=%v, want original list failure %v", err, readErr)
+	}
+	items := mustList(t, base)
+	existingAfter, getErr := base.Get(existingBefore.Subject)
+	if len(items) != 1 || items[0].Value.Call.ID != existingBefore.Value.Call.ID || getErr != nil || existingAfter.Revision != existingBefore.Revision || existingAfter.Value.Lifecycle.State != existingBefore.Value.Lifecycle.State || mustPendingCount(t, base) != 0 {
+		t.Fatalf("List failure changed existing state or admitted work: calls=%d before=%+v after=%+v pending=%d err=%v", len(items), existingBefore, existingAfter, mustPendingCount(t, base), getErr)
+	}
 }
 
 func TestPendingTerminalWinsAndRetryDoesNotDeleteReplacement(t *testing.T) {
@@ -958,10 +1022,10 @@ func TestPendingTerminalWinsAndRetryDoesNotDeleteReplacement(t *testing.T) {
 		t.Fatal("connector did not submit uncertain observation")
 	}
 	deadline := time.Now().Add(time.Second)
-	for s.PendingObservationCount() != 1 && time.Now().Before(deadline) {
+	for mustPendingObservations(t, s) != 1 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if got := s.PendingObservationCount(); got != 1 {
+	if got := mustPendingObservations(t, s); got != 1 {
 		t.Fatalf("unknown result was not retained: pending=%d", got)
 	}
 	blocked := make(chan struct{})
@@ -980,7 +1044,7 @@ func TestPendingTerminalWinsAndRetryDoesNotDeleteReplacement(t *testing.T) {
 	if inspected, err := s.Inspect(context.Background(), "pending-priority"); err != nil || inspected.Value.Lifecycle.State != c.Reconciling {
 		t.Fatalf("terminal inspection commit failure should preserve reconciling state: %+v %v", inspected, err)
 	}
-	if got := s.PendingObservationCount(); got != 1 {
+	if got := mustPendingObservations(t, s); got != 1 {
 		t.Fatalf("terminal result did not replace pending unknown result: pending=%d", got)
 	}
 	close(release)
@@ -989,12 +1053,12 @@ func TestPendingTerminalWinsAndRetryDoesNotDeleteReplacement(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("pending retry did not finish")
 	}
-	if got := s.PendingObservationCount(); got != 1 {
+	if got := mustPendingObservations(t, s); got != 1 {
 		t.Fatalf("stale retry deleted a newer pending terminal result: pending=%d", got)
 	}
 	s.RetryPending()
 	snap := waitState(t, s, "pending-priority", c.Succeeded)
-	if got := s.PendingObservationCount(); got != 0 {
+	if got := mustPendingObservations(t, s); got != 0 {
 		t.Fatalf("terminal retry left a pending observation: %d", got)
 	}
 	if snap.Value.Result == nil || snap.Value.Result.Output.(map[string]any)["answer"] != "inspected" {
@@ -1026,22 +1090,22 @@ func TestConfirmedWaitingPendingReplacesUnknownResult(t *testing.T) {
 	}
 	start(t, s)
 	waitPending := time.Now().Add(time.Second)
-	for s.PendingObservationCount() != 1 && time.Now().Before(waitPending) {
+	for mustPendingObservations(t, s) != 1 && time.Now().Before(waitPending) {
 		time.Sleep(time.Millisecond)
 	}
-	if got := s.PendingObservationCount(); got != 1 {
+	if got := mustPendingObservations(t, s); got != 1 {
 		t.Fatalf("unknown invoke result was not retained: pending=%d", got)
 	}
 	if _, err := s.Inspect(context.Background(), "waiting-priority"); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.PendingObservationCount(); got != 1 {
+	if got := mustPendingObservations(t, s); got != 1 {
 		t.Fatalf("confirmed Waiting did not replace pending Unknown: pending=%d", got)
 	}
 	s.RetryPending()
 	snap := waitState(t, s, "waiting-priority", c.Waiting)
-	if snap.Value.Result == nil || snap.Value.Result.State != c.Waiting || s.PendingObservationCount() != 0 {
-		t.Fatalf("confirmed Waiting was not retried and cleared: %+v pending=%d", snap, s.PendingObservationCount())
+	if snap.Value.Result == nil || snap.Value.Result.State != c.Waiting || mustPendingObservations(t, s) != 0 {
+		t.Fatalf("confirmed Waiting was not retried and cleared: %+v pending=%d", snap, mustPendingObservations(t, s))
 	}
 }
 
@@ -1413,8 +1477,8 @@ func TestNewerInspectionPendingReplacesAndRetriesOnlyItsLineage(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstPendingState, err := s.Get("newer-inspect-pending")
-	if err != nil || firstPendingState.Value.Lifecycle.State != c.Reconciling || s.PendingObservationCount() != 1 {
-		t.Fatalf("first failed inspection was not retained: %+v err=%v pending=%d", firstPendingState, err, s.PendingObservationCount())
+	if err != nil || firstPendingState.Value.Lifecycle.State != c.Reconciling || mustPendingObservations(t, s) != 1 {
+		t.Fatalf("first failed inspection was not retained: %+v err=%v pending=%d", firstPendingState, err, mustPendingObservations(t, s))
 	}
 	unknown, err := base.Get(c.Ref{Namespace: "calls", ID: "newer-inspect-pending"})
 	if err != nil {
@@ -1434,7 +1498,7 @@ func TestNewerInspectionPendingReplacesAndRetriesOnlyItsLineage(t *testing.T) {
 	if _, err := s.Inspect(context.Background(), "newer-inspect-pending"); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.PendingObservationCount(); got != 1 {
+	if got := mustPendingObservations(t, s); got != 1 {
 		t.Fatalf("newer query did not replace the bounded pending slot: %d", got)
 	}
 	s.RetryPending()
@@ -1444,8 +1508,8 @@ func TestNewerInspectionPendingReplacesAndRetriesOnlyItsLineage(t *testing.T) {
 	}
 	wantFirst := c.ID("newer-inspect-pending", "inspect", fmt.Sprint(firstBefore.Revision+1))
 	wantSecond := c.ID("newer-inspect-pending", "inspect", fmt.Sprint(secondBefore.Revision+1))
-	if wantFirst == wantSecond || final.Value.Observation.Reports[wantFirst] != "" || final.Value.Observation.Reports[wantSecond] == "" || s.PendingObservationCount() != 0 || invoked.Load() != 1 || inspected.Load() != 2 {
-		t.Fatalf("retry did not preserve only the newer inspection lineage: order=%v pending=%d invokes=%d inspects=%d", final.Value.Observation.ReportOrder, s.PendingObservationCount(), invoked.Load(), inspected.Load())
+	if wantFirst == wantSecond || final.Value.Observation.Reports[wantFirst] != "" || final.Value.Observation.Reports[wantSecond] == "" || mustPendingObservations(t, s) != 0 || invoked.Load() != 1 || inspected.Load() != 2 {
+		t.Fatalf("retry did not preserve only the newer inspection lineage: order=%v pending=%d invokes=%d inspects=%d", final.Value.Observation.ReportOrder, mustPendingObservations(t, s), invoked.Load(), inspected.Load())
 	}
 }
 
@@ -1473,10 +1537,10 @@ func TestInspectionQueryDoesNotReplacePendingWaitingStream(t *testing.T) {
 	start(t, s)
 	waitState(t, s, "stream-query-priority", c.Running)
 	deadline := time.Now().Add(time.Second)
-	for s.PendingObservationCount() == 0 && time.Now().Before(deadline) {
+	for mustPendingObservations(t, s) == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if got := s.PendingObservationCount(); got != 1 {
+	if got := mustPendingObservations(t, s); got != 1 {
 		t.Fatalf("waiting stream report was not retained: pending=%d", got)
 	}
 	store.mu.Lock()
@@ -1485,13 +1549,13 @@ func TestInspectionQueryDoesNotReplacePendingWaitingStream(t *testing.T) {
 	if _, err := s.Inspect(context.Background(), "stream-query-priority"); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.PendingObservationCount(); got != 1 {
+	if got := mustPendingObservations(t, s); got != 1 {
 		t.Fatalf("failed query replaced the older waiting stream slot: pending=%d", got)
 	}
 	s.RetryPending()
 	final, err := s.Get("stream-query-priority")
-	if err != nil || final.Value.Lifecycle.State != c.Waiting || s.PendingObservationCount() != 0 {
-		t.Fatalf("waiting stream slot was not the one retried: state=%s pending=%d err=%v", final.Value.Lifecycle.State, s.PendingObservationCount(), err)
+	if err != nil || final.Value.Lifecycle.State != c.Waiting || mustPendingObservations(t, s) != 0 {
+		t.Fatalf("waiting stream slot was not the one retried: state=%s pending=%d err=%v", final.Value.Lifecycle.State, mustPendingObservations(t, s), err)
 	}
 }
 
@@ -1519,16 +1583,16 @@ func TestAcceptedInspectionDoesNotClearPendingWaitingStream(t *testing.T) {
 	start(t, s)
 	waitState(t, s, "stream-query-clear", c.Running)
 	deadline := time.Now().Add(time.Second)
-	for s.PendingObservationCount() == 0 && time.Now().Before(deadline) {
+	for mustPendingObservations(t, s) == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if got := s.PendingObservationCount(); got != 1 {
+	if got := mustPendingObservations(t, s); got != 1 {
 		t.Fatalf("waiting stream report was not retained: pending=%d", got)
 	}
 	if _, err := s.Inspect(context.Background(), "stream-query-clear"); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.PendingObservationCount(); got != 1 {
+	if got := mustPendingObservations(t, s); got != 1 {
 		t.Fatalf("accepted query cleared an unrelated waiting stream slot: pending=%d", got)
 	}
 }
@@ -1542,7 +1606,7 @@ func TestZeroCallAdmissionEffectsAreAtomicAndFenceSubscriptionPhantoms(t *testin
 	if _, err := calls.SubmitBatch(origin, nil, effect); err != nil {
 		t.Fatalf("zero-call effect was dropped: %v", err)
 	}
-	if len(calls.List()) != 0 || root.Executions().PendingDeliveryCount() != 1 {
+	if len(mustList(t, calls)) != 0 || mustPendingCount(t, root.Executions()) != 1 {
 		t.Fatal("zero-call effect created calls or lost its journal intent")
 	}
 	if receipt, ok, err := root.Admissions().ReadPublished(eventValue.ID); err != nil || !ok || receipt.Digest != "stable" {
@@ -1551,7 +1615,7 @@ func TestZeroCallAdmissionEffectsAreAtomicAndFenceSubscriptionPhantoms(t *testin
 	if _, err := calls.SubmitBatch(origin, nil, effect); err == nil {
 		t.Fatal("duplicate adapter admission reported a new success")
 	}
-	if root.Executions().PendingDeliveryCount() != 1 {
+	if mustPendingCount(t, root.Executions()) != 1 {
 		t.Fatal("duplicate admission added another journal intent")
 	}
 
@@ -1600,7 +1664,7 @@ func TestConcurrentAdmissionCollisionCommitsOneReceipt(t *testing.T) {
 			t.Fatalf("unexpected collision result: %v", err)
 		}
 	}
-	if success != 1 || conflict != 1 || root.Executions().PendingDeliveryCount() != 0 {
+	if success != 1 || conflict != 1 || mustPendingCount(t, root.Executions()) != 0 {
 		t.Fatalf("duplicate admission was not atomic: success=%d conflict=%d", success, conflict)
 	}
 }
@@ -1612,7 +1676,7 @@ func TestExecutionAdmissionRejectsMismatchedCallIdentityWithoutMutation(t *testi
 	if err := store.CommitAdmission(c.AdmissionCommit{Changes: []c.Change[c.Execution]{ch}}); err == nil || c.AsFault(err).Code != "invalid_input" {
 		t.Fatalf("mismatched admission identity was accepted: %v", err)
 	}
-	if len(store.List()) != 0 || store.PendingDeliveryCount() != 0 {
+	if len(mustList(t, store)) != 0 || mustPendingCount(t, store) != 0 {
 		t.Fatal("invalid identity partially wrote call or queue state")
 	}
 	valid := queued("actual-call")
@@ -1686,7 +1750,7 @@ func TestAdmissionEffectCallReferencesMustExactlyMatchNewCalls(t *testing.T) {
 				t.Fatalf("malformed effect references were accepted: %v", err)
 			}
 			reserved, readErr := root.Admissions().ReservedReplies(conversationRef.ID)
-			if len(root.Executions().List()) != 0 || root.Executions().PendingDeliveryCount() != 0 || readErr != nil || reserved != 0 {
+			if len(mustList(t, root.Executions())) != 0 || mustPendingCount(t, root.Executions()) != 0 || readErr != nil || reserved != 0 {
 				t.Fatal("invalid effect partially mutated execution or reply state")
 			}
 			if effect.Published != nil {

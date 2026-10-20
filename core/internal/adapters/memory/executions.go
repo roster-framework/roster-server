@@ -459,10 +459,10 @@ func (s *Executions) AckDelivery(id string) error {
 	}
 	return nil
 }
-func (s *Executions) PendingDeliveryCount() int {
+func (s *Executions) PendingDeliveryCount() (int, error) {
 	s.outboxMu.Lock()
 	defer s.outboxMu.Unlock()
-	return len(s.pending)
+	return len(s.pending), nil
 }
 
 var _ c.ExecutionStore = (*Executions)(nil)

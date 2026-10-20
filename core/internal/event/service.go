@@ -60,20 +60,24 @@ func (s *Service) Create(sub c.Subscription) (c.Snapshot[c.Subscription], error)
 	out, err := lifecycle.Commit(s.store, ch, s.journal)
 	return out, err
 }
-func (s *Service) List() []c.Snapshot[c.Subscription] {
+func (s *Service) List() ([]c.Snapshot[c.Subscription], error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.listLocked()
 }
-func (s *Service) listLocked() []c.Snapshot[c.Subscription] {
+func (s *Service) listLocked() ([]c.Snapshot[c.Subscription], error) {
 	out := []c.Snapshot[c.Subscription]{}
-	for _, sub := range s.store.List() {
+	items, err := s.store.List()
+	if err != nil {
+		return nil, err
+	}
+	for _, sub := range items {
 		if !sub.Value.Removed {
 			out = append(out, sub)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Value.ID < out[j].Value.ID })
-	return out
+	return out, nil
 }
 func (s *Service) Remove(id string, revision uint64) (c.Change[c.Subscription], error) {
 	s.mu.Lock()

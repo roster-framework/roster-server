@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
+	"github.com/roster-framework/roster-server/core/internal/interfaces/command"
 	httpapi "github.com/roster-framework/roster-server/core/internal/interfaces/http"
 	"github.com/roster-framework/roster-server/core/internal/lifecycle"
 	"github.com/roster-framework/roster-server/core/internal/observation"
@@ -41,21 +42,31 @@ func (s *Core) transitionLocked(to c.State, reason string) error {
 	return nil
 }
 
-func (s *Core) Status() Status {
+func (s *Core) Status() (Status, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ids := []string{}
-	for _, snap := range s.Calls.List() {
+	calls, err := s.Calls.List()
+	if err != nil {
+		return Status{}, err
+	}
+	for _, snap := range calls {
 		if !snap.Value.Lifecycle.State.Terminal() {
 			ids = append(ids, snap.Value.Call.ID)
 		}
 	}
 	sort.Strings(ids)
 	stopped := s.closeDone != nil && s.closeFinished && s.ingress == 0 && !s.sourceActive() && s.Calls.LocalStopped() && channelClosed(s.callsCloseDone) && channelClosed(s.parentWatchDone) && channelClosed(s.drainDone)
-	pendingDeliveries := s.Calls.Outbox().PendingDeliveryCount()
-	pendingObservations := s.Calls.PendingObservationCount()
+	pendingDeliveries, err := s.Calls.Outbox().PendingDeliveryCount()
+	if err != nil {
+		return Status{}, err
+	}
+	pendingObservations, err := s.Calls.PendingObservationCount()
+	if err != nil {
+		return Status{}, err
+	}
 	ready := s.lifecycle.Value.State == c.Running && !s.closing && pendingDeliveries == 0 && pendingObservations == 0
-	return Status{InstanceID: s.instanceID, Lifecycle: c.Clone(s.lifecycle), Ready: ready, LocalStopped: stopped, UnresolvedCallIDs: ids, PendingDeliveryCount: pendingDeliveries, PendingObservationCount: pendingObservations, LastDeliveryError: c.Clone(s.lastDeliveryError)}
+	return Status{InstanceID: s.instanceID, Lifecycle: c.Clone(s.lifecycle), Ready: ready, LocalStopped: stopped, UnresolvedCallIDs: ids, PendingDeliveryCount: pendingDeliveries, PendingObservationCount: pendingObservations, LastDeliveryError: c.Clone(s.lastDeliveryError)}, nil
 }
 
 func (s *Core) BeginDrain() {
@@ -78,8 +89,13 @@ func (s *Core) sourceActive() bool { return s.sourceCount != 0 }
 
 func (s *Core) readyHandler() http.Handler {
 	return httpapi.LocalOnly(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		status := s.Status()
+		status, err := s.Status()
 		code := http.StatusOK
+		if err != nil {
+			code = http.StatusServiceUnavailable
+			httpapi.WriteJSON(w, code, map[string]any{"ready": false, "error": command.PublicFault(err)})
+			return
+		}
 		if !status.Ready {
 			code = http.StatusServiceUnavailable
 		}
@@ -160,24 +176,56 @@ func (s *Core) close(ctx context.Context, fromParent bool) error {
 func (s *Core) cachedCloseError() error { s.mu.Lock(); defer s.mu.Unlock(); return s.closeErr }
 
 func (s *Core) finishClose(ctx context.Context, done chan struct{}) {
+	var firstErr error
+	recordError := func(err error) {
+		if firstErr == nil && err != nil {
+			firstErr = err
+		}
+	}
+	s.mu.Lock()
+	recordError(s.lifecycleErr)
+	s.mu.Unlock()
 	callClose := make(chan error, 1)
 	callsCloseDone := make(chan struct{})
 	s.mu.Lock()
 	s.callsCloseDone = callsCloseDone
 	s.mu.Unlock()
-	go func() { err := s.Calls.Close(ctx); close(callsCloseDone); callClose <- err }()
+	firstCallError := make(chan error, 1)
+	go func() {
+		err := s.Calls.Close(ctx, func(err error) {
+			select {
+			case firstCallError <- err:
+			default:
+			}
+		})
+		close(callsCloseDone)
+		callClose <- err
+	}()
+	observeCallError := func() {
+		select {
+		case err := <-firstCallError:
+			recordError(err)
+		default:
+		}
+	}
 	var err error
 	select {
 	case err = <-callClose:
+		observeCallError()
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			err = c.Err("shutdown_timeout", "Core shutdown exceeded its deadline")
+		}
+		recordError(err)
 	case <-ctx.Done():
-		err = c.Err("shutdown_timeout", "Core shutdown exceeded its deadline")
+		observeCallError()
+		recordError(c.Err("shutdown_timeout", "Core shutdown exceeded its deadline"))
 	}
 	wgDone := make(chan struct{})
 	go func() { s.wg.Wait(); close(wgDone) }()
 	select {
 	case <-wgDone:
 	case <-ctx.Done():
-		err = c.Err("shutdown_timeout", "Core shutdown exceeded its deadline")
+		recordError(c.Err("shutdown_timeout", "Core shutdown exceeded its deadline"))
 	}
 	s.mu.Lock()
 	ingressZero := s.ingressZero
@@ -185,16 +233,29 @@ func (s *Core) finishClose(ctx context.Context, done chan struct{}) {
 	select {
 	case <-ingressZero:
 	case <-ctx.Done():
-		err = c.Err("shutdown_timeout", "Core shutdown exceeded its deadline")
+		recordError(c.Err("shutdown_timeout", "Core shutdown exceeded its deadline"))
 	}
 	drainTick := time.NewTicker(25 * time.Millisecond)
 	defer drainTick.Stop()
-	for s.Calls.Outbox().PendingDeliveryCount() > 0 || s.Calls.PendingObservationCount() > 0 {
+	for {
+		pendingDeliveries, countErr := s.Calls.Outbox().PendingDeliveryCount()
+		if countErr != nil {
+			recordError(countErr)
+			break
+		}
+		pendingObservations, observationErr := s.Calls.PendingObservationCount()
+		if observationErr != nil {
+			recordError(observationErr)
+			break
+		}
+		if pendingDeliveries == 0 && pendingObservations == 0 {
+			break
+		}
 		s.Calls.RetryPending()
 		s.wakeDelivery()
 		select {
 		case <-ctx.Done():
-			err = c.Err("shutdown_timeout", "Core delivery drain exceeded its deadline")
+			recordError(c.Err("shutdown_timeout", "Core delivery drain exceeded its deadline"))
 			goto stopDrain
 		case <-drainTick.C:
 		}
@@ -207,33 +268,49 @@ stopDrain:
 		select {
 		case <-s.drainDone:
 		case <-ctx.Done():
-			err = c.Err("shutdown_timeout", "Core delivery worker did not stop before deadline")
+			recordError(c.Err("shutdown_timeout", "Core delivery worker did not stop before deadline"))
 		}
 	}
 	s.mu.Lock()
 	ids := []string{}
-	for _, snap := range s.Calls.List() {
+	completionKnown := true
+	calls, listErr := s.Calls.List()
+	if listErr != nil {
+		recordError(listErr)
+		completionKnown = false
+	}
+	for _, snap := range calls {
 		if !snap.Value.Lifecycle.State.Terminal() {
 			ids = append(ids, snap.Value.Call.ID)
 		}
 	}
 	sort.Strings(ids)
-	if s.lifecycleErr != nil {
-		err = s.lifecycleErr
-	} else if ctx.Err() != nil {
-		err = s.transitionLocked(c.Unknown, "shutdown_timeout")
-		if err == nil {
-			err = c.Err("shutdown_timeout", "Core shutdown exceeded its deadline")
-		}
-	} else if len(ids) > 0 || s.Calls.Outbox().PendingDeliveryCount() > 0 || s.Calls.PendingObservationCount() > 0 {
-		err = s.transitionLocked(c.Unknown, "shutdown_incomplete")
-		if err == nil {
-			err = c.Err("shutdown_incomplete", "Core stopped with unresolved calls or delivery work")
-		}
-	} else {
-		err = s.transitionLocked(c.Succeeded, "host_shutdown_complete")
+	pendingDeliveries, countErr := s.Calls.Outbox().PendingDeliveryCount()
+	if countErr != nil {
+		recordError(countErr)
+		completionKnown = false
 	}
-	s.closeErr = err
+	pendingObservations, observationErr := s.Calls.PendingObservationCount()
+	if observationErr != nil {
+		recordError(observationErr)
+		completionKnown = false
+	}
+	if !completionKnown || firstErr != nil {
+		reason := "shutdown_unreadable"
+		if ctx.Err() != nil {
+			reason = "shutdown_timeout"
+		}
+		recordError(s.transitionLocked(c.Unknown, reason))
+	} else if ctx.Err() != nil {
+		recordError(s.transitionLocked(c.Unknown, "shutdown_timeout"))
+		recordError(c.Err("shutdown_timeout", "Core shutdown exceeded its deadline"))
+	} else if len(ids) > 0 || pendingDeliveries > 0 || pendingObservations > 0 {
+		recordError(s.transitionLocked(c.Unknown, "shutdown_incomplete"))
+		recordError(c.Err("shutdown_incomplete", "Core stopped with unresolved calls or delivery work"))
+	} else {
+		recordError(s.transitionLocked(c.Succeeded, "host_shutdown_complete"))
+	}
+	s.closeErr = firstErr
 	s.closeFinished = true
 	close(s.hostDone)
 	close(done)

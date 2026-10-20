@@ -109,7 +109,11 @@ func (s *Service) SubmitBatch(origin c.AdmissionOrigin, calls []c.Call, effects 
 	changes := []c.Change[c.Execution]{}
 	out := []c.Snapshot[c.Execution]{}
 	counts := map[string]int{}
-	for _, old := range s.store.List() {
+	storedCalls, err := s.store.List()
+	if err != nil {
+		return nil, err
+	}
+	for _, old := range storedCalls {
 		counts[old.Value.Call.CorrelationID]++
 	}
 	for _, call := range calls {
@@ -179,12 +183,15 @@ func (s *Service) Get(id string) (c.Snapshot[c.Execution], error) {
 	defer s.mu.Unlock()
 	return s.store.Get(ref(id))
 }
-func (s *Service) List() []c.Snapshot[c.Execution] {
+func (s *Service) List() ([]c.Snapshot[c.Execution], error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := s.store.List()
+	out, err := s.store.List()
+	if err != nil {
+		return nil, err
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Value.Call.ID < out[j].Value.Call.ID })
-	return out
+	return out, nil
 }
 func (s *Service) localMove(old c.Snapshot[c.Execution], next c.State) (c.Snapshot[c.Execution], error) {
 	reason := string(next)
@@ -195,10 +202,10 @@ func (s *Service) localMove(old c.Snapshot[c.Execution], next c.State) (c.Snapsh
 	return s.Get(old.Value.Call.ID)
 }
 func (s *Service) Outbox() c.Outbox { return s.store }
-func (s *Service) PendingObservationCount() int {
+func (s *Service) PendingObservationCount() (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.pending)
+	return len(s.pending), nil
 }
 func (s *Service) run(id string) {
 	defer func() {
@@ -786,14 +793,34 @@ func (s *Service) Resume(_ context.Context, id string, _ c.Data) (c.Snapshot[c.E
 	}
 	return old, c.Err("unsupported", "Remote resume is not supported by current connectors")
 }
-func (s *Service) Close(ctx context.Context) error {
+func (s *Service) Close(ctx context.Context, observeFirstError func(error)) (closeErr error) {
+	recordError := func(err error) {
+		if closeErr == nil && err != nil {
+			closeErr = err
+		}
+	}
+	queryErrorReported := false
+	recordQueryError := func(err error) {
+		recordError(err)
+		if !queryErrorReported && err != nil {
+			queryErrorReported = true
+			if observeFirstError != nil {
+				observeFirstError(err)
+			}
+		}
+	}
 	s.mu.Lock()
 	s.closing = true
 	s.mu.Unlock()
-	for _, snap := range s.List() {
-		state := snap.Value.Lifecycle.State
-		if state == c.Created || state == c.Validating || state == c.Queued || state == c.Preparing {
-			_, _ = s.abort(ctx, snap.Value.Call.ID, "host_shutdown", nil, true)
+	initial, err := s.List()
+	if err != nil {
+		recordQueryError(err)
+	} else {
+		for _, snap := range initial {
+			state := snap.Value.Lifecycle.State
+			if state == c.Created || state == c.Validating || state == c.Queued || state == c.Preparing {
+				_, _ = s.abort(ctx, snap.Value.Call.ID, "host_shutdown", nil, true)
+			}
 		}
 	}
 	drain := time.NewTimer(4 * time.Second)
@@ -803,7 +830,12 @@ func (s *Service) Close(ctx context.Context) error {
 draining:
 	for {
 		active := false
-		for _, snap := range s.List() {
+		calls, listErr := s.List()
+		if listErr != nil {
+			recordQueryError(listErr)
+			break draining
+		}
+		for _, snap := range calls {
 			state := snap.Value.Lifecycle.State
 			if !state.Terminal() && state != c.Waiting && state != c.Unknown {
 				active = true
@@ -821,10 +853,15 @@ draining:
 		case <-tick.C:
 		}
 	}
-	for _, snap := range s.List() {
-		state := snap.Value.Lifecycle.State
-		if !state.Terminal() && state != c.Waiting && state != c.Unknown {
-			_, _ = s.abort(ctx, snap.Value.Call.ID, "host_shutdown", nil, true)
+	remaining, listErr := s.List()
+	if listErr != nil {
+		recordQueryError(listErr)
+	} else {
+		for _, snap := range remaining {
+			state := snap.Value.Lifecycle.State
+			if !state.Terminal() && state != c.Waiting && state != c.Unknown {
+				_, _ = s.abort(ctx, snap.Value.Call.ID, "host_shutdown", nil, true)
+			}
 		}
 	}
 	if s.cancel != nil {
@@ -834,9 +871,10 @@ draining:
 	go func() { s.wg.Wait(); close(done) }()
 	select {
 	case <-done:
-		return nil
+		return closeErr
 	case <-ctx.Done():
-		return ctx.Err()
+		recordError(ctx.Err())
+		return closeErr
 	}
 }
 

@@ -26,14 +26,14 @@ func (s *Store[T]) Get(ref c.Ref) (c.Snapshot[T], error) {
 	}
 	return c.Clone(v), nil
 }
-func (s *Store[T]) List() []c.Snapshot[T] {
+func (s *Store[T]) List() ([]c.Snapshot[T], error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := []c.Snapshot[T]{}
 	for _, v := range s.entries {
 		out = append(out, c.Clone(v))
 	}
-	return out
+	return out, nil
 }
 func (s *Store[T]) Apply(ch c.Change[T]) (c.Snapshot[T], error) {
 	s.mu.Lock()

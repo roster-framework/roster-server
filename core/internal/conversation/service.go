@@ -263,10 +263,13 @@ func (s *Service) Close(id string, revision uint64) (c.Change[c.Conversation], e
 	_, err = lifecycle.Commit(s.store, ch, s.journal)
 	return ch, err
 }
-func (s *Service) List() []c.Snapshot[c.Conversation] {
+func (s *Service) List() ([]c.Snapshot[c.Conversation], error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := s.store.List()
+	out, err := s.store.List()
+	if err != nil {
+		return nil, err
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Value.ID < out[j].Value.ID })
-	return out
+	return out, nil
 }

@@ -53,9 +53,9 @@ func publicExecution(s c.Snapshot[c.Execution]) c.Snapshot[c.Execution] {
 func (s *Core) bindCommands() error {
 	r := s.Commands
 	errs := []error{
-		command.Register(r, "core.status", "Read core lifecycle and readiness", func(context.Context, Empty) (Status, error) { return s.Status(), nil }),
+		command.Register(r, "core.status", "Read core lifecycle and readiness", func(context.Context, Empty) (Status, error) { return s.Status() }),
 		command.Register(r, "nodes.register", "Register a node using a connector descriptor", func(ctx context.Context, in c.Registration) (c.Node, error) { return s.Catalog.Register(ctx, in) }),
-		command.Register(r, "nodes.list", "List nodes and declared operations", func(context.Context, Empty) ([]c.Node, error) { return s.Catalog.List(), nil }),
+		command.Register(r, "nodes.list", "List nodes and declared operations", func(context.Context, Empty) ([]c.Node, error) { return s.Catalog.List() }),
 		command.Register(r, "nodes.get", "Read a public node descriptor", func(_ context.Context, in IDInput) (c.Node, error) {
 			n, err := s.Catalog.Get(in.ID)
 			return catalog.Public(n), err
@@ -74,7 +74,11 @@ func (s *Core) bindCommands() error {
 		}),
 		command.Register(r, "calls.list", "List calls filtered by node, correlation or state", func(_ context.Context, in CallsFilter) ([]c.Snapshot[c.Execution], error) {
 			out := []c.Snapshot[c.Execution]{}
-			for _, snap := range s.Calls.List() {
+			calls, err := s.Calls.List()
+			if err != nil {
+				return nil, err
+			}
+			for _, snap := range calls {
 				call := snap.Value.Call
 				if in.NodeID != "" && call.Target.ID != in.NodeID || in.CorrelationID != "" && call.CorrelationID != in.CorrelationID || in.State != "" && snap.Value.Lifecycle.State != in.State {
 					continue
@@ -108,7 +112,7 @@ func (s *Core) bindCommands() error {
 		command.Register(r, "subscriptions.create", "Connect a declared event to a declared node operation", func(_ context.Context, in c.Subscription) (c.Snapshot[c.Subscription], error) {
 			return s.Events.Create(in)
 		}),
-		command.Register(r, "subscriptions.list", "List active subscriptions", func(context.Context, Empty) ([]c.Snapshot[c.Subscription], error) { return s.Events.List(), nil }),
+		command.Register(r, "subscriptions.list", "List active subscriptions", func(context.Context, Empty) ([]c.Snapshot[c.Subscription], error) { return s.Events.List() }),
 		command.Register(r, "subscriptions.remove", "Remove a subscription with revision checking", func(_ context.Context, in RevisionInput) (c.Change[c.Subscription], error) {
 			return s.Events.Remove(in.ID, in.ExpectedRevision)
 		}),
@@ -121,7 +125,7 @@ func (s *Core) bindCommands() error {
 		command.Register(r, "conversations.create", "Create one-to-one or multiparty conversation", func(_ context.Context, in c.Conversation) (c.Snapshot[c.Conversation], error) {
 			return s.Conversations.Create(in)
 		}),
-		command.Register(r, "conversations.list", "List conversations", func(context.Context, Empty) ([]c.Snapshot[c.Conversation], error) { return s.Conversations.List(), nil }),
+		command.Register(r, "conversations.list", "List conversations", func(context.Context, Empty) ([]c.Snapshot[c.Conversation], error) { return s.Conversations.List() }),
 		command.Register(r, "conversations.get", "Read participants and paginated messages", func(_ context.Context, in ConversationPage) (conversation.View, error) {
 			return s.Conversations.Get(in.ID, in.After, in.Limit)
 		}),
