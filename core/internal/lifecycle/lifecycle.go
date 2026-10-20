@@ -101,15 +101,7 @@ func reportDigest(r c.Report) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var normalized any
-	if err = json.Unmarshal(b, &normalized); err != nil {
-		return "", err
-	}
-	b, err = json.Marshal(normalized)
-	if err != nil {
-		return "", err
-	}
-	return c.ID(string(b)), nil
+	return c.CanonicalJSONDigest(b)
 }
 
 // Observe is the sole pure reducer for remote reports and normalized connector results.

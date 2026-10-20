@@ -5,6 +5,9 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"io"
+	"math"
+	"math/big"
 	"mime"
 	"net/http"
 	"strings"
@@ -118,7 +121,12 @@ func (r *Connector) Invoke(ctx c.Context, raw json.RawMessage, call c.Call, sink
 			continue
 		}
 		var frame map[string]any
-		if json.Unmarshal(line, &frame) != nil || frame == nil {
+		if c.CheckJSONNumbers(line) != nil {
+			return h.Failure(call, c.Unknown, "wire")
+		}
+		dec := json.NewDecoder(bytes.NewReader(line))
+		dec.UseNumber()
+		if dec.Decode(&frame) != nil || requireEOF(dec) != nil || frame == nil {
 			return h.Failure(call, c.Unknown, "wire")
 		}
 		switch frame["type"] {
@@ -233,8 +241,7 @@ func (r *Connector) result(b h.Binding, call c.Call, value any) c.Result {
 			return h.Failure(call, c.Unknown, "wire")
 		}
 		for key, v := range metrics {
-			number, ok := v.(float64)
-			if (key != "duration_ms" && key != "cost_usd") || !ok || number < 0 {
+			if (key != "duration_ms" && key != "cost_usd") || !validMetric(v) {
 				return h.Failure(call, c.Unknown, "wire")
 			}
 		}
@@ -260,6 +267,30 @@ func (r *Connector) result(b h.Binding, call c.Call, value any) c.Result {
 		}
 	}
 	return c.Result{CallID: call.ID, State: c.Succeeded, Output: r.http.Safe(b, result), Reference: call.ID, Emissions: emissions}
+}
+
+func requireEOF(dec *json.Decoder) error {
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return c.Err("wire", "Trailing runtime JSON")
+		}
+		return err
+	}
+	return nil
+}
+
+func validMetric(value any) bool {
+	number, ok := value.(json.Number)
+	if !ok {
+		return false
+	}
+	exact, ok := new(big.Rat).SetString(number.String())
+	if !ok || exact.Sign() < 0 {
+		return false
+	}
+	approx, _ := exact.Float64()
+	return !math.IsInf(approx, 0) && !math.IsNaN(approx)
 }
 func (r *Connector) Inspect(ctx c.Context, raw json.RawMessage, call c.Call) c.Result {
 	b, err := h.Parse(raw)

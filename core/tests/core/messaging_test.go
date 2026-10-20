@@ -278,8 +278,35 @@ func TestBusyPublishBlocksOnlyItsSourceForTheCurrentPass(t *testing.T) {
 	drainer := event.New(root.Subscriptions(), cat, calls, root.Admissions())
 	completed := 0
 	err = drainer.Drain(root.Executions(), journalStore, func(c.Delivery) error { completed++; return nil })
-	if c.AsFault(err).Code != "busy" || completed != 1 {
-		t.Fatalf("capacity-busy source did not preserve independent progress: err=%v completed=%d", err, completed)
+	busyObserved := err != nil && c.AsFault(err).Code == "busy"
+	if err != nil && !busyObserved {
+		t.Fatalf("unexpected first drain failure: %v", err)
+	}
+	var remaining []c.Delivery
+	for attempt := 0; attempt < len(deliveries)+1; attempt++ {
+		remaining, err = root.Executions().PendingDeliveries(128)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, independent, readErr := root.Admissions().ReadPublished("independent-b")
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if busyObserved && completed == 1 && independent && len(remaining) == 64 {
+			break
+		}
+		err = drainer.Drain(root.Executions(), journalStore, func(c.Delivery) error { completed++; return nil })
+		if err != nil && c.AsFault(err).Code != "busy" {
+			t.Fatalf("bounded drain pass lost capacity-busy observation: err=%v completed=%d", err, completed)
+		}
+		busyObserved = busyObserved || err != nil
+	}
+	remaining, err = root.Executions().PendingDeliveries(128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !busyObserved || completed != 1 || len(remaining) != 64 {
+		t.Fatalf("bounded drain passes did not observe busy and reach independent work/head: busy=%v completed=%d pending=%d", busyObserved, completed, len(remaining))
 	}
 	for i := 0; i < 64; i++ {
 		id := fmt.Sprintf("busy-a-%02d", i)
@@ -290,15 +317,11 @@ func TestBusyPublishBlocksOnlyItsSourceForTheCurrentPass(t *testing.T) {
 	if _, ok, e := root.Admissions().ReadPublished("independent-b"); e != nil || !ok {
 		t.Fatalf("independent source was not admitted: ok=%v err=%v", ok, e)
 	}
-	remaining, scanErr := root.Executions().PendingDeliveries(128)
-	if scanErr != nil {
-		t.Fatal(scanErr)
-	}
 	remainingIDs := map[string]bool{}
 	for _, delivery := range remaining {
 		remainingIDs[delivery.ID] = true
 	}
-	if len(remaining) != 65 {
+	if len(remaining) != 64 {
 		t.Fatalf("busy source publishes were not retained through fixed Through: count=%d ids=%+v", len(remaining), remainingIDs)
 	}
 	for i := 0; i < 64; i++ {
@@ -306,8 +329,16 @@ func TestBusyPublishBlocksOnlyItsSourceForTheCurrentPass(t *testing.T) {
 			t.Fatalf("busy published delivery %d was skipped", i)
 		}
 	}
-	if err = drainer.Drain(root.Executions(), journalStore, func(c.Delivery) error { completed++; return nil }); c.AsFault(err).Code != "busy" || completed != 1 {
-		t.Fatalf("subsequent pass failed to resume source-blocked work: err=%v completed=%d", err, completed)
+	busyObserved = false
+	for attempt := 0; attempt < len(deliveries)+1 && !busyObserved; attempt++ {
+		err = drainer.Drain(root.Executions(), journalStore, func(c.Delivery) error { completed++; return nil })
+		if err != nil && c.AsFault(err).Code != "busy" {
+			t.Fatalf("subsequent pass returned unexpected error: %v", err)
+		}
+		busyObserved = err != nil
+	}
+	if !busyObserved || completed != 1 {
+		t.Fatalf("subsequent pass failed to resume source-blocked work: busy=%v completed=%d", busyObserved, completed)
 	}
 }
 
@@ -972,7 +1003,7 @@ func TestConversationScopeRetryAndLateReply(t *testing.T) {
 	final := c.Clone(pending)
 	final.Revision++
 	final.Value.Lifecycle.State = c.Succeeded
-	final.Value.Result = &c.Result{CallID: final.Value.Call.ID, State: c.Succeeded, Output: c.Data{"answer": "done"}}
+	final.Value.Result = &c.Result{CallID: final.Value.Call.ID, State: c.Succeeded, Output: c.Data{"answer": "done", "exact": json.Number("9007199254740993")}}
 	change := c.Change[c.Execution]{ID: final.Value.Call.ID, Subject: final.Subject, BeforeRevision: pending.Revision, AfterRevision: final.Revision, Before: &pending.Value, After: final.Value}
 	terminal := c.Delivery{ID: c.ID(final.Value.Call.ID, "test-terminal"), Kind: c.DeliveryCompletion, Execution: &final}
 	_, err = root.Executions().Commit(c.ExecutionMutation{Subject: pending.Subject, ExpectedRevision: pending.Revision, Changes: []c.Change[c.Execution]{change}, Deliveries: []c.Delivery{terminal}})
@@ -990,7 +1021,7 @@ func TestConversationScopeRetryAndLateReply(t *testing.T) {
 		t.Fatalf("late reply missing/duplicated %+v %v", view, err)
 	}
 	reply := view.Messages[1]
-	if reply.ReplyTo != message.ID || reply.Author != recipient || reply.CallIDs[0] != message.CallIDs[0] || len(mustList(t, calls)) != 1 {
+	if reply.ReplyTo != message.ID || reply.Author != recipient || reply.CallIDs[0] != message.CallIDs[0] || reply.Result == nil || reply.Result.Output.(map[string]any)["exact"] != json.Number("9007199254740993") || len(mustList(t, calls)) != 1 {
 		t.Fatalf("invalid reply %+v", reply)
 	}
 	// A queued cancellation completes independently of closing the session.

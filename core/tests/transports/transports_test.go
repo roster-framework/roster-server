@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/roster-framework/roster-server/core/internal/adapters/schema"
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
 	"github.com/roster-framework/roster-server/core/internal/interfaces/cli"
 	"github.com/roster-framework/roster-server/core/internal/interfaces/command"
@@ -37,12 +38,15 @@ type abortInput struct {
 
 func TestSharedCommandTransports(t *testing.T) {
 	ctx := context.Background()
-	registry := command.New()
+	registry := command.New(schema.New())
 	var calls atomic.Int32
 	if err := command.Register(registry, "example.echo", "Echo", func(_ context.Context, in input) (output, error) { calls.Add(1); return output{in.Text}, nil }); err != nil {
 		t.Fatal(err)
 	}
 	if err := command.Register(registry, "example.list", "List", func(context.Context, struct{}) ([]output, error) { return []output{}, nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Register(registry, "example.number", "Preserve decimal numbers", func(_ context.Context, in map[string]any) (map[string]any, error) { return in, nil }); err != nil {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
@@ -60,7 +64,7 @@ func TestSharedCommandTransports(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 2 {
+	if len(tools.Tools) != 3 {
 		t.Fatalf("tools: %+v", tools)
 	}
 	for _, tool := range tools.Tools {
@@ -84,6 +88,29 @@ func TestSharedCommandTransports(t *testing.T) {
 	got, _ := json.Marshal(result.StructuredContent)
 	if string(got) != `{"text":"same"}` {
 		t.Fatalf("MCP result: %s", got)
+	}
+	large := json.Number("9007199254740993")
+	result, err = session.CallTool(ctx, &sdk.CallToolParams{Name: "example_number", Arguments: map[string]any{"integer": large, "fraction": json.Number("0.1")}})
+	if err != nil || result.IsError {
+		t.Fatalf("MCP exact numbers: %+v %v", result, err)
+	}
+	var mcpNumbers map[string]any
+	mcpDecoder := json.NewDecoder(strings.NewReader(result.Content[0].(*sdk.TextContent).Text))
+	mcpDecoder.UseNumber()
+	if err := mcpDecoder.Decode(&mcpNumbers); err != nil || mcpNumbers["integer"] != large || mcpNumbers["fraction"] != json.Number("0.1") {
+		t.Fatalf("MCP response rounded exact numbers: %#v err=%v", mcpNumbers, err)
+	}
+	response, err := http.Post(server.URL+"/api/commands/example.number", "application/json", strings.NewReader(`{"integer":9007199254740993,"fraction":0.1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var httpNumbers map[string]any
+	decoder := json.NewDecoder(response.Body)
+	decoder.UseNumber()
+	decodeErr := decoder.Decode(&httpNumbers)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || decodeErr != nil || httpNumbers["integer"] != large || httpNumbers["fraction"] != json.Number("0.1") {
+		t.Fatalf("HTTP command rounded exact numbers: status=%d value=%#v err=%v", response.StatusCode, httpNumbers, decodeErr)
 	}
 	var stdout, stderr bytes.Buffer
 	if err := cli.Run(ctx, []string{"example.echo", "--file", "-", "--url", server.URL}, strings.NewReader(`{"text":"same"}`), &stdout, &stderr); err != nil {
@@ -140,13 +167,13 @@ func TestSharedCommandTransports(t *testing.T) {
 		t.Fatal(err)
 	}
 	var catalog []command.Metadata
-	if json.Unmarshal(stdout.Bytes(), &catalog) != nil || len(catalog) != 2 {
+	if json.Unmarshal(stdout.Bytes(), &catalog) != nil || len(catalog) != 3 {
 		t.Fatalf("catalog: %s", &stdout)
 	}
 }
 
 func TestAbortExpectedInstanceIDIsPreservedByHTTPCommandTransport(t *testing.T) {
-	registry := command.New()
+	registry := command.New(schema.New())
 	if err := command.Register(registry, "calls.abort", "Abort", func(_ context.Context, in abortInput) (abortInput, error) { return in, nil }); err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +195,7 @@ func TestAbortExpectedInstanceIDIsPreservedByHTTPCommandTransport(t *testing.T) 
 
 func TestAdmissionFaultIsSharedAcrossTransports(t *testing.T) {
 	ctx := context.Background()
-	registry := command.New()
+	registry := command.New(schema.New())
 	if err := command.Register(registry, "example.echo", "Echo", func(_ context.Context, in input) (output, error) { return output{in.Text}, nil }); err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +250,7 @@ func TestAdmissionFaultIsSharedAcrossTransports(t *testing.T) {
 }
 
 func TestLocalProtection(t *testing.T) {
-	handler := httpapi.Handler(command.New())
+	handler := httpapi.Handler(command.New(schema.New()))
 	for _, test := range []struct {
 		host, peer, origin, site string
 		want                     int
@@ -251,7 +278,7 @@ func TestLocalProtection(t *testing.T) {
 // RawMessage represents arbitrary JSON values, including nested schema objects.
 func TestRawJSONContractsAndOutputValidation(t *testing.T) {
 	ctx := context.Background()
-	registry := command.New()
+	registry := command.New(schema.New())
 	err := command.Register(registry, "nodes.register", "Register", func(_ context.Context, in c.Registration) (c.Node, error) {
 		return c.Node{ID: in.ID, ConnectorID: in.ConnectorID, Descriptor: c.Descriptor{
 			Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}},

@@ -29,16 +29,22 @@ type entry struct {
 	execute  func(context.Context, json.RawMessage) (any, error)
 }
 type Registry struct {
-	mu      sync.RWMutex
-	entries map[string]entry
-	enter   func(string) (func(), error)
+	mu        sync.RWMutex
+	entries   map[string]entry
+	validator c.Validator
+	enter     func(string) (func(), error)
 }
 
-func New() *Registry { return &Registry{entries: make(map[string]entry)} }
+func New(validator c.Validator) *Registry {
+	return &Registry{entries: make(map[string]entry), validator: validator}
+}
 
 func Register[I, O any](r *Registry, name, description string, handler func(context.Context, I) (O, error)) error {
 	if r == nil || !c.ValidID(name) || handler == nil {
 		return c.Err("invalid", "Invalid command registration")
+	}
+	if r.validator == nil {
+		return c.Err("invalid", "A schema validator is required")
 	}
 	options := &jsonschema.ForOptions{TypeSchemas: map[reflect.Type]*jsonschema.Schema{
 		reflect.TypeFor[json.RawMessage](): {},
@@ -54,30 +60,47 @@ func Register[I, O any](r *Registry, name, description string, handler func(cont
 	if input.Type != "object" {
 		return c.Err("invalid", "Command input must be an object")
 	}
-	resolved, err := input.Resolve(nil)
-	if err != nil {
+	inputBytes, err := json.Marshal(input)
+	if err != nil || c.CheckJSONNumbers(inputBytes) != nil {
+		return c.Err("invalid", "Invalid generated command input schema")
+	}
+	outputBytes, err := json.Marshal(output)
+	if err != nil || c.CheckJSONNumbers(outputBytes) != nil {
+		return c.Err("invalid", "Invalid generated command output schema")
+	}
+	inputSchema := c.Schema(inputBytes)
+	outputSchema := c.Schema(outputBytes)
+	if err := r.validator.Check(inputSchema); err != nil {
 		return err
 	}
-	resolvedOutput, err := output.Resolve(nil)
-	if err != nil {
+	if err := r.validator.Check(outputSchema); err != nil {
 		return err
 	}
 	e := entry{metadata: Metadata{name, description, input, output}, execute: func(ctx context.Context, raw json.RawMessage) (any, error) {
 		if len(raw) > MaxInputBytes {
 			return nil, c.Err("invalid", "Input exceeds 64 KiB")
 		}
+		if c.CheckJSONNumbers(raw) != nil {
+			return nil, c.Err("invalid", "Input contains an unsupported JSON number")
+		}
 		var value any
-		if err := json.Unmarshal(raw, &value); err != nil {
+		valueDecoder := json.NewDecoder(bytes.NewReader(raw))
+		valueDecoder.UseNumber()
+		if err := valueDecoder.Decode(&value); err != nil {
 			return nil, c.Err("invalid", "Input must be one JSON object")
+		}
+		if _, err := valueDecoder.Token(); err != io.EOF {
+			return nil, c.Err("invalid", "Trailing JSON is not allowed")
 		}
 		if _, ok := value.(map[string]any); !ok {
 			return nil, c.Err("invalid", "Input must be a JSON object")
 		}
-		if err := resolved.Validate(value); err != nil {
+		if err := r.validator.Validate(inputSchema, value); err != nil {
 			return nil, c.Err("invalid", "Input does not match command schema")
 		}
 		var in I
 		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&in); err != nil {
 			return nil, c.Err("invalid", "Invalid command input")
@@ -90,14 +113,10 @@ func Register[I, O any](r *Registry, name, description string, handler func(cont
 			return nil, err
 		}
 		encoded, err := json.Marshal(out)
-		if err != nil {
+		if err != nil || c.CheckJSONNumbers(encoded) != nil {
 			return nil, c.Err("internal", "Command produced invalid JSON output")
 		}
-		var normalized any
-		if err := json.Unmarshal(encoded, &normalized); err != nil {
-			return nil, c.Err("internal", "Command produced invalid JSON output")
-		}
-		if err := resolvedOutput.Validate(normalized); err != nil {
+		if err := r.validator.Validate(outputSchema, out); err != nil {
 			return nil, c.Err("internal", "Command output does not match schema")
 		}
 		return out, nil

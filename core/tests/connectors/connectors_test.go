@@ -24,7 +24,7 @@ func binding(url string) json.RawMessage {
 	return b
 }
 func call() c.Call {
-	return c.Call{ID: "call-1", Operation: "run", Input: c.Data{"request": "hello", "extra": true}, CorrelationID: "corr"}
+	return c.Call{ID: "call-1", Operation: "run", Input: c.Data{"request": "hello", "extra": true, "exact": json.Number("9007199254740993")}, CorrelationID: "corr"}
 }
 func lookup(key string) string {
 	if key == "SERVER_TOKEN" {
@@ -32,6 +32,23 @@ func lookup(key string) string {
 	}
 	return ""
 }
+
+func TestHTTPJSONDecodePreservesNumbersAndEnforcesSingleBoundedValue(t *testing.T) {
+	var decoded map[string]any
+	if err := h.Decode(strings.NewReader(`{"integer":9007199254740993,"fraction":0.1}`), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["integer"] != json.Number("9007199254740993") || decoded["fraction"] != json.Number("0.1") {
+		t.Fatalf("HTTP decoder rounded numbers: %#v", decoded)
+	}
+	for _, raw := range []string{`{"n":1e1025}`, `{} {}`} {
+		var value any
+		if err := h.Decode(strings.NewReader(raw), &value); err == nil {
+			t.Fatalf("HTTP decoder accepted invalid value %s", raw)
+		}
+	}
+}
+
 func TestRuntimeWireAndReports(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer private-token" {
@@ -42,7 +59,9 @@ func TestRuntimeWireAndReports(t *testing.T) {
 			fmt.Fprint(w, `{"protocol":"roster/0.1","runtime_id":"runtime","agents":[{"id":"target","statuses":["needs_help"],"events":["complete"]}]}`)
 		case "/executions":
 			var body map[string]any
-			if json.NewDecoder(r.Body).Decode(&body) != nil {
+			decoder := json.NewDecoder(r.Body)
+			decoder.UseNumber()
+			if decoder.Decode(&body) != nil {
 				t.Error("invalid request")
 			}
 			if body["protocol"] != "roster/0.1" || body["agent_id"] != "target" || body["execution_id"] != "call-1" || body["work_id"] != "call-1" {
@@ -55,9 +74,12 @@ func TestRuntimeWireAndReports(t *testing.T) {
 			if body["input"].(map[string]any)["extra"] != true {
 				t.Error("lost input")
 			}
+			if body["input"].(map[string]any)["exact"] != json.Number("9007199254740993") {
+				t.Errorf("request number rounded on the wire: %#v", body["input"])
+			}
 			w.Header().Set("Content-Type", "application/x-ndjson")
 			fmt.Fprintln(w, `{"type":"log","text":"private-token","at":"2026-10-12T00:00:00Z"}`)
-			fmt.Fprintln(w, `{"type":"result","result":{"status":"needs_help","summary":"done","output":{"secret":"private-token"},"events":[{"type":"complete","data":{"text":"private-token"}}],"metrics":{"duration_ms":1},"artifacts":[]}}`)
+			fmt.Fprintln(w, `{"type":"result","result":{"status":"needs_help","summary":"done","output":{"secret":"private-token","exact":9007199254740993,"fraction":0.1},"events":[{"type":"complete","data":{"text":"private-token","exact":9007199254740993}}],"metrics":{"duration_ms":1},"artifacts":[]}}`)
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
@@ -70,8 +92,9 @@ func TestRuntimeWireAndReports(t *testing.T) {
 	}
 	var reports []c.Report
 	result := connector.Invoke(context.Background(), binding(server.URL), call(), func(report c.Report) error { reports = append(reports, report); return nil })
-	if result.State != c.Succeeded || len(result.Emissions) != 1 || result.Emissions[0].Payload["text"] != "[redacted]" {
-		t.Fatalf("result: %+v", result)
+	output := result.Output.(map[string]any)["output"].(map[string]any)
+	if result.State != c.Succeeded || len(result.Emissions) != 1 || result.Emissions[0].Payload["text"] != "[redacted]" || output["exact"] != json.Number("9007199254740993") || output["fraction"] != json.Number("0.1") || result.Emissions[0].Payload["exact"] != json.Number("9007199254740993") {
+		t.Fatalf("result number precision lost: %#v", result)
 	}
 	data, _ := json.Marshal(result)
 	if strings.Contains(string(data), "private-token") {
@@ -87,7 +110,7 @@ func TestRuntimeAmbiguityAndAdmission(t *testing.T) {
 		status     int
 		state      c.State
 	}{
-		{"eof", "", 200, c.Unknown}, {"observation", `{"type":"observation","code":"interrupted","message":"stop"}`, 200, c.Unknown}, {"malformed", `{"type":"result","result":{"status":"done"}}`, 200, c.Unknown}, {"bad_events", `{"type":"result","result":{"status":"done","summary":"ok","events":{}}}`, 200, c.Unknown}, {"bad_metrics", `{"type":"result","result":{"status":"done","summary":"ok","metrics":{"cost_usd":-1}}}`, 200, c.Unknown}, {"reject", `{"accepted":false}`, 429, c.Rejected}, {"http_error", `{"error":"private-token"}`, 500, c.Unknown}, {"wrong_frame", `{"type":"accepted"}`, 200, c.Unknown},
+		{"eof", "", 200, c.Unknown}, {"observation", `{"type":"observation","code":"interrupted","message":"stop"}`, 200, c.Unknown}, {"malformed", `{"type":"result","result":{"status":"done"}}`, 200, c.Unknown}, {"bad_events", `{"type":"result","result":{"status":"done","summary":"ok","events":{}}}`, 200, c.Unknown}, {"bad_metrics", `{"type":"result","result":{"status":"done","summary":"ok","metrics":{"cost_usd":-1}}}`, 200, c.Unknown}, {"negative_underflow_metric", `{"type":"result","result":{"status":"done","summary":"ok","metrics":{"cost_usd":-1e-1024}}}`, 200, c.Unknown}, {"overflow_metric", `{"type":"result","result":{"status":"done","summary":"ok","metrics":{"cost_usd":1e1024}}}`, 200, c.Unknown}, {"reject", `{"accepted":false}`, 429, c.Rejected}, {"http_error", `{"error":"private-token"}`, 500, c.Unknown}, {"wrong_frame", `{"type":"accepted"}`, 200, c.Unknown},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -144,8 +167,10 @@ func TestResourceWireAndUnsupported(t *testing.T) {
 			fmt.Fprint(w, `{"id":"target","operations":["tools.call","tools.list"]}`)
 		case "/v1/resources/target/invoke":
 			var body map[string]any
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			if body["name"] != "tools.call" || body["tool"] != "read" || body["arguments"].(map[string]any)["id"] != "doc" || body["expected_version"] != float64(3) {
+			decoder := json.NewDecoder(r.Body)
+			decoder.UseNumber()
+			_ = decoder.Decode(&body)
+			if body["name"] != "tools.call" || body["tool"] != "read" || body["arguments"].(map[string]any)["id"] != "doc" || body["expected_version"] != json.Number("3") {
 				t.Errorf("bad invoke %v", body)
 			}
 			fmt.Fprint(w, `{"content":[{"text":"private-token"}],"isError":false}`)
@@ -176,6 +201,38 @@ func TestResourceWireAndUnsupported(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+func TestResourceExpectedVersionAcceptsExactIntegralSpellings(t *testing.T) {
+	var versions []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/resources/target/invoke" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			return
+		}
+		var body map[string]any
+		decoder := json.NewDecoder(r.Body)
+		decoder.UseNumber()
+		if err := decoder.Decode(&body); err != nil {
+			t.Error(err)
+		}
+		versions = append(versions, body["expected_version"].(json.Number).String())
+		fmt.Fprint(w, `{"content":[],"isError":false}`)
+	}))
+	defer server.Close()
+	connector := resource.New(server.Client(), lookup)
+	for _, spelling := range []string{"1", "1.0", "1e0"} {
+		current := call()
+		current.Operation = "tools.call"
+		current.Input = c.Data{"tool": "read", "arguments": map[string]any{}, "expected_version": json.Number(spelling)}
+		result := connector.Invoke(context.Background(), binding(server.URL), current, nil)
+		if result.State != c.Succeeded {
+			t.Fatalf("integral version %s was rejected: %+v", spelling, result)
+		}
+	}
+	if strings.Join(versions, ",") != "1,1.0,1e0" {
+		t.Fatalf("resource version lexical tokens changed: %v", versions)
+	}
+}
+
 func TestResourceResponseUncertainty(t *testing.T) {
 	for _, tc := range []struct {
 		status int

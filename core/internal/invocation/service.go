@@ -159,7 +159,7 @@ func (s *Service) SubmitBatch(origin c.AdmissionOrigin, calls []c.Call, effects 
 	}
 	for _, call := range calls {
 		encoded, encodeErr := json.Marshal(call)
-		if encodeErr != nil || len(encoded) > 65536 {
+		if encodeErr != nil || len(encoded) > 65536 || c.CheckJSONNumbers(encoded) != nil {
 			return nil, c.Err("invalid_input", "Call must fit the JSON input limit")
 		}
 		call = c.Clone(call)
@@ -183,7 +183,7 @@ func (s *Service) SubmitBatch(origin c.AdmissionOrigin, calls []c.Call, effects 
 			call.Deadline = c.Now().Add(time.Minute)
 		}
 		b, err := json.Marshal(call.Input)
-		if err != nil || len(b) > 65536 {
+		if err != nil || len(b) > 65536 || c.CheckJSONNumbers(b) != nil {
 			return nil, c.Err("invalid_input", "Call input exceeds JSON limit")
 		}
 		if _, _, err = s.catalog.Validate(call.Target, call.Operation, call.Input); err != nil {
@@ -328,12 +328,12 @@ func (s *Service) normalizeResult(id string, result c.Result, allowProgress bool
 		Reference string   `json:"reference,omitempty"`
 	}{result.State, result.Output, result.Error, result.Reference})
 	emissions, emissionErr := json.Marshal(result.Emissions)
-	if err != nil || len(encoded) > 65536 || emissionErr != nil || len(emissions) > 65536 || len(result.Emissions) > 20 {
+	if err != nil || len(encoded) > 65536 || c.CheckJSONNumbers(encoded) != nil || emissionErr != nil || len(emissions) > 65536 || c.CheckJSONNumbers(emissions) != nil || len(result.Emissions) > 20 {
 		return invalid("Connector returned an oversized or invalid result"), nil
 	}
 	for _, emission := range result.Emissions {
 		b, e := json.Marshal(emission)
-		if e != nil || len(b) > 65536 {
+		if e != nil || len(b) > 65536 || c.CheckJSONNumbers(b) != nil {
 			return invalid("Connector returned an oversized emission"), nil
 		}
 	}

@@ -218,20 +218,13 @@ func (s *Executions) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], err
 }
 
 func copyReport(r c.Report) (c.Report, error) {
-	b, err := json.Marshal(r)
+	out, err := c.CloneJSON(r)
 	if err != nil {
 		return c.Report{}, err
 	}
-	var out c.Report
-	if err = json.Unmarshal(b, &out); err != nil {
-		return c.Report{}, err
-	}
 	if r.Result != nil && out.Result != nil {
-		b, err = json.Marshal(r.Result.Emissions)
+		out.Result.Emissions, err = c.CloneJSON(r.Result.Emissions)
 		if err != nil {
-			return c.Report{}, err
-		}
-		if err = json.Unmarshal(b, &out.Result.Emissions); err != nil {
 			return c.Report{}, err
 		}
 	}
@@ -367,34 +360,18 @@ func deliveryDigest(d c.Delivery) (string, error) {
 		}
 	}
 	d.Kind = kind
-	b, e := json.Marshal(d)
-	if e != nil {
-		return "", e
-	}
-	var canonical any
-	if e = json.Unmarshal(b, &canonical); e != nil {
-		return "", e
-	}
-	object, ok := canonical.(map[string]any)
-	if !ok {
-		return "", c.Err("invalid_input", "Delivery is not an object")
-	}
 	var emissions any
 	if d.Execution != nil && d.Execution.Value.Result != nil {
-		emissionBytes, err := json.Marshal(d.Execution.Value.Result.Emissions)
-		if err != nil {
-			return "", err
-		}
-		if err = json.Unmarshal(emissionBytes, &emissions); err != nil {
-			return "", err
-		}
+		emissions = d.Execution.Value.Result.Emissions
 	}
-	object["private_emissions"] = emissions
-	canonicalBytes, err := json.Marshal(object)
+	canonicalBytes, err := json.Marshal(struct {
+		c.Delivery
+		PrivateEmissions any `json:"private_emissions"`
+	}{d, emissions})
 	if err != nil {
 		return "", err
 	}
-	return c.ID(string(canonicalBytes)), nil
+	return c.CanonicalJSONDigest(canonicalBytes)
 }
 func cloneDelivery(d c.Delivery) c.Delivery {
 	out, err := copyDelivery(d)
@@ -404,20 +381,13 @@ func cloneDelivery(d c.Delivery) c.Delivery {
 	return out
 }
 func copyDelivery(d c.Delivery) (c.Delivery, error) {
-	b, err := json.Marshal(d)
+	out, err := c.CloneJSON(d)
 	if err != nil {
 		return c.Delivery{}, err
 	}
-	var out c.Delivery
-	if err = json.Unmarshal(b, &out); err != nil {
-		return c.Delivery{}, err
-	}
 	if d.Execution != nil && d.Execution.Value.Result != nil && out.Execution != nil && out.Execution.Value.Result != nil {
-		b, err = json.Marshal(d.Execution.Value.Result.Emissions)
+		out.Execution.Value.Result.Emissions, err = c.CloneJSON(d.Execution.Value.Result.Emissions)
 		if err != nil {
-			return c.Delivery{}, err
-		}
-		if err = json.Unmarshal(b, &out.Execution.Value.Result.Emissions); err != nil {
 			return c.Delivery{}, err
 		}
 	}

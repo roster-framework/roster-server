@@ -1,7 +1,6 @@
 package memory
 
 import (
-	"encoding/json"
 	"sync"
 
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
@@ -54,18 +53,34 @@ func (r *Root) Admissions() c.AdmissionState           { return r }
 func (r *Root) Journal() observation.Store             { return r.journalStore }
 
 func copyAdmissionEffect(effect c.AdmissionEffect) (c.AdmissionEffect, error) {
-	b, err := json.Marshal(effect)
+	out, err := c.CloneJSON(effect)
 	if err != nil {
-		return c.AdmissionEffect{}, err
-	}
-	var out c.AdmissionEffect
-	if err = json.Unmarshal(b, &out); err != nil {
 		return c.AdmissionEffect{}, err
 	}
 	for i, d := range effect.Deliveries {
 		out.Deliveries[i], err = copyDelivery(d)
 		if err != nil {
 			return c.AdmissionEffect{}, err
+		}
+	}
+	if effect.Message != nil && effect.Message.Message.Result != nil && out.Message != nil && out.Message.Message.Result != nil {
+		out.Message.Message.Result.Emissions, err = c.CloneJSON(effect.Message.Message.Result.Emissions)
+		if err != nil {
+			return c.AdmissionEffect{}, err
+		}
+	}
+	return out, nil
+}
+
+func copyMessage(message c.Message) (c.Message, error) {
+	out, err := c.CloneJSON(message)
+	if err != nil {
+		return c.Message{}, err
+	}
+	if message.Result != nil && out.Result != nil {
+		out.Result.Emissions, err = c.CloneJSON(message.Result.Emissions)
+		if err != nil {
+			return c.Message{}, err
 		}
 	}
 	return out, nil
@@ -253,12 +268,8 @@ func (r *Root) CommitReply(commit c.ReplyCommit) error {
 	}
 	var stagedMessage *c.Message
 	if commit.Message != nil {
-		b, e := json.Marshal(commit.Message)
+		m, e := copyMessage(*commit.Message)
 		if e != nil {
-			return c.Err("invalid_input", "Reply message cannot be stored")
-		}
-		var m c.Message
-		if e = json.Unmarshal(b, &m); e != nil {
 			return c.Err("invalid_input", "Reply message cannot be stored")
 		}
 		stagedMessage = &m

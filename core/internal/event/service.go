@@ -101,7 +101,6 @@ func (s *Service) Remove(id string, revision uint64) (c.Change[c.Subscription], 
 func (s *Service) Publish(e c.Event, origin c.AdmissionOrigin) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e = c.Clone(e)
 	if !c.ValidAdmissionOrigin(origin) {
 		return nil, c.Err("forbidden", "Admission is not authorized")
 	}
@@ -121,9 +120,10 @@ func (s *Service) Publish(e c.Event, origin c.AdmissionOrigin) ([]string, error)
 		e.Payload = c.Data{}
 	}
 	b, err := json.Marshal(e)
-	if err != nil || len(b) > 65536 {
+	if err != nil || len(b) > 65536 || c.CheckJSONNumbers(b) != nil {
 		return nil, c.Err("invalid_input", "Event exceeds size limit")
 	}
+	e = c.Clone(e)
 	originBytes, err := json.Marshal(origin)
 	if err != nil {
 		return nil, c.Err("invalid_input", "Invalid event provenance")

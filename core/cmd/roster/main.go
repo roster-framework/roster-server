@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"github.com/roster-framework/roster-server/core/internal/authority"
+	c "github.com/roster-framework/roster-server/core/internal/contracts"
 	"github.com/roster-framework/roster-server/core/internal/host"
 	"github.com/roster-framework/roster-server/core/internal/interfaces/cli"
 	"io"
@@ -83,7 +85,15 @@ func run() (runErr error) {
 			return err
 		}
 		defer file.Close()
-		decoder := json.NewDecoder(io.LimitReader(file, 65537))
+		raw, readErr := io.ReadAll(io.LimitReader(file, 65537))
+		if readErr != nil || len(raw) > 65536 {
+			return errors.New("configuration exceeds 64 KiB")
+		}
+		if c.CheckJSONNumbers(raw) != nil {
+			return errors.New("configuration contains an unsupported JSON number")
+		}
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
 		decoder.DisallowUnknownFields()
 		var initial host.Config
 		if err = decoder.Decode(&initial); err != nil {

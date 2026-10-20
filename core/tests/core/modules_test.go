@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +20,7 @@ import (
 	"github.com/roster-framework/roster-server/core/internal/catalog"
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
 	"github.com/roster-framework/roster-server/core/internal/event"
+	"github.com/roster-framework/roster-server/core/internal/interfaces/command"
 	"github.com/roster-framework/roster-server/core/internal/invocation"
 	"github.com/roster-framework/roster-server/core/internal/lifecycle"
 	"github.com/roster-framework/roster-server/core/internal/observation"
@@ -26,6 +31,196 @@ func fault(t *testing.T, err error, code string) {
 	if err == nil || c.AsFault(err).Code != code {
 		t.Fatalf("want %s, got %v", code, err)
 	}
+}
+
+func TestSharedJSONNumberBoundsPrecisionAndCompositeCopies(t *testing.T) {
+	accepted := []string{"0.1", "-0", "1e3", "1e0001024", "1e-1024", "-1e1024", strings.Repeat("9", 1024), `{"s":"1e1025 \\\"quote\\\" \\\\ slash","n":1e1024}`}
+	for _, number := range accepted {
+		if err := c.CheckJSONNumbers(json.RawMessage(number)); err != nil {
+			t.Errorf("valid bounded number %q rejected: %v", number[:min(len(number), 24)], err)
+		}
+	}
+	for _, raw := range []string{"01", "1e1025", "1e-1025", "-1e1025", strings.Repeat("9", 1025), `{"n":1e1025}`, `{"s":"unterminated}`, "1 2", ""} {
+		if err := c.CheckJSONNumbers(json.RawMessage(raw)); err == nil {
+			t.Errorf("invalid or over-budget number accepted: %q", raw[:min(len(raw), 24)])
+		}
+	}
+	typedRaw := json.RawMessage(`{"embedded":9007199254740993}`)
+	if err := c.CheckJSONNumbers(typedRaw); err != nil {
+		t.Fatalf("valid json.RawMessage with an exact number was rejected: %v", err)
+	}
+
+	one, err := c.CanonicalJSONDigest(json.RawMessage(`{"x":1,"y":9007199254740992}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordered, err := c.CanonicalJSONDigest(json.RawMessage(`{"y":9007199254740992,"x":1}`))
+	if err != nil || one != ordered {
+		t.Fatalf("object key order changed digest: %q %q err=%v", one, ordered, err)
+	}
+	digestInteger, _ := c.CanonicalJSONDigest(json.RawMessage(`1`))
+	digestDecimal, _ := c.CanonicalJSONDigest(json.RawMessage(`1.0`))
+	if digestInteger == digestDecimal {
+		t.Fatal("lexically distinct decimal inputs were normalized to one digest")
+	}
+	largeInteger, _ := c.CanonicalJSONDigest(json.RawMessage(`{"x":1,"y":9007199254740992}`))
+	adjacentInteger, _ := c.CanonicalJSONDigest(json.RawMessage(`{"x":1,"y":9007199254740993}`))
+	if largeInteger == adjacentInteger {
+		t.Fatal("adjacent integers above 2^53 collided in the same object")
+	}
+
+	largeToken := json.Number(strings.Repeat("9", 1024))
+	makeValue := func() []any {
+		values := make([]any, 700)
+		for i := range values {
+			values[i] = largeToken
+		}
+		return values
+	}
+	before, err := c.CloneJSON(makeValue())
+	if err != nil {
+		t.Fatalf("valid large value could not be cloned: %v", err)
+	}
+	after, err := c.CloneJSON(makeValue())
+	if err != nil {
+		t.Fatalf("second valid large value could not be cloned: %v", err)
+	}
+	beforeValue, afterValue := any(before), any(after)
+	change := c.Change[any]{Before: &beforeValue, After: afterValue}
+	copyOfChange, err := c.CloneJSON(change)
+	if err != nil || copyOfChange.Before == nil || (*copyOfChange.Before).([]any)[0] != largeToken {
+		t.Fatalf("Before/After composite lost precision or failed: err=%v", err)
+	}
+	event := c.Event{Payload: c.Data{"before": before, "after": after}}
+	delivery := c.Delivery{ID: "wide-json", Event: &event}
+	composite, err := c.CloneJSON([]c.Delivery{delivery})
+	if err != nil || composite[0].Event.Payload["after"].([]any)[699] != largeToken {
+		t.Fatalf("delivery/list composite lost precision or failed: err=%v", err)
+	}
+	if _, err = c.CanonicalJSONDigest(mustJSON(t, []c.Delivery{delivery})); err != nil {
+		t.Fatalf("trusted composite digest failed: %v", err)
+	}
+}
+
+func mustJSON(t *testing.T, value any) json.RawMessage {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestSchemaValidatorUsesExactDecimalSemantics(t *testing.T) {
+	validator := schema.New()
+	for _, tc := range []struct {
+		name   string
+		schema c.Schema
+		value  json.Number
+		valid  bool
+	}{
+		{"multipleOf exact decimal", c.Schema(`{"type":"number","multipleOf":0.1}`), "0.3", true},
+		{"multipleOf rejects fraction", c.Schema(`{"type":"number","multipleOf":0.1}`), "0.31", false},
+		{"exponent notation", c.Schema(`{"type":"number","minimum":1000,"maximum":1000}`), "1e3", true},
+		{"integer decimal spelling", c.Schema(`{"type":"integer"}`), "1.0", true},
+		{"integer exponent spelling", c.Schema(`{"type":"integer"}`), "1e0", true},
+		{"negative zero", c.Schema(`{"type":"number","const":0}`), "-0", true},
+		{"large finite decimal", c.Schema(`{"type":"number","minimum":1e308}`), "1e308", true},
+		{"large exact integer enum", c.Schema(`{"enum":[9007199254740992,9007199254740993]}`), "9007199254740993", true},
+		{"adjacent integer distinct enum", c.Schema(`{"enum":[9007199254740992]}`), "9007199254740993", false},
+		{"const", c.Schema(`{"const":9007199254740993}`), "9007199254740993", true},
+		{"minimum", c.Schema(`{"minimum":9007199254740993}`), "9007199254740992", false},
+		{"maximum", c.Schema(`{"maximum":9007199254740992}`), "9007199254740993", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validator.Validate(tc.schema, tc.value)
+			if (err == nil) != tc.valid {
+				t.Fatalf("Validate(%s) error=%v, want valid=%v", tc.value, err, tc.valid)
+			}
+		})
+	}
+	if err := validator.Check(c.Schema(`{"$ref":"https://example.invalid/schema.json"}`)); err == nil {
+		t.Fatal("remote schema reference was loaded")
+	}
+	local := c.Schema(`{"$defs":{"nonnegative":{"type":"number","minimum":0}},"$ref":"#/$defs/nonnegative"}`)
+	if err := validator.Check(local); err != nil || validator.Validate(local, json.Number("0.1")) != nil {
+		t.Fatalf("in-memory JSON Pointer reference did not resolve: %v", err)
+	}
+	var remoteReads atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		remoteReads.Add(1)
+		_, _ = w.Write([]byte(`{"type":"number"}`))
+	}))
+	defer server.Close()
+	if err := validator.Check(c.Schema(`{"$ref":"` + server.URL + `/schema.json"}`)); err == nil {
+		t.Fatal("remote schema reference was accepted")
+	}
+	if got := remoteReads.Load(); got != 0 {
+		t.Fatalf("schema validation performed external HTTP reads: %d", got)
+	}
+	fileSchema := `{"type":"number"}`
+	filePath := t.TempDir() + "/schema.json"
+	if err := os.WriteFile(filePath, []byte(fileSchema), 0600); err != nil {
+		t.Fatal(err)
+	}
+	fileURL := (&url.URL{Scheme: "file", Path: filePath}).String()
+	if err := validator.Check(c.Schema(`{"$ref":"` + fileURL + `"}`)); err == nil {
+		t.Fatal("file schema reference was accepted")
+	}
+}
+
+type numberSpyValidator struct {
+	validations []any
+}
+
+func (v *numberSpyValidator) Check(c.Schema) error { return nil }
+func (v *numberSpyValidator) Validate(_ c.Schema, value any) error {
+	v.validations = append(v.validations, value)
+	return nil
+}
+
+func TestCommandNumberGuardRunsBeforeValidatorAndPreservesUseNumber(t *testing.T) {
+	spy := &numberSpyValidator{}
+	registry := command.New(spy)
+	if err := command.Register(registry, "number.echo", "Preserve numbers", func(_ context.Context, input map[string]any) (map[string]any, error) {
+		return input, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	checksAfterRegister := len(spy.validations)
+	if _, err := registry.Execute(context.Background(), "number.echo", json.RawMessage(`{"exact":1e1025}`)); err == nil {
+		t.Fatal("over-budget number reached command execution")
+	}
+	if len(spy.validations) != checksAfterRegister {
+		t.Fatal("over-budget input reached the schema validator")
+	}
+	value, err := registry.Execute(context.Background(), "number.echo", json.RawMessage(`{"exact":9007199254740993}`))
+	if err != nil || value.(map[string]any)["exact"] != json.Number("9007199254740993") {
+		t.Fatalf("command input/output lost json.Number: value=%#v err=%v", value, err)
+	}
+}
+
+func TestMemoryDeliveryCopyAndDigestRetainDecimalTokens(t *testing.T) {
+	store := memory.NewExecutions(1, 1)
+	if err := store.CommitBatch(queued("json-number-copy")); err != nil {
+		t.Fatal(err)
+	}
+	event := c.Event{ID: "number-event", Category: "observation", Payload: c.Data{"integer": json.Number("9007199254740993"), "fraction": json.Number("0.1")}}
+	delivery := c.Delivery{ID: "number-delivery", Event: &event}
+	if err := store.CommitBatch(nil, delivery); err != nil {
+		t.Fatal(err)
+	}
+	read, err := store.PendingDeliveries(10)
+	if err != nil || len(read) != 1 {
+		t.Fatalf("delivery read failed: %d %v", len(read), err)
+	}
+	values := read[0].Event.Payload
+	if values["integer"] != json.Number("9007199254740993") || values["fraction"] != json.Number("0.1") {
+		t.Fatalf("delivery precision lost: %#v", values)
+	}
+	conflict := event
+	conflict.Payload = c.Data{"integer": json.Number("9007199254740992"), "fraction": json.Number("0.1")}
+	fault(t, store.CommitBatch(nil, c.Delivery{ID: delivery.ID, Event: &conflict}), "conflict")
 }
 
 func mustList[T any](t *testing.T, source interface {
@@ -199,7 +394,7 @@ func TestObserveOrdersReceiptsAndHashesEmissions(t *testing.T) {
 	if c.AsFault(obs.Err).Code != "conflict" || obs.Changes[0].After.Lifecycle.State != c.Running {
 		t.Fatalf("receipt conflict: %+v", obs)
 	}
-	result := c.Result{CallID: "call", State: c.Succeeded, Output: c.Data{"ok": true}, Emissions: []c.Emission{{Name: "complete", Payload: c.Data{"v": 1}}}}
+	result := c.Result{CallID: "call", State: c.Succeeded, Output: c.Data{"integer": json.Number("9007199254740992")}, Emissions: []c.Emission{{Name: "complete", Payload: c.Data{"integer": json.Number("9007199254740992")}}}}
 	terminal := c.Report{Evidence: c.Evidence{CallID: "call", RemoteID: "call", Confirmed: true, ReportID: "terminal"}, Result: &result}
 	obs = lifecycle.Observe(current, terminal)
 	if obs.Err != nil || len(obs.Changes) != 1 || obs.Changes[0].After.Observation.TerminalDigest == "" {
@@ -209,9 +404,14 @@ func TestObserveOrdersReceiptsAndHashesEmissions(t *testing.T) {
 	if got := lifecycle.Observe(final, terminal); len(got.Changes) != 0 || len(got.Deliveries) != 0 {
 		t.Fatalf("same terminal replay was not a no-op: %+v", got)
 	}
-	result.Emissions = []c.Emission{{Name: "complete", Payload: c.Data{"v": 2}}}
+	result.Output = c.Data{"integer": json.Number("9007199254740993")}
 	terminal.Result = &result
-	terminal.Evidence.ReportID = "terminal-other"
+	if got := lifecycle.Observe(final, terminal); c.AsFault(got.Err).Code != "conflict" {
+		t.Fatalf("adjacent terminal output numbers did not conflict: %+v", got)
+	}
+	result.Output = c.Data{"integer": json.Number("9007199254740992")}
+	result.Emissions = []c.Emission{{Name: "complete", Payload: c.Data{"integer": json.Number("9007199254740993")}}}
+	terminal.Result = &result
 	got := lifecycle.Observe(final, terminal)
 	if c.AsFault(got.Err).Code != "conflict" || got.Changes[0].After.Lifecycle.State != c.Succeeded {
 		t.Fatalf("different terminal emissions were not audited: %+v", got)
@@ -305,7 +505,7 @@ func TestPendingObservationStoreCASCopyAndAtomicConsumption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstReport := c.Report{Evidence: c.Evidence{CallID: "pending-cas", ReportID: "one"}, Result: &c.Result{CallID: "pending-cas", State: c.Unknown, Emissions: []c.Emission{{Name: "event", Payload: c.Data{"value": 1}}}}}
+	firstReport := c.Report{Evidence: c.Evidence{CallID: "pending-cas", ReportID: "one"}, Result: &c.Result{CallID: "pending-cas", State: c.Unknown, Output: c.Data{"exact": json.Number("9007199254740993")}, Emissions: []c.Emission{{Name: "event", Payload: c.Data{"value": 1}}}}}
 	first := c.PendingMutation{CallID: "pending-cas", After: &c.PendingObservation{CallID: "pending-cas", Revision: 1, Identity: c.ID("slot-one"), Report: firstReport}}
 	for _, tc := range []struct {
 		name   string
@@ -345,7 +545,7 @@ func TestPendingObservationStoreCASCopyAndAtomicConsumption(t *testing.T) {
 	}
 	read.Report.Result.Emissions[0].Payload["value"] = "caller mutation"
 	read, _, err = store.PendingObservation("pending-cas")
-	if err != nil || read.Report.Result.Emissions[0].Payload["value"] != float64(1) {
+	if err != nil || read.Report.Result.Emissions[0].Payload["value"] != json.Number("1") || read.Report.Result.Output.(map[string]any)["exact"] != json.Number("9007199254740993") {
 		t.Fatalf("pending emissions were not deeply copied: %+v %v", read, err)
 	}
 	secondReport := firstReport
@@ -1336,6 +1536,58 @@ func TestInvocationRemoteOutcomes(t *testing.T) {
 		close(release)
 		waitState(t, s, "abort", c.Succeeded)
 	})
+}
+
+func TestExactJSONNumbersSurviveTerminalOutboxAndPublishedJournal(t *testing.T) {
+	large := json.Number("9007199254740993")
+	f := &fakeConnector{invoke: func(call c.Call, _ c.ReportSink) c.Result {
+		return c.Result{CallID: call.ID, State: c.Succeeded,
+			Output:    c.Data{"integer": large, "fraction": json.Number("0.1")},
+			Emissions: []c.Emission{{Name: "complete", Payload: c.Data{"integer": large, "fraction": json.Number("0.1")}}}}
+	}}
+	_, calls, journal, _ := fixture(t, f)
+	terminalSeen := make(chan struct{}, 1)
+	calls.OnResult = func(delivery c.Delivery) error {
+		if delivery.Execution == nil || delivery.Execution.Value.Result == nil || delivery.Execution.Value.Result.Output.(map[string]any)["integer"] != large || delivery.Execution.Value.Result.Output.(map[string]any)["fraction"] != json.Number("0.1") {
+			return fmt.Errorf("terminal outbox changed numeric values: %#v", delivery.Execution)
+		}
+		select {
+		case terminalSeen <- struct{}{}:
+		default:
+		}
+		return nil
+	}
+	if _, err := calls.SubmitBatch(directOrigin(), []c.Call{call("exact-json-pipeline")}); err != nil {
+		t.Fatal(err)
+	}
+	start(t, calls)
+	waitState(t, calls, "exact-json-pipeline", c.Succeeded)
+	select {
+	case <-terminalSeen:
+	case <-time.After(2 * time.Second):
+		snapshot, _ := calls.Get("exact-json-pipeline")
+		pending, _ := calls.Outbox().PendingDeliveries(10)
+		t.Fatalf("terminal delivery was not observed: state=%s result=%#v outbox=%#v", snapshot.Value.Lifecycle.State, snapshot.Value.Result, pending)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		page, err := journal.Query(observation.Filter{CallID: "exact-json-pipeline"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range page.Entries {
+			if entry.Event.Name != "complete" {
+				continue
+			}
+			payload := entry.Event.Payload
+			if payload["integer"] != large || payload["fraction"] != json.Number("0.1") {
+				t.Fatalf("published journal rounded emission values: %#v", payload)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("published emission did not reach journal")
 }
 
 func TestAbortRevisionCASAndUnknownRejectsNewIntent(t *testing.T) {
