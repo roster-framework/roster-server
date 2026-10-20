@@ -1,0 +1,12 @@
+{
+  "nodes": [
+    {"id":"designer","connector_id":"runtime","binding":{"url":"http://127.0.0.1:7351","target_id":"designer","token_env":"RUNTIME_TOKEN"}},
+    {"id":"developer","connector_id":"runtime","binding":{"url":"http://127.0.0.1:7351","target_id":"developer","token_env":"RUNTIME_TOKEN"}},
+    {"id":"notes","connector_id":"resource","binding":{"url":"http://127.0.0.1:7352","target_id":"notes","token_env":"RESOURCE_TOKEN","watch":true}}
+  ],
+  "subscriptions": [
+    {"id":"design-to-development","source":{"namespace":"nodes","id":"designer"},"event":"complete","target":{"namespace":"nodes","id":"developer"},"operation":"run","input":{"values":{},"pointers":{"request":"/summary"}},"removed":false},
+    {"id":"document-to-development","source":{"namespace":"nodes","id":"notes"},"event":"resource.updated","target":{"namespace":"nodes","id":"developer"},"operation":"run","input":{"values":{"request":"Review the updated document through the notes node"}},"removed":false}
+  ],
+  "conversations": []
+}

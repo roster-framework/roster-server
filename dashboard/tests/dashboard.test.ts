@@ -1,0 +1,954 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { CLIENT_PROFILE, applyBundle, applyExitCode, coreOrigin, parseStrictJson, validateManifest, type BundlePlan } from "../src/bundle.js";
+import { createServer } from "node:http";
+import { spawn } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { runDeployment } from "../src/deployment.js";
+import {
+  CALL_STATES, MutationInputError, abortObservationChanged, canRequestCallAbort, confirmedCoreDisplayState, continuousCallTransitionPairs, coreInstanceChanged, hasContinuousJournal, isDefiniteAbortRejection, keepHighestCallRevisions, mergeJournalEvidence, mutationResponseIsCurrent, subscriptionCanvasExtent, parseCallsQuery, parseListLimit, parseLogsQuery, parseCallAbortInput, parseSubscriptionCreateInput, parseSubscriptionRemoveInput, projectCall, projectCalls, projectConversations, projectCore, projectLogs, projectNodeDetails, projectNodes, projectRelations, type SafeCall,
+  validDashboardRequest,
+} from "../src/projection.js";
+
+const callFixture = (id = "call-1") => ({
+  subject: { namespace: "roster.execution", id }, revision: 4,
+  value: { call: { id, target: { namespace: "roster.node", id: "node-a" }, operation: "render", input: { secret: "never project" }, correlation_id: "corr-1" },
+    lifecycle: { state: "running", updated_at: "2026-10-13T00:00:00Z" },
+    result: { state: "failed", output: { secret: "hidden" }, error: { code: "bad", message: "private detail" } },
+    abort_requested: false, observation: { secret: "hidden" }, binding: { secret: "hidden" } },
+});
+
+test("call projection exposes only identifiers, lifecycle, and result presence", () => {
+  const projected = projectCall(callFixture());
+  const serialized = JSON.stringify(projected);
+  assert.equal(projected.lifecycle.state, "running");
+  assert.deepEqual(projected.result, { state: "failed", error_present: true });
+  assert.equal(serialized.includes("never project"), false);
+  assert.equal(serialized.includes("private detail"), false);
+  assert.equal(serialized.includes("hidden"), false);
+  assert.equal("input" in projected.call, false);
+});
+
+test("projection rejects malformed lifecycle and sorts calls by stable ID", () => {
+  assert.throws(() => projectCall({ ...callFixture(), revision: -1 }));
+  assert.deepEqual(projectCalls([callFixture("z"), callFixture("a")]).map((item) => item.call.id), ["a", "z"]);
+  assert.throws(() => projectNodes([{ id: "node-a", connector_id: "../secret" }]));
+  const nodes = Array.from({ length: 101 }, (_, index) => ({ id: `node-${index}`, connector_id: "connector-a" }));
+  assert.equal(projectNodes(nodes, 100).length, 100);
+});
+
+test("Core projection retains status facts without private fields", () => {
+  const core = projectCore({ instance_id: "core-1", lifecycle: { value: { state: "running", updated_at: "2026-10-13T00:00:00Z" } },
+    ready: true, local_stopped: false, unresolved_call_ids: ["call-1"], pending_delivery_count: 2, pending_observation_count: 3, last_delivery_error: "hidden" });
+  assert.equal(core.ready, true);
+  assert.equal(core.pending_delivery_count, 2);
+  assert.equal("last_delivery_error" in core, false);
+});
+
+test("stale or partially failed overview never confirms Core ready", () => {
+  const overview = {
+    meta: { fetched_at: "2026-10-13T00:00:00Z", stale: false, returned_count: 0, truncated: false, errors: {} },
+    sources: { core: { attempted_at: "2026-10-13T00:00:00Z", error: null, returned_count: 1, truncated: false },
+      nodes: { attempted_at: "2026-10-13T00:00:00Z", error: null, returned_count: 0, truncated: false },
+      calls: { attempted_at: "2026-10-13T00:00:00Z", error: null, returned_count: 0, truncated: false } },
+    core: { instance_id: "core-a", state: "running", updated_at: "2026-10-13T00:00:00Z", ready: true, local_stopped: false,
+      unresolved_call_ids: [], pending_delivery_count: 0, pending_observation_count: 0 }, nodes: [], calls: [],
+  } as const;
+  assert.equal(confirmedCoreDisplayState(overview as never, false, null), "ready");
+  assert.equal(confirmedCoreDisplayState({ ...overview, meta: { ...overview.meta, stale: true } } as never, false, null), "unconfirmed");
+  assert.equal(confirmedCoreDisplayState({ ...overview, sources: { ...overview.sources, core: { ...overview.sources.core, error: "core_unavailable" } } } as never, false, null), "unconfirmed");
+  assert.equal(confirmedCoreDisplayState(overview as never, true, null), "unconfirmed");
+  assert.equal(coreInstanceChanged("core-a", "core-b"), true);
+  assert.equal(coreInstanceChanged("core-a", null), false);
+});
+
+test("unknown Core identity does not retain an older call revision", () => {
+  type MergeFixture = { core: { instance_id: string } | null; calls: SafeCall[]; meta: { returned_count: number; truncated: boolean } };
+  const prior: MergeFixture = { core: { instance_id: "core-old" }, calls: [projectCall({ ...callFixture(), revision: 20 })], meta: { returned_count: 1, truncated: false } };
+  const next: MergeFixture = { core: null, calls: [projectCall({ ...callFixture(), revision: 2 })], meta: { returned_count: 1, truncated: false } };
+  const merged = keepHighestCallRevisions(prior, next);
+  assert.equal(merged.calls[0]?.revision, 2);
+  assert.equal(merged.core?.instance_id, "core-old");
+
+  const priorOverview = { ...prior, nodes: [], meta: { returned_count: 8, truncated: true } };
+  const partialOverview = { ...next, calls: [], nodes: [], meta: { returned_count: 0, truncated: false } };
+  const partial = keepHighestCallRevisions(priorOverview, partialOverview);
+  assert.equal(partial.calls.length, 0);
+  assert.equal(partial.meta.returned_count, 0);
+  assert.equal(partial.meta.truncated, false);
+
+  type OverviewMergeFixture = { core: { instance_id: string } | null; calls: SafeCall[]; nodes: unknown[] | null; meta: { returned_count: number; truncated: boolean } };
+  const sameCorePrior: OverviewMergeFixture = { ...priorOverview, core: { instance_id: "core-a" } };
+  const sameCoreNext: OverviewMergeFixture = { ...partialOverview, core: { instance_id: "core-a" }, nodes: null };
+  const sameCorePartial = keepHighestCallRevisions(sameCorePrior, sameCoreNext);
+  assert.equal(sameCorePartial.calls.length, 0);
+  assert.equal(sameCorePartial.meta.returned_count, 0);
+  assert.equal(sameCorePartial.meta.truncated, false);
+
+  const sameCoreLowerRevision = { ...next, core: { instance_id: "core-old" } };
+  const sameCoreMerge = keepHighestCallRevisions(prior, sameCoreLowerRevision);
+  assert.equal(sameCoreMerge.calls[0]?.revision, 20);
+
+  type CallsMergeFixture = { calls: SafeCall[] | null; meta: { returned_count: number; truncated: boolean } };
+  const callsOnlyPrior: CallsMergeFixture = { calls: prior.calls, meta: { returned_count: 1, truncated: true } };
+  const callsOnlyNext: CallsMergeFixture = { calls: next.calls, meta: { returned_count: 1, truncated: false } };
+  assert.equal(keepHighestCallRevisions(callsOnlyPrior, callsOnlyNext, false).calls?.[0]?.revision, 2);
+  const unavailableCalls = keepHighestCallRevisions(callsOnlyPrior, { calls: null, meta: { returned_count: 0, truncated: false } }, false);
+  assert.equal(unavailableCalls.calls?.[0]?.revision, 20);
+  assert.equal(unavailableCalls.meta.returned_count, 1);
+  assert.equal(unavailableCalls.meta.truncated, true);
+
+  type OverviewSourceFixture = { attempted_at: string; error: string | null; returned_count: number; truncated: boolean };
+  type RetainedOverviewFixture = {
+    core: { instance_id: string } | null;
+    nodes: { id: string; connector_id: string }[] | null;
+    calls: SafeCall[] | null;
+    sources: { core: OverviewSourceFixture; nodes: OverviewSourceFixture; calls: OverviewSourceFixture };
+    meta: { fetched_at: string; stale: boolean; returned_count: number; truncated: boolean; errors: Record<string, string> };
+  };
+  const oldOverview: RetainedOverviewFixture = {
+    core: { instance_id: "core-a" }, nodes: [{ id: "node-a", connector_id: "connector-a" }], calls: prior.calls,
+    sources: { core: { attempted_at: "old", error: null, returned_count: 1, truncated: false },
+      nodes: { attempted_at: "old", error: null, returned_count: 1, truncated: true },
+      calls: { attempted_at: "old", error: null, returned_count: 1, truncated: false } },
+    meta: { fetched_at: "old", stale: false, returned_count: 2, truncated: true, errors: {} },
+  };
+  const newPartial: RetainedOverviewFixture = {
+    core: { instance_id: "core-a" }, nodes: null, calls: [],
+    sources: { core: { attempted_at: "new", error: null, returned_count: 1, truncated: false },
+      nodes: { attempted_at: "new", error: "core_unavailable", returned_count: 0, truncated: false },
+      calls: { attempted_at: "new", error: null, returned_count: 0, truncated: false } },
+    meta: { fetched_at: "new", stale: true, returned_count: 0, truncated: false, errors: { nodes: "core_unavailable" } },
+  };
+  const retainedPartial = keepHighestCallRevisions(oldOverview, newPartial);
+  assert.equal(retainedPartial.nodes?.length, 1);
+  assert.equal(retainedPartial.calls?.length, 0);
+  assert.equal(retainedPartial.sources.nodes.attempted_at, "new");
+  assert.equal(retainedPartial.sources.nodes.error, "core_unavailable");
+  assert.equal(retainedPartial.sources.nodes.returned_count, 1);
+  assert.equal(retainedPartial.sources.nodes.truncated, true);
+  assert.equal(retainedPartial.meta.returned_count, 1);
+  assert.equal(retainedPartial.meta.truncated, true);
+  assert.equal(retainedPartial.meta.stale, true);
+});
+
+test("call query allowlist rejects duplicates, unknown fields, bad states, and excess limits", () => {
+  assert.equal(parseCallsQuery(new URLSearchParams("limit=2&state=running")).limit, 2);
+  for (const query of ["state=not-a-state", "limit=101", "node_id=a&node_id=b", "payload=x"]) {
+    assert.throws(() => parseCallsQuery(new URLSearchParams(query)));
+  }
+  assert.ok(CALL_STATES.includes("unknown"));
+});
+
+test("relation projections expose only declared Node, subscription, and conversation fields", () => {
+  const node = projectNodeDetails([{ id: "node-a", connector_id: "connector-a", binding: { secret: "hidden" },
+    operations: { render: { input_schema: { secret: true }, capabilities: { abort: true, inspect: false, resume: false } } },
+    events: { rendered: { schema_secret: true } } }])[0]!;
+  assert.deepEqual(node.operations, [{ name: "render", capabilities: { abort: true, inspect: false, resume: false } }]);
+  assert.deepEqual(node.events, ["rendered"]);
+  assert.equal(JSON.stringify(node).includes("secret"), false);
+
+  const relation = projectRelations([{ subject: { namespace: "subscriptions", id: "sub-a" }, revision: 3,
+    value: { id: "sub-a", source: { namespace: "nodes", id: "node-a" }, event: "rendered",
+      target: { namespace: "nodes", id: "node-b" }, operation: "consume", input: { secret: true } } }])[0]!;
+  assert.equal(relation.removed, false);
+  assert.equal(relation.revision, 3);
+  assert.equal(JSON.stringify(relation).includes("secret"), false);
+
+  const conversation = projectConversations([{ revision: 2, value: { id: "conversation-a", title: "private title",
+    participants: [{ ref: { namespace: "nodes", id: "node-a" }, receiver: {
+      target: { namespace: "nodes", id: "node-b" }, operation: "reply", input: { secret: true },
+    } }] } }])[0]!;
+  assert.equal(conversation.participants[0]?.receiver?.operation, "reply");
+  assert.equal(JSON.stringify(conversation).includes("private"), false);
+  assert.equal(JSON.stringify(conversation).includes("secret"), false);
+});
+
+test("subscription mutation input validates provider-neutral declarations and data-only mappings", () => {
+  const request = parseSubscriptionCreateInput({ id: "sub-a", source: { namespace: "nodes", id: "node-a" }, event: "finished",
+    target: { namespace: "nodes", id: "node-b" }, operation: "run", input: { values: { request: "explicit" }, pointers: { context: "/payload/summary" } } });
+  assert.deepEqual(request.source, { namespace: "nodes", id: "node-a" });
+  assert.deepEqual(request.input.values, { request: "explicit" });
+  assert.deepEqual(Object.fromEntries(Object.entries(request.input.pointers ?? {})), { context: "/payload/summary" });
+  assert.deepEqual(Object.fromEntries(Object.entries(parseSubscriptionCreateInput({ id: "sub-root", source: { namespace: "nodes", id: "a" }, event: "e", target: { namespace: "nodes", id: "b" }, operation: "op", input: { pointers: { value: "" } } }).input.pointers ?? {})), { value: "" });
+  const invalid = [
+    { ...request, unexpected: true },
+    { ...request, source: { namespace: "runtime", id: "node-a" } },
+    { ...request, input: { values: JSON.parse('{"__proto__":"unsafe"}') } },
+    { ...request, input: { values: { x: { constructor: { polluted: true } } } } },
+    { ...request, input: { values: { ["x".repeat(101)]: 1 } } },
+    { ...request, input: { values: Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`k${index}`, index])) } },
+    { ...request, input: { pointers: { value: "/bad~2escape" } } },
+    { ...request, input: { pointers: { value: "/__proto__/x" } } },
+    { ...request, input: { values: { payload: "x".repeat(16 * 1024) } } },
+  ];
+  for (const value of invalid) assert.throws(() => parseSubscriptionCreateInput(value), MutationInputError);
+  assert.throws(() => parseSubscriptionCreateInput({ ...request, removed: false }), MutationInputError);
+});
+
+test("subscription removal requires an observed positive safe revision", () => {
+  assert.deepEqual(parseSubscriptionRemoveInput({ id: "sub-a", expected_revision: 4 }), { id: "sub-a", expected_revision: 4 });
+  for (const value of [
+    { id: "sub-a", expected_revision: 0 }, { id: "sub-a", expected_revision: Number.MAX_SAFE_INTEGER + 1 },
+    { id: "sub-a", expected_revision: 4, extra: "ignored?" }, { id: "../sub-a", expected_revision: 4 },
+  ]) assert.throws(() => parseSubscriptionRemoveInput(value), MutationInputError);
+});
+
+test("call cancellation input requires exact observed revision and Core instance", () => {
+  const input = { id: "call-a", expected_revision: 4, expected_instance_id: "core-a" };
+  assert.deepEqual(parseCallAbortInput(input), input);
+  for (const value of [
+    { ...input, reason: "spoofed" }, { ...input, actor: "operators/admin" }, { ...input, expected_revision: 0 },
+    { ...input, expected_revision: Number.MAX_SAFE_INTEGER + 1 }, { ...input, expected_instance_id: "../core" },
+    { id: input.id, expected_revision: input.expected_revision },
+  ]) assert.throws(() => parseCallAbortInput(value), MutationInputError);
+});
+
+test("cancellation action requires a fresh selected nonterminal snapshot", () => {
+  const call = projectCall(callFixture());
+  assert.equal(canRequestCallAbort(call, true, false), true);
+  assert.equal(canRequestCallAbort(call, false, false), false);
+  assert.equal(canRequestCallAbort(call, true, true), false);
+  assert.equal(canRequestCallAbort(call, true, false, true), false);
+  for (const state of ["unknown", "reconciling", "cancelling", "succeeded", "failed", "cancelled", "expired", "rejected"] as const) {
+    assert.equal(canRequestCallAbort({ ...call, lifecycle: { ...call.lifecycle, state } }, true, false), false);
+  }
+});
+
+test("cancellation remains locked until observed revision or state changes", () => {
+  const call = projectCall(callFixture());
+  const attempt = { revision: call.revision, state: call.lifecycle.state };
+  assert.equal(abortObservationChanged(attempt, call), false);
+  assert.equal(abortObservationChanged(attempt, { ...call, revision: call.revision + 1 }), true);
+  assert.equal(abortObservationChanged(attempt, { ...call, lifecycle: { ...call.lifecycle, state: "cancelling" } }), true);
+  assert.equal(abortObservationChanged(attempt, null), false);
+});
+
+test("local cancellation parsing failures are definite pre-send rejections", () => {
+  for (const status of [400, 403, 404, 408, 409, 413, 415, 422, 429]) assert.equal(isDefiniteAbortRejection(status), true);
+  for (const status of [200, 502, 504]) assert.equal(isDefiniteAbortRejection(status), false);
+  assert.equal(isDefiniteAbortRejection(500, "rejected"), true);
+});
+
+test("subscription mutation responses are ignored after generation or Core identity changes", () => {
+  assert.equal(mutationResponseIsCurrent(7, 7, "core-a", "core-a"), true);
+  assert.equal(mutationResponseIsCurrent(7, 8, "core-a", "core-a"), false);
+  assert.equal(mutationResponseIsCurrent(7, 7, "core-a", "core-b"), false);
+});
+
+test("a delayed cancellation response stays stale after selecting away and back to the same Call", () => {
+  const actionGeneration = 11;
+  let currentGeneration = actionGeneration;
+  const action = { id: "call-a", revision: 7, instanceId: "core-a" };
+  let current: { id: string; revision: number; instanceId: string } = action;
+  current = { ...action, id: "call-b" };
+  currentGeneration += 1; // selection changes away
+  current = action;
+  currentGeneration += 1; // selection returns to the same ID and revision
+  assert.deepEqual(current, action);
+  assert.equal(mutationResponseIsCurrent(actionGeneration, currentGeneration, action.instanceId, current.instanceId), false);
+});
+
+test("subscription canvas extent follows cards when wrapping narrow and shrinking wide", () => {
+  const narrow = subscriptionCanvasExtent(600, 480, [{ right: 580, bottom: 700 }], 12, 18);
+  assert.deepEqual(narrow, { width: 600, height: 718 });
+  const wide = subscriptionCanvasExtent(900, 274, [{ right: 860, bottom: 242 }], 12, 18);
+  assert.deepEqual(wide, { width: 900, height: 274 });
+  const borderAligned = subscriptionCanvasExtent(982, 274, [{ right: 964.984, bottom: 257 }], 17, 17);
+  assert.deepEqual(borderAligned, { width: 982, height: 274 });
+});
+
+test("gateway validates raw subscription receipts and returns only safe mutation outcomes", async () => {
+  const commands: Array<{ path: string; body: Record<string, unknown> }> = [];
+  let hangingResponse: import("node:http").ServerResponse | undefined;
+  let coreInstance = "core-fixture";
+  const core = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    const path = request.url ?? "";
+    if (path === "/api/commands/subscriptions.list") {
+      response.writeHead(200, { "Content-Type": "application/json" }); response.end("[]"); return;
+    }
+    if (path === "/api/commands/core.status") {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ instance_id: coreInstance, lifecycle: { value: { state: "running", updated_at: "2026-10-13T00:00:00Z" } }, ready: true, local_stopped: false, unresolved_call_ids: [], pending_delivery_count: 0, pending_observation_count: 0 })); return;
+    }
+    commands.push({ path, body });
+    if (path.endsWith("subscriptions.create")) {
+      const id = String(body.id);
+      if (id === "sub-server-error") { response.writeHead(500, { "Content-Type": "application/json" }); response.end(JSON.stringify({ message: "private Core failure" })); return; }
+      if (id === "sub-timeout") { hangingResponse = response; return; }
+      if (id === "sub-unknown") { response.writeHead(400, { "Content-Type": "application/json" }); response.end(JSON.stringify({ code: "future_fault", message: "private" })); return; }
+      if (id === "sub-schema") { response.writeHead(400, { "Content-Type": "application/json" }); response.end(JSON.stringify({ code: "invalid_schema", message: "private" })); return; }
+      const value = { id, source: body.source, event: body.event, target: body.target, operation: body.operation,
+        input: { values: { private_value: "must not echo" } }, ...(id === "sub-removed" ? { removed: true } : {}) };
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ subject: { namespace: "subscriptions", id }, revision: 1, value })); return;
+    }
+    if (path.endsWith("calls.abort")) {
+      const id = String(body.id);
+      if (id === "call-server-error") { response.writeHead(500, { "Content-Type": "application/json" }); response.end(JSON.stringify({ message: "private Core failure" })); return; }
+      if (id === "call-timeout") { hangingResponse = response; return; }
+      if (id === "call-rejected") { response.writeHead(409, { "Content-Type": "application/json" }); response.end(JSON.stringify({ code: "conflict", message: "private" })); return; }
+      if (id === "call-forbidden") { response.writeHead(403, { "Content-Type": "application/json" }); response.end(JSON.stringify({ code: "forbidden", message: "private" })); return; }
+      if (id === "call-instance-changed") coreInstance = "core-restarted";
+      const callId = id === "call-bad-snapshot" ? "different-call" : id;
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ subject: { namespace: "calls", id: callId }, revision: Number(body.expected_revision) + 1, value: {
+        call: { id: callId, target: { namespace: "nodes", id: "node-a" }, operation: "run" },
+        lifecycle: { state: "cancelling", updated_at: "2026-10-13T00:00:00Z" }, abort_requested: true,
+      } })); return;
+    }
+    const id = String(body.id); const revision = Number(body.expected_revision);
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ id: "event-change-id", subject: { namespace: "subscriptions", id }, before_revision: revision,
+      after_revision: revision + 1, after: { id, source: { namespace: "nodes", id: "node-a" }, event: "changed",
+        target: { namespace: "nodes", id: "node-b" }, operation: "apply", removed: true } }));
+  });
+  await new Promise<void>((resolve, reject) => core.listen(7350, "127.0.0.1", (error?: Error) => error ? reject(error) : resolve()));
+  const probe = createServer();
+  await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+  const address = probe.address(); assert.ok(address && typeof address !== "string");
+  await new Promise<void>((resolve) => probe.close(() => resolve()));
+  const child = spawn(process.execPath, ["build/src/gateway.js"], { cwd: process.cwd(), env: { ...process.env, PORT: String(address.port) }, stdio: "ignore" });
+  const origin = `http://127.0.0.1:${address.port}`;
+  try {
+    let ready = false;
+    for (let attempt = 0; attempt < 50 && !ready; attempt++) {
+      try { ready = (await fetch(`${origin}/api/relations`, { headers: { Origin: origin } })).status === 200; }
+      catch { await new Promise((resolve) => setTimeout(resolve, 20)); }
+    }
+    assert.equal(ready, true);
+    const post = (path: string, body: unknown) => fetch(`${origin}${path}`, { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const declaration = { source: { namespace: "nodes", id: "node-a" }, event: "changed", target: { namespace: "nodes", id: "node-b" }, operation: "apply", input: {} };
+    const denied = async (headers: Record<string, string>) => fetch(`${origin}/api/subscriptions`, { method: "POST", headers, body: JSON.stringify({ ...declaration, id: "sub-denied" }) });
+    assert.equal((await denied({ "Content-Type": "application/json" })).status, 403);
+    assert.equal((await denied({ Origin: "http://example.invalid", "Content-Type": "application/json" })).status, 403);
+    assert.equal((await denied({ Origin: "null", "Content-Type": "application/json" })).status, 403);
+    const none = await fetch(`${origin}/api/subscriptions`, { method: "POST", headers: { Origin: origin, "Sec-Fetch-Site": "none", "Content-Type": "application/json" }, body: JSON.stringify({ ...declaration, id: "sub-no-site" }) });
+    assert.equal(none.status, 403);
+    assert.equal((await denied({ Origin: origin, "Sec-Fetch-Site": "cross-site", "Content-Type": "application/json" })).status, 403);
+    assert.equal((await fetch(`${origin}/api/subscriptions`, { method: "POST", headers: { Origin: origin, "Content-Type": "text/plain" }, body: JSON.stringify({ ...declaration, id: "sub-media" }) })).status, 415);
+    const malformedBody = await fetch(`${origin}/api/subscriptions`, { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: "{not-json" });
+    assert.equal(malformedBody.status, 400);
+    const duplicateBody = await fetch(`${origin}/api/subscriptions`, { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: '{"id":"sub-dup","id":"sub-dup","source":{"namespace":"nodes","id":"node-a"},"event":"changed","target":{"namespace":"nodes","id":"node-b"},"operation":"apply","input":{}}' });
+    assert.equal(duplicateBody.status, 400);
+    const oversizedBody = await fetch(`${origin}/api/subscriptions`, { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: " ".repeat(33 * 1024) });
+    assert.equal(oversizedBody.status, 413);
+    assert.equal(commands.length, 0);
+    const good = await post("/api/subscriptions", { ...declaration, id: "sub-good" });
+    assert.equal(good.status, 200);
+    const goodBody = await good.text(); assert.equal(goodBody.includes("private_value"), false); assert.equal(goodBody.includes("must not echo"), false);
+    const malformed = await post("/api/subscriptions", { ...declaration, id: "sub-removed" });
+    assert.equal(malformed.status, 502); assert.deepEqual(await malformed.json(), { status: "unconfirmed", code: "mutation_unconfirmed", id: "sub-removed", action: "create" });
+    const unknown = await post("/api/subscriptions", { ...declaration, id: "sub-unknown" });
+    assert.equal(unknown.status, 400); assert.deepEqual(await unknown.json(), { status: "rejected", code: "core_rejected", id: "sub-unknown" });
+    const schema = await post("/api/subscriptions", { ...declaration, id: "sub-schema" });
+    assert.equal(schema.status, 400); assert.deepEqual(await schema.json(), { status: "rejected", code: "invalid_schema", id: "sub-schema" });
+    const serverError = await post("/api/subscriptions", { ...declaration, id: "sub-server-error" });
+    assert.equal(serverError.status, 502); assert.deepEqual(await serverError.json(), { status: "unconfirmed", code: "mutation_unconfirmed", id: "sub-server-error", action: "create" });
+    const timedOut = await post("/api/subscriptions", { ...declaration, id: "sub-timeout" });
+    assert.equal(timedOut.status, 504); assert.deepEqual(await timedOut.json(), { status: "unconfirmed", code: "mutation_unconfirmed", id: "sub-timeout", action: "create" });
+    const removed = await post("/api/subscriptions/remove", { id: "sub-good", expected_revision: 2 });
+    assert.deepEqual(await removed.json(), { status: "applied", action: "remove", id: "sub-good", revision: 3, removed: true });
+    const abortInput = { id: "call-good", expected_revision: 4, expected_instance_id: "core-fixture" };
+    const abortNoOrigin = await fetch(`${origin}/api/calls/abort`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(abortInput) });
+    assert.equal(abortNoOrigin.status, 403);
+    const abortFetchNone = await fetch(`${origin}/api/calls/abort`, { method: "POST", headers: { Origin: origin, "Sec-Fetch-Site": "none", "Content-Type": "application/json" }, body: JSON.stringify(abortInput) });
+    assert.equal(abortFetchNone.status, 403);
+    const abortExtra = await post("/api/calls/abort", { ...abortInput, reason: "spoofed" });
+    assert.equal(abortExtra.status, 400);
+    const abortDuplicate = await fetch(`${origin}/api/calls/abort`, { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: `{"id":"call-good","id":"call-good","expected_revision":4,"expected_instance_id":"core-fixture"}` });
+    assert.equal(abortDuplicate.status, 400);
+    const abortMedia = await fetch(`${origin}/api/calls/abort`, { method: "POST", headers: { Origin: origin, "Content-Type": "text/plain" }, body: JSON.stringify(abortInput) });
+    assert.equal(abortMedia.status, 415);
+    const abortOversized = await fetch(`${origin}/api/calls/abort`, { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: " ".repeat(4 * 1024 + 1) });
+    assert.equal(abortOversized.status, 413);
+    const aborted = await post("/api/calls/abort", abortInput);
+    const abortBody = await aborted.json() as { status: string; action: string; id: string; call: SafeCall };
+    assert.equal(aborted.status, 200); assert.equal(abortBody.status, "confirmed"); assert.equal(abortBody.action, "abort");
+    assert.equal(abortBody.call.lifecycle.state, "cancelling"); assert.equal(abortBody.call.abort_requested, true);
+    assert.equal(JSON.stringify(abortBody).includes("operator_intervention"), false);
+    const abortCommand = commands.find((item) => item.path.endsWith("calls.abort"));
+    assert.deepEqual(abortCommand?.body, { ...abortInput, reason: "operator_intervention" });
+    const abortBadSnapshot = await post("/api/calls/abort", { ...abortInput, id: "call-bad-snapshot" });
+    assert.deepEqual(await abortBadSnapshot.json(), { status: "unconfirmed", code: "mutation_unconfirmed", id: "call-bad-snapshot", action: "abort" });
+    const abortRejected = await post("/api/calls/abort", { ...abortInput, id: "call-rejected" });
+    assert.deepEqual(await abortRejected.json(), { status: "rejected", code: "conflict", id: "call-rejected", action: "abort" });
+    const abortForbidden = await post("/api/calls/abort", { ...abortInput, id: "call-forbidden" });
+    assert.deepEqual(await abortForbidden.json(), { status: "rejected", code: "forbidden", id: "call-forbidden", action: "abort" });
+    const abortServerError = await post("/api/calls/abort", { ...abortInput, id: "call-server-error" });
+    assert.deepEqual(await abortServerError.json(), { status: "unconfirmed", code: "mutation_unconfirmed", id: "call-server-error", action: "abort" });
+    const abortTimeout = await post("/api/calls/abort", { ...abortInput, id: "call-timeout" });
+    assert.equal(abortTimeout.status, 504); assert.deepEqual(await abortTimeout.json(), { status: "unconfirmed", code: "mutation_unconfirmed", id: "call-timeout", action: "abort" });
+    coreInstance = "core-fixture";
+    const abortInstanceChanged = await post("/api/calls/abort", { ...abortInput, id: "call-instance-changed" });
+    assert.deepEqual(await abortInstanceChanged.json(), { status: "unconfirmed", code: "mutation_unconfirmed", id: "call-instance-changed", action: "abort" });
+    assert.equal(commands.length, 14);
+  } finally {
+    hangingResponse?.destroy();
+    child.kill("SIGTERM");
+    await new Promise<void>((resolve, reject) => core.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("log projection keeps safe envelope, validates only state.changed evidence, and rejects unsafe queries", () => {
+  const event = (id: string, payload: unknown, sequence: number) => ({
+    sequence, event: { id, source: { namespace: "calls", id: "call-a" }, name: "state.changed",
+      category: "observation", occurred_at: "2026-10-13T00:00:00Z", call_id: "call-a",
+      payload, private_field: "never project" },
+  });
+  const page = projectLogs({ entries: [
+    event("event-a", { state: "running", before_revision: 4, after_revision: 5, reason: "private" }, 5),
+    event("event-b", { state: "running", before_revision: 5, after_revision: 8, reason: "private" }, 6),
+    event("event-c", { state: "running", before_revision: Number.MAX_SAFE_INTEGER + 1, after_revision: Number.MAX_SAFE_INTEGER + 2 }, 7),
+    { sequence: { dashboard_unsafe_integer: true, source: "9007199254740993" }, event: { id: "event-d", source: { namespace: "nodes", id: "node-a" },
+      name: "registered", category: "lifecycle", occurred_at: "2026-10-13T00:00:00Z", payload: { secret: true } } },
+  ], next_cursor: "opaque:cursor"}, 10);
+  assert.deepEqual(page.entries[0]?.transition_observation, { state: "running", before_revision: 4, after_revision: 5 });
+  assert.equal(page.entries[1]?.projection_error, "invalid_state_observation");
+  assert.equal(page.entries[2]?.projection_error, "invalid_state_observation");
+  assert.equal(page.entries[3]?.sequence, "9007199254740993");
+  assert.equal(JSON.stringify(page).includes("private"), false);
+  assert.equal(JSON.stringify(page).includes("secret"), false);
+  assert.equal(page.next_cursor, "opaque:cursor");
+  assert.equal(parseListLimit(new URLSearchParams("limit=100"), ["limit"], 50, 100), 100);
+  for (const query of ["limit=101", "limit=2&limit=3", "unknown=x"]) assert.throws(() => parseListLimit(new URLSearchParams(query), ["limit"], 50, 100));
+  assert.equal(parseLogsQuery(new URLSearchParams("call_id=call-a&limit=200")).call_id, "call-a");
+  for (const query of ["call_id=x&call_id=y", "limit=201", "other=x", "after=" + "é".repeat(600)]) assert.throws(() => parseLogsQuery(new URLSearchParams(query)));
+});
+
+test("journal transition evidence rejects invalid, conflicting, gapped, expired, and partial records", () => {
+  const event = (id: string, sequence: number | null, before: number, after: number, state = "running", callId = "call-a", sourceId = callId) => ({
+    sequence, event: { id, source: { namespace: "calls", id: sourceId }, name: "state.changed", category: "observation",
+      occurred_at: "2026-10-13T00:00:00Z", call_id: callId, payload: { state, before_revision: before, after_revision: after } },
+  });
+  const project = (...entries: ReturnType<typeof event>[]) => projectLogs({ next_cursor: "", entries }).entries;
+  const valid = project(event("event-1", 1, 1, 2), event("event-2", 2, 2, 3));
+  assert.equal(continuousCallTransitionPairs(valid, "call-a", true).length, 1);
+  assert.equal(continuousCallTransitionPairs(valid, "call-a", false).length, 0);
+  assert.equal(continuousCallTransitionPairs(valid, "call-a", true, ["event-1"]).length, 0);
+  assert.equal(hasContinuousJournal(project(event("event-1", 1, 1, 2), event("event-2", 3, 2, 3))), false);
+  assert.equal(continuousCallTransitionPairs(project(event("event-1", 1, 1, 2), event("event-2", 3, 2, 3)), "call-a", true).length, 0);
+  const invalidBreak = project(event("event-1", 1, 1, 2), event("event-bad", 2, 2, 4, "running", "other-call", "call-a"), event("event-2", 3, 2, 3));
+  assert.equal(continuousCallTransitionPairs(invalidBreak, "call-a", true).length, 0);
+  const repeatedRevision = project(event("event-1", 1, 1, 2), event("event-2", 2, 1, 2));
+  assert.equal(continuousCallTransitionPairs(repeatedRevision, "call-a", true).length, 0);
+  const ambiguousRevision = project(event("a", 1, 4, 5, "running"), event("b", 2, 4, 5, "failed"), event("c", 3, 5, 6, "waiting"));
+  assert.equal(continuousCallTransitionPairs(ambiguousRevision, "call-a", true).length, 0);
+  const unknownSequence = project(event("a", 1, 4, 5), event("unknown", null, 5, 6), event("c", 3, 6, 7));
+  assert.equal(continuousCallTransitionPairs(unknownSequence, "call-a", true).length, 0);
+  const rollingWindow = project(event("older", 800, 0, 1), event("event-1", 801, 1, 2), event("event-2", 802, 2, 3));
+  assert.equal(continuousCallTransitionPairs(rollingWindow.slice(1), "call-a", true).length, 1);
+  const conflicting = mergeJournalEvidence(valid, [{ ...valid[0]!, event: { ...valid[0]!.event, name: "different" } }]);
+  assert.deepEqual(conflicting.conflictIds, ["event-1"]);
+  assert.equal(continuousCallTransitionPairs(valid, "call-a", true, conflicting.conflictIds).length, 0);
+});
+
+test("gateway request guard requires a loopback peer and same-origin request", () => {
+  const good = { remoteAddress: "127.0.0.1", host: "127.0.0.1:7360", origin: "http://127.0.0.1:7360", fetchSite: "same-origin", port: 7360 };
+  assert.equal(validDashboardRequest(good), true);
+  assert.equal(validDashboardRequest({ ...good, remoteAddress: "203.0.113.9" }), false);
+  assert.equal(validDashboardRequest({ ...good, origin: "https://evil.invalid" }), false);
+  assert.equal(validDashboardRequest({ ...good, host: "[invalid" }), false);
+  assert.equal(validDashboardRequest({ ...good, fetchSite: "cross-site" }), false);
+  assert.equal(validDashboardRequest({ ...good, fetchSite: "none", requireSameOriginFetchSite: true }), false);
+  assert.equal(validDashboardRequest({ ...good, origin: undefined, fetchSite: undefined }), false);
+});
+
+test("bundle validation accepts only declarative references and never resolves token values", () => {
+  const pkg = { name: "@sample/echo", version: "1.2.3", roster: { manifest: "roster-bundle.json" }, scripts: { postinstall: "must-not-run" } };
+  const manifest = { schema: "roster-bundle/1", name: "@sample/echo", version: "1.2.3", client_profile: CLIENT_PROFILE,
+    nodes: [{ id: "alpha", connector_id: "runtime", binding_ref: "alpha-binding" }, { id: "beta", connector_id: "runtime", binding_ref: "beta-binding" }],
+    subscriptions: [{ id: "alpha-to-beta", source: { namespace: "nodes", id: "alpha" }, event: "finished", target: { namespace: "nodes", id: "beta" }, operation: "run", input: { values: { request: "hello" } } }] };
+  const bindings = { bindings: {
+    "alpha-binding": { url: "http://127.0.0.1:7331", target_id: "agent-a", token_env: "RUNTIME_TOKEN" },
+    "beta-binding": { url: "https://runtime.example", target_id: "agent-b", token_env: "RUNTIME_TOKEN", watch: true },
+  } };
+  const accepted = validateManifest(pkg, manifest, bindings);
+  assert.equal(accepted.packageInfo.name, "@sample/echo");
+  assert.deepEqual(Object.keys(accepted.bindings), ["alpha-binding", "beta-binding"]);
+  assert.equal(JSON.stringify(accepted).includes("RUNTIME_TOKEN_VALUE"), false);
+  assert.equal(CLIENT_PROFILE, "roster-core-import/1");
+  for (const changed of [
+    { ...manifest, schema: "roster-bundle/2" },
+    { ...manifest, unknown: true },
+    { ...manifest, name: "other" },
+    { ...manifest, version: "^1.2.3" },
+    { ...manifest, subscriptions: [{ ...manifest.subscriptions[0], source: { namespace: "foreign", id: "alpha" } }] },
+    { ...manifest, subscriptions: [{ ...manifest.subscriptions[0], source: { namespace: "nodes", id: "missing" } }] },
+  ]) assert.throws(() => validateManifest(pkg, changed, bindings));
+  assert.throws(() => validateManifest(pkg, manifest, { bindings: { "alpha-binding": { ...bindings.bindings["alpha-binding"], token: "secret" }, "beta-binding": bindings.bindings["beta-binding"] } }));
+  assert.throws(() => validateManifest(pkg, manifest, { bindings: { "alpha-binding": { ...bindings.bindings["alpha-binding"], url: "http://provider.example" }, "beta-binding": bindings.bindings["beta-binding"] } }));
+});
+
+test("bundle CLI parser primitives reject duplicate JSON keys and non-loopback Core origins", () => {
+  assert.throws(() => parseStrictJson('{"name":"first","name":"second"}'));
+  assert.throws(() => parseStrictJson('{"a":[1,]}'));
+  assert.equal(coreOrigin("http://127.0.0.1:7350"), "http://127.0.0.1:7350");
+  assert.equal(coreOrigin("http://[::1]:7350"), "http://[::1]:7350");
+  for (const origin of ["https://127.0.0.1:7350", "http://example.com", "http://127.0.0.1:7350/path", "http://u:p@127.0.0.1:7350"]) assert.throws(() => coreOrigin(origin));
+});
+
+test("deployment CLI rejects unknown and duplicate JSON fields without network or mutation", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "roster-deployment-invalid-"));
+  try {
+    const unknown = path.join(directory, "unknown.json");
+    await writeFile(unknown, JSON.stringify({ schema: "roster-deployment/1", id: "sample", runtime: { origin: "http://127.0.0.1:1", token_env: "RUNTIME_TOKEN" }, core: { origin: "http://127.0.0.1:2" }, profiles: {}, agents: [], resources: [], bundle: { package_dir: "pkg", bindings_file: "bindings.json" }, install: true }));
+    const unknownResult = await runDeployment(["validate", "--file", unknown]);
+    assert.equal(unknownResult.code, 2);
+    assert.equal(unknownResult.result.status, "failed");
+    assert.equal(unknownResult.result.code, "deployment_invalid");
+
+    const duplicate = path.join(directory, "duplicate.json");
+    await writeFile(duplicate, '{"schema":"roster-deployment/1","schema":"roster-deployment/1"}');
+    const duplicateResult = await runDeployment(["validate", "--file", duplicate]);
+    assert.equal(duplicateResult.code, 2);
+    assert.equal(duplicateResult.result.code, "json_invalid");
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("deployment CLI rejects prompt escape and missing tokens without exposing declaration values", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "roster-deployment-safe-"));
+  const previousToken = process.env.ROSTER_TEST_MISSING_TOKEN;
+  try {
+    const base = { schema: "roster-deployment/1", id: "sample", runtime: { origin: "http://127.0.0.1:1", token_env: "ROSTER_TEST_MISSING_TOKEN" }, core: { origin: "http://127.0.0.1:2" },
+      profiles: { echo: { name: "Echo", kind: "echo" } }, agents: [{ id: "echo-agent", expected_version: 0, profile_ref: "echo", config: {}, prompt_ref: "../outside.txt", skill_refs: [], mcp_refs: [], resource_refs: [] }], resources: [], bundle: { package_dir: "pkg", bindings_file: "bindings.json" } };
+    const promptEscape = path.join(directory, "escape.json"); await writeFile(promptEscape, JSON.stringify(base));
+    process.env.ROSTER_TEST_MISSING_TOKEN = "secret-fixture-value";
+    const escaped = await runDeployment(["validate", "--file", promptEscape]);
+    assert.equal(escaped.code, 2); assert.equal(escaped.result.code, "path_invalid");
+
+    const bundleEscape = path.join(directory, "bundle-escape.json");
+    await writeFile(bundleEscape, JSON.stringify({ ...base, agents: [{ ...base.agents[0], prompt_ref: undefined }], bundle: { package_dir: "../pkg", bindings_file: "bindings.json" } }));
+    const escapedBundle = await runDeployment(["validate", "--file", bundleEscape]);
+    assert.equal(escapedBundle.code, 2); assert.equal(escapedBundle.result.code, "path_invalid");
+
+    const missingToken = path.join(directory, "missing-token.json");
+    await writeFile(missingToken, JSON.stringify({ ...base, agents: [{ ...base.agents[0], prompt_ref: undefined }] }));
+    delete process.env.ROSTER_TEST_MISSING_TOKEN;
+    const missing = await runDeployment(["validate", "--file", missingToken]);
+    assert.equal(missing.code, 2); assert.equal(missing.result.code, "token_missing");
+    const output = JSON.stringify(missing.result);
+    assert.equal(output.includes("ROSTER_TEST_MISSING_TOKEN"), false);
+    assert.equal(output.includes("Bearer"), false);
+  } finally { if (previousToken === undefined) delete process.env.ROSTER_TEST_MISSING_TOKEN; else process.env.ROSTER_TEST_MISSING_TOKEN = previousToken; await rm(directory, { recursive: true, force: true }); }
+});
+
+function deploymentCoreCatalog(): unknown[] {
+  const empty = { type: "object", additionalProperties: false };
+  const node = { type: "object", properties: { id: { type: "string" }, connector_id: { type: "string" }, binding: true,
+    operations: { type: "object", additionalProperties: { type: "object", properties: { name: { type: "string" }, input_schema: true, output_schema: true,
+      capabilities: { type: "object", properties: { abort: { type: "boolean" }, inspect: { type: "boolean" }, resume: { type: "boolean" } }, required: ["abort", "inspect", "resume"], additionalProperties: false } },
+    required: ["name", "input_schema", "capabilities"], additionalProperties: false } }, events: { type: "object", additionalProperties: true } },
+    required: ["id", "connector_id", "operations", "events"], additionalProperties: false };
+  const pair = { type: "object", properties: { namespace: { type: "string" }, id: { type: "string" } }, required: ["namespace", "id"], additionalProperties: false };
+  const input = { type: "object", properties: { values: { type: "object", additionalProperties: true }, pointers: { type: "object", additionalProperties: { type: "string" } } }, additionalProperties: false };
+  const subscription = { type: "object", properties: { id: { type: "string" }, source: pair, event: { type: "string" }, target: pair, operation: { type: "string" }, input, removed: { type: "boolean" } },
+    required: ["id", "source", "event", "target", "operation", "input"], additionalProperties: false };
+  const snapshot = { type: "object", properties: { subject: pair, revision: { type: "integer", minimum: 0 }, value: subscription }, required: ["subject", "revision", "value"], additionalProperties: false };
+  const registerInput = { type: "object", properties: { id: { type: "string" }, connector_id: { type: "string" }, binding: true }, required: ["id", "connector_id", "binding"], additionalProperties: false };
+  const subscriptionCreate = { type: "object", properties: { id: { type: "string" }, source: pair, event: { type: "string" }, target: pair, operation: { type: "string" }, input, removed: { type: "boolean" } },
+    required: ["id", "source", "event", "target", "operation", "input"], additionalProperties: false };
+  return [
+    { name: "nodes.list", input_schema: empty, output_schema: { type: ["null", "array"], items: node } },
+    { name: "nodes.register", input_schema: registerInput, output_schema: node },
+    { name: "subscriptions.list", input_schema: empty, output_schema: { type: ["null", "array"], items: snapshot } },
+    { name: "subscriptions.create", input_schema: subscriptionCreate, output_schema: snapshot },
+  ];
+}
+
+test("deployment validate is read-only and apply confirms Runtime CAS before reusing Core bundle actions", async () => {
+  const work = await mkdtemp(path.join(os.tmpdir(), "roster-deployment-plan-"));
+  const saved = { runtime: process.env.ROSTER_DEPLOY_TEST_RUNTIME, resource: process.env.ROSTER_DEPLOY_TEST_RESOURCE };
+  process.env.ROSTER_DEPLOY_TEST_RUNTIME = "runtime-fixture-secret"; process.env.ROSTER_DEPLOY_TEST_RESOURCE = "resource-fixture-secret";
+  const storedAgents: Record<string, unknown>[] = []; const runtimeWrites: unknown[] = []; const coreWrites: string[] = []; const coreReads: string[] = []; let resourceReads = 0; let dropRuntimeReply = false; let dropCoreReply = false; let runtimePreflightStatus = 200; let corePreflightStatus = 200;
+  const runtime = createServer(async (request, response) => {
+    if (request.headers.authorization !== "Bearer runtime-fixture-secret") { response.writeHead(401).end(); return; }
+    if (request.method === "GET" && request.url === "/admin") {
+      response.writeHead(runtimePreflightStatus, { "content-type": "application/json" });
+      if (runtimePreflightStatus !== 200) { response.end("{}"); return; }
+      response.end(JSON.stringify({ manifest: { protocol: "roster/0.1", runtime_id: "runtime-fixture", agents: storedAgents.map((agent) => ({ id: agent.id })) }, managed_agents: storedAgents, skill_catalog: { mode: "files", skills: [{ id: "skill-a", ready: true }] } })); return;
+    }
+    if (request.method === "GET" && request.url === "/mcp-catalogue") {
+      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ protocol: "roster-mcp-catalogue/1", runtime_id: "runtime-fixture", connections: [{ connection_id: "mcp-a", revision: "00000000-0000-4000-8000-000000000001", state: "active", tools: [] }] })); return;
+    }
+    if (request.method === "PUT" && request.url === "/admin/agents") {
+      const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk)); const config = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      runtimeWrites.push(config); const savedAgent = { ...config, version: (config.version as number) + 1 };
+      const existing = storedAgents.findIndex((agent) => agent.id === config.id); if (existing >= 0) storedAgents[existing] = savedAgent; else storedAgents.push(savedAgent);
+      if (dropRuntimeReply) { response.destroy(); return; }
+      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ protocol: "roster/0.1", runtime_id: "runtime-fixture", agents: [{ id: config.id }] })); return;
+    }
+    response.writeHead(404).end();
+  });
+  const resource = createServer((request, response) => {
+    resourceReads++;
+    if (request.headers.authorization !== "Bearer resource-fixture-secret" || request.url !== "/v1/resources/notes") { response.writeHead(404).end(); return; }
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ id: "notes", version: 2, operations: ["read"] }));
+  });
+  const core = createServer(async (request, response) => {
+    coreReads.push(`${request.method} ${request.url}`);
+    if (request.method === "GET" && request.url === "/api/catalog") { response.writeHead(corePreflightStatus, { "content-type": "application/json" }); response.end(corePreflightStatus === 200 ? JSON.stringify(deploymentCoreCatalog()) : "{}"); return; }
+    if (request.method === "POST" && ["/api/commands/nodes.list", "/api/commands/subscriptions.list"].includes(request.url ?? "")) { for await (const _chunk of request) { /* consume request body */ } response.writeHead(200, { "content-type": "application/json" }).end("[]"); return; }
+    const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk)); const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    if (request.method === "POST" && request.url?.startsWith("/api/commands/")) {
+      const command = request.url.slice("/api/commands/".length); coreWrites.push(command);
+      if (dropCoreReply && command === "subscriptions.create") { response.destroy(); return; }
+      const value = command === "nodes.register" ? { id: body.id, connector_id: body.connector_id } : { subject: { namespace: "subscriptions", id: body.id }, revision: 1, value: { id: body.id } };
+      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(value)); return;
+    }
+    response.writeHead(404).end();
+  });
+  const listen = async (server: ReturnType<typeof createServer>): Promise<number> => { await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve)); const address = server.address(); assert.ok(address && typeof address !== "string"); return address.port; };
+  const close = async (server: ReturnType<typeof createServer>) => { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); };
+  try {
+    const runtimePort = await listen(runtime); const resourcePort = await listen(resource); const corePort = await listen(core);
+    const packageDir = path.join(work, "bundle"); await mkdir(packageDir);
+    await writeFile(path.join(packageDir, "package.json"), JSON.stringify({ name: "@fixture/deployment", version: "1.0.0", roster: { manifest: "roster-bundle.json" } }));
+    await writeFile(path.join(packageDir, "roster-bundle.json"), JSON.stringify({ schema: "roster-bundle/1", name: "@fixture/deployment", version: "1.0.0", client_profile: "roster-core-import/1",
+      nodes: [{ id: "notes-node", connector_id: "resource", binding_ref: "notes" }, { id: "echo-node", connector_id: "runtime", binding_ref: "echo" }],
+      subscriptions: [{ id: "notes-to-echo", source: { namespace: "nodes", id: "notes-node" }, event: "changed", target: { namespace: "nodes", id: "echo-node" }, operation: "run", input: {} }] }));
+    const declaration = path.join(work, "deployment.json");
+    await writeFile(path.join(work, "bindings.json"), JSON.stringify({ bindings: {
+      notes: { url: `http://127.0.0.1:${resourcePort}`, target_id: "notes", token_env: "ROSTER_DEPLOY_TEST_RESOURCE" },
+      echo: { url: `http://127.0.0.1:${runtimePort}`, target_id: "echo-agent", token_env: "ROSTER_DEPLOY_TEST_RUNTIME" },
+    } }));
+    await writeFile(path.join(work, "bindings-mismatch.json"), JSON.stringify({ bindings: {
+      notes: { url: `http://127.0.0.1:${resourcePort}`, target_id: "different-resource", token_env: "ROSTER_DEPLOY_TEST_RESOURCE" },
+      echo: { url: `http://127.0.0.1:${runtimePort}`, target_id: "echo-agent", token_env: "ROSTER_DEPLOY_TEST_RUNTIME" },
+    } }));
+    await writeFile(path.join(work, "prompt.md"), "Echo safely.");
+    await writeFile(declaration, JSON.stringify({ schema: "roster-deployment/1", id: "fixture", runtime: { origin: `http://127.0.0.1:${runtimePort}`, token_env: "ROSTER_DEPLOY_TEST_RUNTIME" },
+      core: { origin: `http://127.0.0.1:${corePort}` }, profiles: { echo: { name: "Echo Agent", kind: "echo" } },
+      agents: [{ id: "echo-agent", expected_version: 0, profile_ref: "echo", config: {}, prompt_ref: "./prompt.md", skill_refs: ["skill-a"], mcp_refs: ["mcp-a"], resource_refs: ["notes"] }],
+      resources: [{ id: "notes", origin: `http://127.0.0.1:${resourcePort}`, token_env: "ROSTER_DEPLOY_TEST_RESOURCE", expected_version: 2, node_id: "notes-node" }],
+      bundle: { package_dir: "./bundle", bindings_file: "./bindings.json" } }));
+
+    const mismatchedBinding = path.join(work, "binding-mismatch-deployment.json");
+    await writeFile(mismatchedBinding, JSON.stringify({ ...JSON.parse(await readFile(declaration, "utf8")), bundle: { package_dir: "./bundle", bindings_file: "./bindings-mismatch.json" } }));
+    const mismatch = await runDeployment(["validate", "--file", mismatchedBinding]);
+    assert.equal(mismatch.code, 2, `${JSON.stringify(mismatch.result)} ${coreReads.join(",")}`); assert.equal(mismatch.result.code, "resource_node_mismatch");
+    assert.equal(runtimeWrites.length, 0); assert.equal(coreWrites.length, 0);
+
+    runtimePreflightStatus = 503;
+    const runtimeUnavailable = await runDeployment(["validate", "--file", declaration]);
+    runtimePreflightStatus = 200;
+    assert.equal(runtimeUnavailable.code, 2); assert.equal(runtimeUnavailable.result.code, "runtime_unavailable");
+    corePreflightStatus = 503;
+    const coreUnavailable = await runDeployment(["validate", "--file", declaration]);
+    corePreflightStatus = 200;
+    assert.equal(coreUnavailable.code, 2); assert.equal(coreUnavailable.result.code, "core_unavailable");
+
+    // Contract cases for @roster/contracts 0.49.0 ManagedAgent, ModelProvider,
+    // AgentEngine, ModelParameters, and ToolApprovalPolicy; invalid second
+    // agents must be rejected before the valid first agent can be applied.
+    const badAgentConfigs: Array<Record<string, unknown>> = [
+      { name: "Bad kind", kind: "unsupported" },
+      { name: "Bad provider", kind: "llm", provider: "../unsafe" },
+      { name: "Bad engine", kind: "llm", engine: "shell" },
+      { name: "Empty statuses", kind: "echo", statuses: [] },
+      { name: "Nested model controls", kind: "llm", model_parameters: { api_key: "not-allowed" } },
+      { name: "Bad approval", kind: "echo", tool_approval: { mode: "selected", tools: [] } },
+    ];
+    for (let index = 0; index < badAgentConfigs.length; index++) {
+      const invalidFile = path.join(work, `invalid-agent-${index}.json`);
+      const base = JSON.parse(await readFile(declaration, "utf8")) as Record<string, unknown>;
+      const invalid = { ...base, profiles: { echo: (base.profiles as Record<string, unknown>).echo, invalid: badAgentConfigs[index] }, agents: [
+        ...(base.agents as Array<Record<string, unknown>>),
+        { id: `bad-agent-${index}`, expected_version: 0, profile_ref: "invalid", config: {}, skill_refs: [], mcp_refs: [], resource_refs: [] },
+      ] };
+      await writeFile(invalidFile, JSON.stringify(invalid));
+      const beforeWrites: number = runtimeWrites.length; const beforeCoreWrites: number = coreWrites.length;
+      const result = await runDeployment(["validate", "--file", invalidFile]);
+      assert.equal(result.code, 2, JSON.stringify(result.result)); assert.equal(result.result.code, "agent_config_invalid");
+      assert.equal(runtimeWrites.length, beforeWrites); assert.equal(coreWrites.length, beforeCoreWrites);
+    }
+    const unicodePrompt = path.join(work, "unicode-prompt.md"); await writeFile(unicodePrompt, "😀".repeat(10_001));
+    const unicodeFile = path.join(work, "unicode-prompt.json");
+    await writeFile(unicodeFile, JSON.stringify({ ...JSON.parse(await readFile(declaration, "utf8")), agents: [
+      { ...((JSON.parse(await readFile(declaration, "utf8")) as Record<string, unknown>).agents as Array<Record<string, unknown>>)[0], prompt_ref: "./unicode-prompt.md" },
+    ] }));
+    const unicodeResult = await runDeployment(["validate", "--file", unicodeFile]);
+    assert.equal(unicodeResult.code, 2); assert.equal(unicodeResult.result.code, "prompt_size_limit");
+    assert.equal(runtimeWrites.length, 0); assert.equal(coreWrites.length, 0);
+
+    const planned = await runDeployment(["validate", "--file", declaration]);
+    assert.equal(planned.code, 0); assert.equal(planned.result.status, "planned"); assert.match(planned.result.digest ?? "", /^[a-f0-9]{64}$/u);
+    assert.equal(Object.hasOwn(planned.result, "teams"), false);
+    assert.equal(runtimeWrites.length, 0); assert.equal(coreWrites.length, 0);
+    assert.equal(JSON.stringify(planned.result).includes("Echo safely."), false);
+    const rejectedDigest = await runDeployment(["apply", "--file", declaration, "--expected-digest", "0".repeat(64)]);
+    assert.equal(rejectedDigest.code, 2); assert.equal(rejectedDigest.result.code, "digest_mismatch"); assert.equal(runtimeWrites.length, 0); assert.equal(coreWrites.length, 0);
+
+    const applied = await runDeployment(["apply", "--file", declaration, "--expected-digest", planned.result.digest!]);
+    assert.equal(applied.code, 0, JSON.stringify(applied.result)); assert.equal(applied.result.status, "applied");
+    assert.deepEqual(runtimeWrites[0] && (runtimeWrites[0] as Record<string, unknown>).instructions, "Echo safely.");
+    assert.equal((runtimeWrites[0] as Record<string, unknown>).version, 0);
+    assert.deepEqual(coreWrites, ["nodes.register", "nodes.register", "subscriptions.create"]);
+    assert.equal(applied.result.applied.filter((item) => item.service === "runtime")[0]?.revision, 1);
+    const output = JSON.stringify(applied.result);
+    assert.equal(output.includes("runtime-fixture-secret"), false); assert.equal(output.includes("resource-fixture-secret"), false); assert.equal(output.includes("Echo safely."), false);
+
+    const lostReplyFile = path.join(work, "lost-reply.json");
+    const baseDeclaration = JSON.parse(await readFile(declaration, "utf8")) as Record<string, unknown>;
+    const baseAgent = (baseDeclaration.agents as Array<Record<string, unknown>>)[0]!;
+    await writeFile(lostReplyFile, JSON.stringify({ ...baseDeclaration, id: "lost-reply", agents: [{ ...baseAgent, id: "echo-agent-lost" }] }));
+    const lostPlan = await runDeployment(["validate", "--file", lostReplyFile]); assert.equal(lostPlan.code, 0);
+    dropRuntimeReply = true;
+    const lost = await runDeployment(["apply", "--file", lostReplyFile, "--expected-digest", lostPlan.result.digest!]);
+    dropRuntimeReply = false;
+    assert.equal(lost.code, 4); assert.equal(lost.result.status, "partial");
+    assert.deepEqual(lost.result.unresolved, [{ service: "runtime", id: "echo-agent-lost" }]);
+    assert.equal(storedAgents.some((agent) => agent.id === "echo-agent-lost" && agent.version === 1), true);
+    assert.deepEqual(coreWrites, ["nodes.register", "nodes.register", "subscriptions.create"]);
+
+    const coreLostReplyFile = path.join(work, "core-lost-reply.json");
+    await writeFile(coreLostReplyFile, JSON.stringify({ ...baseDeclaration, id: "core-lost-reply", agents: [{ ...baseAgent, id: "echo-agent-core-lost" }] }));
+    const coreLostPlan = await runDeployment(["validate", "--file", coreLostReplyFile]); assert.equal(coreLostPlan.code, 0);
+    dropCoreReply = true;
+    const coreLost = await runDeployment(["apply", "--file", coreLostReplyFile, "--expected-digest", coreLostPlan.result.digest!]);
+    dropCoreReply = false;
+    assert.equal(coreLost.code, 4); assert.equal(coreLost.result.status, "partial");
+    assert.deepEqual(coreLost.result.unresolved, [{ service: "core", id: "notes-to-echo" }]);
+    assert.equal(storedAgents.some((agent) => agent.id === "echo-agent-core-lost" && agent.version === 1), true);
+
+    const teamBundleDir = path.join(work, "team-bundle"); await mkdir(teamBundleDir);
+    const teamNodes = [
+      { id: "notes-node", connector_id: "resource", binding_ref: "notes" },
+      { id: "team-node-a", connector_id: "runtime", binding_ref: "team-a" },
+      { id: "team-node-b", connector_id: "runtime", binding_ref: "team-b" },
+    ];
+    await writeFile(path.join(teamBundleDir, "package.json"), JSON.stringify({ name: "@fixture/team-deployment", version: "1.0.0", roster: { manifest: "roster-bundle.json" } }));
+    await writeFile(path.join(teamBundleDir, "roster-bundle.json"), JSON.stringify({ schema: "roster-bundle/1", name: "@fixture/team-deployment", version: "1.0.0", client_profile: "roster-core-import/1", nodes: teamNodes, subscriptions: [] }));
+    const teamBindings = {
+      notes: { url: `http://127.0.0.1:${resourcePort}`, target_id: "notes", token_env: "ROSTER_DEPLOY_TEST_RESOURCE" },
+      "team-a": { url: `http://127.0.0.1:${runtimePort}`, target_id: "team-agent-a", token_env: "ROSTER_DEPLOY_TEST_RUNTIME" },
+      "team-b": { url: `http://127.0.0.1:${runtimePort}`, target_id: "team-agent-b", token_env: "ROSTER_DEPLOY_TEST_RUNTIME" },
+    };
+    const teamBindingsFile = path.join(work, "team-bindings.json"); await writeFile(teamBindingsFile, JSON.stringify({ bindings: teamBindings }));
+    const teamDeclaration = path.join(work, "team-deployment.json");
+    const teamBase = JSON.parse(await readFile(declaration, "utf8")) as Record<string, unknown>;
+    const team = [{ id: "delivery", name: "  Delivery Team  ", roles: [{ id: "reviewers", name: "  Reviewers  ", members: [
+      { agent_id: "team-agent-a", node_id: "team-node-a" }, { agent_id: "team-agent-b", node_id: "team-node-b" },
+    ] }] }];
+    const teamAgents = ["team-agent-a", "team-agent-b"].map((id) => ({ id, expected_version: 0, profile_ref: "echo", config: {}, skill_refs: [], mcp_refs: [], resource_refs: [] }));
+    const teamInput = { ...teamBase, id: "team-fixture", agents: teamAgents, teams: team,
+      bundle: { package_dir: "./team-bundle", bindings_file: "./team-bindings.json" } };
+    await writeFile(teamDeclaration, JSON.stringify(teamInput));
+    const noRuntimeWrites = runtimeWrites.length; const noCoreWrites = coreWrites.length;
+    const teamPlan = await runDeployment(["validate", "--file", teamDeclaration]);
+    assert.equal(teamPlan.code, 0); assert.equal(teamPlan.result.status, "planned");
+    assert.deepEqual(teamPlan.result.teams, [{ id: "delivery", name: "Delivery Team", roles: [{ id: "reviewers", name: "Reviewers", members: [
+      { agent_id: "team-agent-a", node_id: "team-node-a" }, { agent_id: "team-agent-b", node_id: "team-node-b" },
+    ] }] }]);
+    assert.equal(runtimeWrites.length, noRuntimeWrites); assert.equal(coreWrites.length, noCoreWrites);
+    const whitespaceTeamFile = path.join(work, "whitespace-team.json");
+    await writeFile(whitespaceTeamFile, JSON.stringify({ ...teamInput, teams: [{ ...team[0], name: "Delivery Team", roles: [{ ...team[0]!.roles[0], name: "Reviewers" }] }] }));
+    const whitespaceTeamPlan = await runDeployment(["validate", "--file", whitespaceTeamFile]);
+    assert.equal(whitespaceTeamPlan.code, 0); assert.equal(whitespaceTeamPlan.result.digest, teamPlan.result.digest);
+    const renamedTeamFile = path.join(work, "renamed-team.json");
+    await writeFile(renamedTeamFile, JSON.stringify({ ...teamInput, teams: [{ ...team[0], name: "Delivery Team v2" }] }));
+    const renamedPlan = await runDeployment(["validate", "--file", renamedTeamFile]);
+    assert.equal(renamedPlan.code, 0); assert.notEqual(renamedPlan.result.digest, teamPlan.result.digest);
+
+    const invalidTeams = [
+      [{ ...team[0], id: "delivery" }, { ...team[0], id: "delivery" }],
+      [{ ...team[0], roles: [team[0]!.roles[0], { ...team[0]!.roles[0], name: "Other" }] }],
+      [{ ...team[0], roles: [{ ...team[0]!.roles[0], members: [team[0]!.roles[0]!.members[0], { agent_id: "foreign-agent", node_id: "foreign-node" }] }] }],
+      [{ ...team[0], roles: [{ ...team[0]!.roles[0], members: [team[0]!.roles[0]!.members[0], { agent_id: "team-agent-a", node_id: "team-node-b" }] }] }],
+      [{ ...team[0], roles: [{ ...team[0]!.roles[0], members: [team[0]!.roles[0]!.members[0], { agent_id: "team-agent-b", node_id: "team-node-a" }] }] }],
+      [{ ...team[0], extra: "unknown" }],
+      Array.from({ length: 17 }, (_, index) => ({ ...team[0]!, id: `team-${index}` })),
+      [{ ...team[0], roles: Array.from({ length: 33 }, (_, index) => ({ id: `role-${index}`, name: "Role", members: [team[0]!.roles[0]!.members[0]] })) }],
+      [{ ...team[0], roles: [{ ...team[0]!.roles[0], members: Array.from({ length: 33 }, () => team[0]!.roles[0]!.members[0]) }] }],
+    ];
+    for (const [index, invalidTeam] of invalidTeams.entries()) {
+      const invalidTeamFile = path.join(work, `invalid-team-${index}.json`);
+      await writeFile(invalidTeamFile, JSON.stringify({ ...teamInput, teams: invalidTeam }));
+      const result = await runDeployment(["validate", "--file", invalidTeamFile]);
+      assert.equal(result.code, 2); assert.ok(["team_declaration_invalid", "team_reference_invalid"].includes(result.result.code), `team fixture ${index}: ${JSON.stringify(result.result)}`);
+      assert.equal(runtimeWrites.length, noRuntimeWrites); assert.equal(coreWrites.length, noCoreWrites);
+    }
+
+    const teamMismatchCases: Array<{ id: string; nodes?: typeof teamNodes; bindings?: typeof teamBindings }> = [
+      { id: "connector", nodes: teamNodes.map((node) => node.id === "team-node-a" ? { ...node, connector_id: "resource" } : node) },
+      { id: "target", bindings: { ...teamBindings, "team-a": { ...teamBindings["team-a"], target_id: "another-agent" } } },
+      { id: "origin", bindings: { ...teamBindings, "team-a": { ...teamBindings["team-a"], url: "http://127.0.0.1:9" } } },
+      { id: "token", bindings: { ...teamBindings, "team-a": { ...teamBindings["team-a"], token_env: "OTHER_RUNTIME_TOKEN" } } },
+    ];
+    for (const mismatchCase of teamMismatchCases) {
+      const mismatchDir = path.join(work, `team-${mismatchCase.id}-bundle`); await mkdir(mismatchDir);
+      const nodes = mismatchCase.nodes ?? teamNodes;
+      await writeFile(path.join(mismatchDir, "package.json"), JSON.stringify({ name: `@fixture/team-${mismatchCase.id}`, version: "1.0.0", roster: { manifest: "roster-bundle.json" } }));
+      await writeFile(path.join(mismatchDir, "roster-bundle.json"), JSON.stringify({ schema: "roster-bundle/1", name: `@fixture/team-${mismatchCase.id}`, version: "1.0.0", client_profile: "roster-core-import/1", nodes, subscriptions: [] }));
+      const bindingFile = path.join(work, `team-${mismatchCase.id}-bindings.json`);
+      await writeFile(bindingFile, JSON.stringify({ bindings: mismatchCase.bindings ?? teamBindings }));
+      const mismatchFile = path.join(work, `team-${mismatchCase.id}.json`);
+      await writeFile(mismatchFile, JSON.stringify({ ...teamInput, id: `team-${mismatchCase.id}`, bundle: { package_dir: `./team-${mismatchCase.id}-bundle`, bindings_file: `./team-${mismatchCase.id}-bindings.json` } }));
+      const result = await runDeployment(["validate", "--file", mismatchFile]);
+      assert.equal(result.code, 2); assert.equal(result.result.code, "team_node_mismatch");
+      assert.equal(runtimeWrites.length, noRuntimeWrites); assert.equal(coreWrites.length, noCoreWrites);
+    }
+    const foreignNodeFile = path.join(work, "team-foreign-node.json");
+    await writeFile(foreignNodeFile, JSON.stringify({ ...teamInput, id: "team-foreign-node", teams: [{ ...team[0], roles: [{ ...team[0]!.roles[0], members: [team[0]!.roles[0]!.members[0], { agent_id: "team-agent-b", node_id: "foreign-node" }] }] }] }));
+    const foreignNode = await runDeployment(["validate", "--file", foreignNodeFile]);
+    assert.equal(foreignNode.code, 2); assert.equal(foreignNode.result.code, "team_node_mismatch");
+    assert.equal(runtimeWrites.length, noRuntimeWrites); assert.equal(coreWrites.length, noCoreWrites);
+
+    runtimePreflightStatus = 503;
+    const teamFailure = await runDeployment(["validate", "--file", teamDeclaration]);
+    runtimePreflightStatus = 200;
+    assert.equal(teamFailure.code, 2); assert.deepEqual(teamFailure.result.teams, teamPlan.result.teams);
+
+    const teamApply = await runDeployment(["apply", "--file", teamDeclaration, "--expected-digest", teamPlan.result.digest!]);
+    assert.equal(teamApply.code, 0); assert.deepEqual(teamApply.result.teams, teamPlan.result.teams);
+    const beforeReapplyWrites = runtimeWrites.length;
+    const teamReapply = await runDeployment(["apply", "--file", teamDeclaration, "--expected-digest", teamPlan.result.digest!]);
+    assert.equal(teamReapply.code, 2); assert.equal(teamReapply.result.code, "agent_version_conflict");
+    assert.deepEqual(teamReapply.result.teams, teamPlan.result.teams); assert.equal(runtimeWrites.length, beforeReapplyWrites);
+
+    const teamUnknownFile = path.join(work, "team-unknown.json");
+    const teamUnknownInput = { ...teamInput, id: "team-unknown", agents: teamAgents.map((agent) => ({ ...agent, expected_version: 1 })) };
+    await writeFile(teamUnknownFile, JSON.stringify(teamUnknownInput));
+    const teamUnknownPlan = await runDeployment(["validate", "--file", teamUnknownFile]); assert.equal(teamUnknownPlan.code, 0);
+    dropRuntimeReply = true;
+    const teamUnknown = await runDeployment(["apply", "--file", teamUnknownFile, "--expected-digest", teamUnknownPlan.result.digest!]);
+    dropRuntimeReply = false;
+    assert.equal(teamUnknown.code, 4); assert.equal(teamUnknown.result.status, "partial");
+    assert.deepEqual(teamUnknown.result.teams, teamPlan.result.teams);
+    assert.deepEqual(teamUnknown.result.unresolved, [{ service: "runtime", id: "team-agent-a" }]);
+    assert.ok(resourceReads >= 6);
+  } finally {
+    await close(runtime); await close(resource); await close(core);
+    if (saved.runtime === undefined) delete process.env.ROSTER_DEPLOY_TEST_RUNTIME; else process.env.ROSTER_DEPLOY_TEST_RUNTIME = saved.runtime;
+    if (saved.resource === undefined) delete process.env.ROSTER_DEPLOY_TEST_RESOURCE; else process.env.ROSTER_DEPLOY_TEST_RESOURCE = saved.resource;
+    await rm(work, { recursive: true, force: true });
+  }
+});
+
+test("bundle CLI maps pre-apply communication failure and partial mutation to distinct exits", () => {
+  const result = (status: "planned" | "applied" | "partial" | "failed") => ({
+    schema: "roster-import-result/1" as const, status, package: { name: "example", version: "1.0.0" },
+    client_profile: CLIENT_PROFILE, digest: null, actions: [], applied: [], unresolved: [], failure: null,
+  });
+  assert.equal(applyExitCode(result("planned")), 0);
+  assert.equal(applyExitCode(result("applied")), 0);
+  assert.equal(applyExitCode(result("partial")), 3);
+  assert.equal(applyExitCode(result("failed")), 4);
+});
+
+test("bundle apply records only identity-matching Core command responses", async () => {
+  const server = createServer(async (request, response) => {
+    for await (const _chunk of request) { /* consume request body */ }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ id: "other-node", connector_id: "connector-a" }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const plan: BundlePlan = {
+      package: { name: "example-bundle", version: "1.0.0" },
+      manifest: { schema: "roster-bundle/1", name: "example-bundle", version: "1.0.0", client_profile: CLIENT_PROFILE, nodes: [], subscriptions: [] },
+      bindings: {}, digest: "digest",
+      actions: [{ command: "nodes.register", id: "wanted-node", input: { id: "wanted-node", connector_id: "connector-a" } }],
+    };
+    const result = await applyBundle(plan, `http://127.0.0.1:${address.port}`, Date.now() + 5_000);
+    assert.equal(result.status, "partial");
+    assert.deepEqual(result.applied, []);
+    assert.deepEqual(result.unresolved, [{ command: "nodes.register", id: "wanted-node" }]);
+    assert.deepEqual(result.failure, { stage: "apply", code: "core_response_invalid", id: "wanted-node" });
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("bundle apply does not report an unsent expired mutation as unresolved", async () => {
+  let requests = 0;
+  const server = createServer((_request, response) => { requests++; response.writeHead(200); response.end("{}"); });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const plan: BundlePlan = {
+      package: { name: "example-bundle", version: "1.0.0" },
+      manifest: { schema: "roster-bundle/1", name: "example-bundle", version: "1.0.0", client_profile: CLIENT_PROFILE, nodes: [], subscriptions: [] },
+      bindings: {}, digest: "digest",
+      actions: [{ command: "nodes.register", id: "wanted-node", input: { id: "wanted-node", connector_id: "connector-a" } }],
+    };
+    const result = await applyBundle(plan, `http://127.0.0.1:${address.port}`, Date.now() - 1);
+    assert.equal(result.status, "failed");
+    assert.deepEqual(result.applied, []);
+    assert.deepEqual(result.unresolved, []);
+    assert.equal(requests, 0);
+    assert.deepEqual(result.failure, { stage: "apply", code: "overall_timeout", id: "wanted-node" });
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("bundle apply cancels an oversized Core response and keeps the action unresolved", async () => {
+  let responseClosed = false;
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.on("close", () => { responseClosed = true; });
+    response.write(Buffer.alloc(2 * 1024 * 1024 + 1, 0x20));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const plan: BundlePlan = {
+      package: { name: "example-bundle", version: "1.0.0" },
+      manifest: { schema: "roster-bundle/1", name: "example-bundle", version: "1.0.0", client_profile: CLIENT_PROFILE, nodes: [], subscriptions: [] },
+      bindings: {}, digest: "digest",
+      actions: [{ command: "nodes.register", id: "wanted-node", input: { id: "wanted-node", connector_id: "connector-a" } }],
+    };
+    const result = await applyBundle(plan, `http://127.0.0.1:${address.port}`, Date.now() + 5_000);
+    assert.equal(result.status, "partial");
+    assert.deepEqual(result.unresolved, [{ command: "nodes.register", id: "wanted-node" }]);
+    assert.deepEqual(result.failure, { stage: "apply", code: "core_response_invalid", id: "wanted-node" });
+    for (let attempt = 0; attempt < 20 && !responseClosed; attempt++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(responseClosed, true);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("bundle apply cancels redirect and error response bodies", async () => {
+  const statuses = [302, 400, 500];
+  const closed = statuses.map(() => false);
+  let requestIndex = 0;
+  const server = createServer((_request, response) => {
+    const index = requestIndex++;
+    response.writeHead(statuses[index]!);
+    response.on("close", () => { closed[index] = true; });
+    response.write(Buffer.alloc(64 * 1024, 0x20));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const plan: BundlePlan = {
+      package: { name: "example-bundle", version: "1.0.0" },
+      manifest: { schema: "roster-bundle/1", name: "example-bundle", version: "1.0.0", client_profile: CLIENT_PROFILE, nodes: [], subscriptions: [] },
+      bindings: {}, digest: "digest",
+      actions: [{ command: "nodes.register", id: "wanted-node", input: { id: "wanted-node", connector_id: "connector-a" } }],
+    };
+    const expected = ["redirect_forbidden", "core_rejected", "core_unavailable"];
+    for (let index = 0; index < statuses.length; index++) {
+      const result = await applyBundle(plan, `http://127.0.0.1:${address.port}`, Date.now() + 5_000);
+      assert.equal(result.status, "partial");
+      assert.equal(result.failure?.code, expected[index]);
+      assert.deepEqual(result.unresolved, index === 2 ? [{ command: "nodes.register", id: "wanted-node" }] : []);
+      for (let attempt = 0; attempt < 20 && !closed[index]; attempt++) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(closed[index], true);
+    }
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
