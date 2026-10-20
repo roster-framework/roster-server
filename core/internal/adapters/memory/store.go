@@ -1,7 +1,6 @@
 package memory
 
 import (
-	"context"
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
 	"sync"
 )
@@ -83,19 +82,4 @@ func (s *Store[T]) Apply(ch c.Change[T], deliveries ...c.Delivery) (c.Snapshot[T
 		s.root.executions.appendDeliveriesLocked(stagedDeliveries, nil)
 	}
 	return s.copy(next), nil
-}
-
-type Queue struct {
-	mu      sync.Mutex
-	pending chan string
-}
-
-func NewQueue(capacity int) *Queue { return &Queue{pending: make(chan string, capacity)} }
-func (q *Queue) Claim(ctx context.Context) (string, error) {
-	select {
-	case id := <-q.pending:
-		return id, nil
-	case <-ctx.Done():
-		return "", ctx.Err()
-	}
 }

@@ -16,14 +16,15 @@ import (
 )
 
 type Status struct {
-	InstanceID              string                  `json:"instance_id"`
-	Lifecycle               c.Snapshot[c.Lifecycle] `json:"lifecycle"`
-	Ready                   bool                    `json:"ready"`
-	LocalStopped            bool                    `json:"local_stopped"`
-	UnresolvedCallIDs       []string                `json:"unresolved_call_ids"`
-	PendingDeliveryCount    int                     `json:"pending_delivery_count"`
-	PendingObservationCount int                     `json:"pending_observation_count"`
-	LastDeliveryError       *c.Fault                `json:"last_delivery_error"`
+	InstanceID              string                      `json:"instance_id"`
+	Lifecycle               c.Snapshot[c.Lifecycle]     `json:"lifecycle"`
+	Ready                   bool                        `json:"ready"`
+	Scheduling              invocation.SchedulingStatus `json:"scheduling"`
+	LocalStopped            bool                        `json:"local_stopped"`
+	UnresolvedCallIDs       []string                    `json:"unresolved_call_ids"`
+	PendingDeliveryCount    int                         `json:"pending_delivery_count"`
+	PendingObservationCount int                         `json:"pending_observation_count"`
+	LastDeliveryError       *c.Fault                    `json:"last_delivery_error"`
 }
 
 func (s *Core) transitionLocked(to c.State, reason string) error {
@@ -59,13 +60,13 @@ func (s *Core) Status() (Status, error) {
 		return Status{}, s.lifecycleErr
 	}
 	ids := []string{}
-	calls, err := s.Calls.List()
+	calls, err := s.Calls.ReadSummaries()
 	if err != nil {
 		return Status{}, err
 	}
-	for _, snap := range calls {
-		if !snap.Value.Lifecycle.State.Terminal() {
-			ids = append(ids, snap.Value.Call.ID)
+	for _, summary := range calls {
+		if !summary.State.Terminal() {
+			ids = append(ids, summary.Call.Subject.ID)
 		}
 	}
 	sort.Strings(ids)
@@ -78,12 +79,16 @@ func (s *Core) Status() (Status, error) {
 	if err != nil {
 		return Status{}, err
 	}
-	ready := s.lifecycle.Value.State == c.Running && !s.closing && pendingDeliveries == 0 && pendingObservations == 0
+	ready := s.lifecycle.Value.State == c.Running && !s.closing
+	scheduling, err := s.Calls.SchedulingStatus()
+	if err != nil {
+		return Status{}, err
+	}
 	var lastDeliveryFault *c.Fault
 	if s.lastDeliveryError != nil {
 		lastDeliveryFault = command.PublicFault(s.lastDeliveryError)
 	}
-	return Status{InstanceID: s.instanceID, Lifecycle: c.Clone(s.lifecycle), Ready: ready, LocalStopped: stopped, UnresolvedCallIDs: ids, PendingDeliveryCount: pendingDeliveries, PendingObservationCount: pendingObservations, LastDeliveryError: lastDeliveryFault}, nil
+	return Status{InstanceID: s.instanceID, Lifecycle: c.Clone(s.lifecycle), Ready: ready, Scheduling: scheduling, LocalStopped: stopped, UnresolvedCallIDs: ids, PendingDeliveryCount: pendingDeliveries, PendingObservationCount: pendingObservations, LastDeliveryError: lastDeliveryFault}, nil
 }
 
 func (s *Core) BeginDrain() {
@@ -127,6 +132,11 @@ var readOnlyCommands = map[string]bool{"nodes.list": true, "nodes.get": true, "c
 func (s *Core) admitCommand(name string) (func(), error) {
 	s.mu.Lock()
 	readOnly := readOnlyCommands[name]
+	if !readOnly && s.lifecycleErr != nil {
+		err := s.lifecycleErr
+		s.mu.Unlock()
+		return nil, err
+	}
 	if s.closing && !readOnly {
 		s.mu.Unlock()
 		return nil, c.Err("busy", "Host is draining")
@@ -308,6 +318,9 @@ stopDrain:
 	if s.drainCancel != nil {
 		s.drainCancel()
 	}
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if s.drainDone != nil {
 		select {
 		case <-s.drainDone:
@@ -319,14 +332,14 @@ stopDrain:
 	recordError(s.lifecycleErr)
 	ids := []string{}
 	completionKnown := true
-	calls, listErr := s.Calls.List()
+	calls, listErr := s.Calls.ReadSummaries()
 	if listErr != nil {
 		recordError(listErr)
 		completionKnown = false
 	}
-	for _, snap := range calls {
-		if !snap.Value.Lifecycle.State.Terminal() {
-			ids = append(ids, snap.Value.Call.ID)
+	for _, summary := range calls {
+		if !summary.State.Terminal() {
+			ids = append(ids, summary.Call.Subject.ID)
 		}
 	}
 	sort.Strings(ids)

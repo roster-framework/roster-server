@@ -119,13 +119,22 @@ type Caller interface {
 type ExecutionStore interface {
 	Get(Ref) (Snapshot[Execution], error)
 	List() ([]Snapshot[Execution], error)
+	ReadSummaries() ([]ExecutionSummary, error)
 	CommitAdmission(AdmissionCommit) error
 	Commit(ExecutionMutation) (Snapshot[Execution], error)
 	PendingObservation(callID string) (PendingObservation, bool, error)
 	PendingObservations() ([]PendingObservation, error)
 	CommitPending(PendingMutation) error
 	Outbox
-	Claim(Context) (string, error)
+	ReadScheduling() (SchedulingView, <-chan struct{}, error)
+	ReadQueueFacts() ([]QueueFact, uint64, uint64, error)
+}
+
+// ExecutionSummary is the bounded metadata-only projection used by operational
+// status and shutdown checks. It deliberately excludes execution payloads.
+type ExecutionSummary struct {
+	Call  RevisionRef
+	State State
 }
 
 // CopyExecution returns an independent, lossless copy of an execution,
@@ -190,6 +199,8 @@ type AdmissionCommit struct {
 	Changes    []Change[Execution]
 	Deliveries []Delivery
 	Effect     *AdmissionEffect
+	Queue      []QueueMutation
+	Scheduling *SchedulingMutation
 }
 type ReplyCommit struct {
 	Delivery   Delivery
@@ -213,6 +224,61 @@ type ExecutionMutation struct {
 	Deliveries       []Delivery
 	Pending          *PendingMutation
 	NodeRevision     *RevisionRef
+	Queue            *QueueMutation
+	Scheduling       *SchedulingMutation
+}
+
+// QueueMetadata is the immutable admission-time ordering fact for a call.
+type QueueMetadata struct {
+	Admission RevisionRef
+	At        time.Time
+	Sequence  uint64
+}
+
+// QueueFact is the bounded startup-recovery view of one retained execution's
+// scheduler metadata. It intentionally contains no execution payload.
+type QueueFact struct {
+	Call     RevisionRef
+	Present  bool
+	SlotHeld bool
+	Metadata *QueueMetadata
+}
+
+// QueueMutation expresses desired queue and possible-slot facts in the same
+// commit as the execution transition that justifies them.
+type QueueMutation struct {
+	CallID            string
+	Present, SlotHeld bool
+	Metadata          *QueueMetadata
+}
+
+type SchedulingCursor struct {
+	Round       uint8
+	AfterTarget Ref
+}
+
+type QueueCandidate struct {
+	Call                 RevisionRef
+	Target               Ref
+	Sequence             uint64
+	EnqueuedAt, Deadline time.Time
+}
+
+type TargetCount struct {
+	Target Ref
+	Count  uint32
+}
+
+type SchedulingView struct {
+	Revision uint64
+	Cursor   SchedulingCursor
+	Eligible []QueueCandidate
+	Held     []TargetCount
+}
+
+type SchedulingMutation struct {
+	ExpectedRevision uint64
+	Cursor           *SchedulingCursor
 }
 type OutboxCursor struct {
 	StoreID        string

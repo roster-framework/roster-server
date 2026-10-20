@@ -61,6 +61,27 @@ Call은 `calls.submit`, `calls.get`, `calls.list`, `calls.inspect`, `calls.abort
 
 정책 파일에는 자격을 넣지 마세요. 연결 단절이나 timeout 뒤에는 Call이 `unknown`일 수 있으므로 같은 receipt를 확인한 뒤 조치하세요. 공급자 등록만으로 현재 연결 가능성이 증명되지는 않습니다. 구독 선언은 이후 이벤트 경로를 설정할 뿐 전달 성공을 증명하지 않습니다. Core 로그의 Event receipt와 생성된 Call 근거를 확인하세요. 구독을 제거해도 이미 생성된 Call은 취소되지 않습니다.
 
+## 스케줄링 설정
+
+`serve --config <file>`에 전달하는 Core JSON의 최상위에 다음 조각을 추가하세요. 같은 파일의 `nodes`에 ID가 `runtime`인 Node를 선언해야 하며, 실제 ID가 다르면 아래 ID도 바꾸세요. Node 전체 설정이 아닌 스케줄링 조각입니다.
+
+```json
+{
+  "scheduling": {
+    "global_waiting": 128,
+    "global_possible": 16,
+    "aging_after_seconds": 30,
+    "targets": [
+      { "node_id": "runtime", "weight": 2, "waiting": 32, "possible": 4, "active": 2 }
+    ]
+  }
+}
+```
+
+설정을 생략하면 전체 waiting 256·possible 64·aging 기준 30초이며, 각 Node는 weight 1·waiting 64·possible 4·기본 worker 8개에서 active 2입니다. 전체 또는 worker 상한을 낮추면 생략한 기본값도 그 상한에 맞춰 줄어듭니다. 존재하지 않거나 중복된 target ID와 명시적으로 잘못 지정한 값은 시작을 거절합니다. 정책은 작업 시작 전에 검증하며 재시작할 때까지 고정됩니다.
+
+Core는 처리 가능한 Node 사이에 가중 선택 기회를 배분합니다. Node 안에서는 처리 가능한 Call 중 aging 기준을 넘긴 Call을 최초 접수 순으로 먼저 고르고, 그 외에는 이른 deadline 순으로 고릅니다. weight는 선택 횟수의 비율이며 provider 실행시간의 비율이 아닙니다. `unknown`이나 취소 ACK만 받은 Call은 종료가 확인될 때까지 `possible`을 점유합니다. `active`는 실제 반환할 때까지 준비·Invoke 중인 로컬 worker 수를 셉니다. 상한이 차면 전송이 지연될 수 있으며 비협조적인 provider를 선점할 수는 없습니다. `core.status`의 `scheduling`에서 waiting/possible/physical 수, 가장 오래된 대기 시간과 활동 중인 target별 차단 이유를 확인하세요.
+
 ## 커뮤니티 bundle 가져오기
 
 커뮤니티 패키지는 Node와 구독을 선언해 운영자가 명시적으로 가져올 수 있습니다. 전용 공급자 작업 공간에서 정확한 버전을 설치하고 install script 없이 공급자를 별도로 실행하세요.
@@ -90,7 +111,7 @@ node dashboard/build/src/cli.js deployment apply --file <deployment.json> --expe
 `core/`와 `log/`에서 각각 Docker 모듈 검사를 실행합니다.
 
 ```sh
-docker run --rm -v "$PWD:/src:ro" -w /src golang:1.26 go test ./...
+docker run --rm -v "$PWD:/src:ro" -w /src golang:1.26.10 go test ./...
 ```
 
 대시보드는 `dashboard/`에서 `npm test`를 실행합니다. 실제 Runtime·Resource HTTP, 구독, 1:1 응답과 그룹 대화를 모델 호출 없이 검사하려면 `../roster-node-client/runtime`을 먼저 빌드한 다음 저장소 루트에서 다음 격리 Docker fixture를 실행하세요.

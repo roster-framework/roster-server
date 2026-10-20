@@ -3,11 +3,13 @@ package core_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +27,710 @@ import (
 	"github.com/roster-framework/roster-server/core/internal/lifecycle"
 	"github.com/roster-framework/roster-server/core/internal/observation"
 )
+
+func TestStartValidationAndWorkerStorageFailureLifecycle(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseConnector := func() { releaseOnce.Do(func() { close(release) }) }
+	var enteredOnce sync.Once
+	var invokes atomic.Int32
+	f := &fakeConnector{invoke: func(call c.Call, _ c.ReportSink) c.Result {
+		invokes.Add(1)
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+		return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{}}
+	}}
+	cat, _, journal, root := fixture(t, f)
+	store := &interceptExecutionStore{ExecutionStore: root.Executions()}
+	service := invocation.New(store, cat, journal, fixtureAuthority(t))
+	var closed atomic.Bool
+	t.Cleanup(func() {
+		releaseConnector()
+		if !closed.Load() {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+			defer cancel()
+			_ = service.Close(closeCtx, nil)
+		}
+	})
+	if err := service.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	observerCalls := atomic.Int32{}
+	observedFailure := make(chan error, 1)
+	observer := func(err error) {
+		observerCalls.Add(1)
+		observedFailure <- err
+	}
+	for name, err := range map[string]error{
+		"nil context":      service.Start(nil, 1, observer),
+		"nil observer":     service.Start(ctx, 1, nil),
+		"zero workers":     service.Start(ctx, 0, observer),
+		"too many workers": service.Start(ctx, 65, observer),
+	} {
+		if err == nil || c.AsFault(err).Code != "invalid_input" {
+			t.Errorf("Start(%s) error=%v, want invalid_input", name, err)
+		}
+	}
+	invalid := invocation.DefaultSchedulingPolicy(2)
+	invalid.WaitingLimit = 0
+	if err := service.SetSchedulingPolicy(invalid); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Start(ctx, 2, observer); err == nil || c.AsFault(err).Code != "invalid_input" {
+		t.Fatalf("Start accepted invalid policy: %v", err)
+	}
+	if err := service.SetSchedulingPolicy(invocation.DefaultSchedulingPolicy(2)); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	readCalls := atomic.Int32{}
+	store.readScheduling = func() (c.SchedulingView, <-chan struct{}, error) {
+		readCalls.Add(1)
+		return root.Executions().ReadScheduling()
+	}
+	store.mu.Unlock()
+	if _, err := service.SubmitBatch(directOrigin(), []c.Call{call("worker-failure-inflight")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Start(ctx, 2, observer); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Start(ctx, 2, observer); err == nil || c.AsFault(err).Code != "conflict" {
+		t.Fatalf("duplicate Start error=%v, want conflict", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first worker did not enter the connector")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if readCalls.Load() >= 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if readCalls.Load() < 2 {
+		t.Fatal("idle worker did not reach its scheduling read")
+	}
+	errSchedulingRead := c.Err("busy", "private backend read detail")
+	store.mu.Lock()
+	store.readScheduling = func() (c.SchedulingView, <-chan struct{}, error) {
+		return c.SchedulingView{}, nil, errSchedulingRead
+	}
+	store.mu.Unlock()
+	other := invocation.New(root.Executions(), cat, journal, fixtureAuthority(t))
+	if _, err := other.SubmitBatch(directOrigin(), []c.Call{call("worker-failure-queued")}); err != nil {
+		t.Fatalf("second service admission: %v", err)
+	}
+	select {
+	case err := <-observedFailure:
+		if !errors.Is(err, errSchedulingRead) {
+			t.Fatalf("worker failure lost original read cause: %v", err)
+		}
+		var storageFailure *c.StorageFailure
+		if !errors.As(err, &storageFailure) || strings.Contains(err.Error(), "private backend") {
+			t.Fatalf("worker failure was not typed and sanitized: %T %v", err, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker read failure was not observed")
+	}
+	if observerCalls.Load() != 1 {
+		t.Fatalf("failure observer called %d times, want once", observerCalls.Load())
+	}
+	if _, err := service.SchedulingStatus(); !errors.Is(err, errSchedulingRead) || strings.Contains(err.Error(), "private backend") {
+		t.Fatalf("scheduling status exposed storage details or lost the cause: %v", err)
+	}
+	if _, err := service.SubmitBatch(directOrigin(), []c.Call{call("worker-failure-rejected")}); !errors.Is(err, errSchedulingRead) {
+		t.Fatalf("latched worker failure did not reject admission: %v", err)
+	}
+	releaseConnector()
+	if snap := waitState(t, service, "worker-failure-inflight", c.Succeeded); snap.Value.Result == nil {
+		t.Fatal("in-flight invocation did not finish after worker failure")
+	}
+	closeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := service.Close(closeCtx, nil); !errors.Is(err, errSchedulingRead) {
+		t.Fatalf("Close did not preserve first worker failure: %v", err)
+	}
+	closed.Store(true)
+	if observerCalls.Load() != 1 || invokes.Load() != 1 {
+		t.Fatalf("observer/invoke count changed after failure: observers=%d invokes=%d", observerCalls.Load(), invokes.Load())
+	}
+}
+
+func TestSchedulingCommitBusyAndConflictRemainRetryable(t *testing.T) {
+	for _, code := range []string{"busy", "conflict"} {
+		t.Run(code, func(t *testing.T) {
+			f := &fakeConnector{invoke: func(call c.Call, _ c.ReportSink) c.Result {
+				return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{}}
+			}}
+			cat, _, journal, root := fixture(t, f)
+			store := &interceptExecutionStore{
+				ExecutionStore: root.Executions(),
+				failures:       map[c.State]int{c.Preparing: 1},
+				commitFailure:  map[c.State]error{c.Preparing: c.Err(code, "retryable scheduling commit")},
+			}
+			service := invocation.New(store, cat, journal, fixtureAuthority(t))
+			if err := service.Recover(); err != nil {
+				t.Fatal(err)
+			}
+			var observed atomic.Int32
+			if _, err := service.SubmitBatch(directOrigin(), []c.Call{call("retryable-scheduling-commit")}); err != nil {
+				t.Fatal(err)
+			}
+			if err := service.Start(context.Background(), 1, func(error) { observed.Add(1) }); err != nil {
+				t.Fatal(err)
+			}
+			waitState(t, service, "retryable-scheduling-commit", c.Succeeded)
+			if observed.Load() != 0 {
+				t.Fatalf("ordinary %s commit contention was reported as worker failure", code)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := service.Close(ctx, nil); err != nil {
+				t.Fatalf("Close after retryable %s contention: %v", code, err)
+			}
+		})
+	}
+}
+
+func TestWorkerTerminalCommitFailureClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		code          string
+		attempts      int
+		fatal         bool
+		pendingCAS    bool
+	}{
+		{name: "busy with pending save", code: "busy", attempts: 1},
+		{name: "execution CAS exhaustion with pending save", code: "conflict", attempts: 8},
+		{name: "typed storage failure after pending save", code: "storage_write", attempts: 1, fatal: true},
+		{name: "pending CAS exhaustion after execution busy", code: "busy", attempts: 1, fatal: true, pendingCAS: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
+			invoked := make(chan string, 2)
+			f := &fakeConnector{
+				descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}},
+				invoke: func(call c.Call, _ c.ReportSink) c.Result {
+					invoked <- call.ID
+					return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{}}
+				},
+			}
+			cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
+			if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+				t.Fatal(err)
+			}
+			cause := c.Err(tc.code, "terminal execution commit failed")
+			commitErr := error(cause)
+			if tc.fatal && !tc.pendingCAS {
+				commitErr = &c.StorageFailure{Cause: cause}
+			}
+			store := &interceptExecutionStore{
+				ExecutionStore: root.Executions(),
+				failures:       map[c.State]int{c.Succeeded: tc.attempts},
+				commitFailure:  map[c.State]error{c.Succeeded: commitErr},
+			}
+			pendingCause := c.Err("conflict", "pending observation CAS exhausted")
+			if tc.pendingCAS {
+				store.pendingWriteErr = pendingCause
+			}
+			journal := newJournal(t, root, 100)
+			service := invocation.New(store, cat, journal, fixtureAuthority(t))
+			if err := service.Recover(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.SubmitBatch(directOrigin(), []c.Call{call("terminal-first"), call("terminal-second")}); err != nil {
+				t.Fatal(err)
+			}
+			observed := make(chan error, 1)
+			var observerCalls atomic.Int32
+			if err := service.Start(context.Background(), 1, func(err error) {
+				observerCalls.Add(1)
+				observed <- err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case id := <-invoked:
+				if id != "terminal-first" {
+					t.Fatalf("first invocation=%q, want terminal-first", id)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("first terminal connector call did not start")
+			}
+			closeCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+			defer cancel()
+			if tc.fatal {
+				var workerErr error
+				select {
+				case workerErr = <-observed:
+				case <-time.After(time.Second):
+					t.Fatal("typed terminal storage failure was not observed")
+				}
+				wantCause := cause
+				if tc.pendingCAS {
+					var storageFailure *c.StorageFailure
+					if !errors.As(workerErr, &storageFailure) || c.AsFault(storageFailure.Cause).Code != "conflict" || !strings.Contains(storageFailure.Cause.Error(), "Pending observation exceeded CAS retry limit") {
+						t.Fatalf("pending CAS exhaustion cause was not preserved as a typed worker failure: %v", workerErr)
+					}
+				} else if !errors.Is(workerErr, wantCause) {
+					t.Fatalf("terminal storage cause was lost: %v", workerErr)
+				}
+				if observerCalls.Load() != 1 || c.AsFault(workerErr).Code != "storage" {
+					t.Fatalf("typed failure was lost or misclassified: err=%v observerCalls=%d", workerErr, observerCalls.Load())
+				}
+				if err := service.Close(closeCtx, nil); (!tc.pendingCAS && !errors.Is(err, wantCause)) || (tc.pendingCAS && c.AsFault(err).Code != "storage") {
+					t.Fatalf("Close did not preserve first worker storage failure: %v", err)
+				}
+				if tc.pendingCAS {
+					store.mu.Lock()
+					pendingCalls := store.pendingWriteCalls
+					store.mu.Unlock()
+					if pendingCalls != 8 {
+						t.Fatalf("pending persistence CAS attempts=%d, want exactly 8", pendingCalls)
+					}
+				}
+				select {
+				case id := <-invoked:
+					t.Fatalf("fatal worker failure dispatched subsequent call %q", id)
+				default:
+				}
+			} else {
+				select {
+				case id := <-invoked:
+					if id != "terminal-second" {
+						t.Fatalf("terminal apply %s prevented next call: invoked %q", tc.name, id)
+					}
+				case <-time.After(time.Second):
+					t.Fatalf("ordinary %s apply contention became a worker failure", tc.name)
+				}
+				waitState(t, service, "terminal-second", c.Succeeded)
+				if observerCalls.Load() != 0 {
+					t.Fatalf("ordinary %s contention invoked worker observer", tc.name)
+				}
+				if err := service.Close(closeCtx, nil); err != nil {
+					t.Fatalf("Close after ordinary %s contention: %v", tc.name, err)
+				}
+			}
+		})
+	}
+}
+
+func TestWorkerFinishAndPanicPreservePendingReadFailure(t *testing.T) {
+	for _, panicConnector := range []bool{false, true} {
+		name := "finish"
+		if panicConnector {
+			name = "panic recovery"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
+			entered, release := make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			releaseCall := func() { releaseOnce.Do(func() { close(release) }) }
+			t.Cleanup(releaseCall)
+			f := &fakeConnector{
+				descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}},
+				invoke: func(call c.Call, _ c.ReportSink) c.Result {
+					close(entered)
+					<-release
+					if panicConnector {
+						panic("connector panic for pending read failure")
+					}
+					return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{}}
+				},
+			}
+			cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
+			if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+				t.Fatal(err)
+			}
+			store := &interceptExecutionStore{ExecutionStore: root.Executions()}
+			journal := newJournal(t, root, 64)
+			service := invocation.New(store, cat, journal, fixtureAuthority(t))
+			if err := service.Recover(); err != nil {
+				t.Fatal(err)
+			}
+			const callID = "worker-pending-read-failure"
+			if _, err := service.SubmitBatch(directOrigin(), []c.Call{call(callID)}); err != nil {
+				t.Fatal(err)
+			}
+			observed := make(chan error, 1)
+			var observerCalls atomic.Int32
+			if err := service.Start(context.Background(), 1, func(err error) {
+				observerCalls.Add(1)
+				observed <- err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			closeCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+			defer cancel()
+			t.Cleanup(func() { _ = service.Close(closeCtx, nil) })
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("worker connector did not enter")
+			}
+			readCause := errors.New("private pending execution read")
+			store.mu.Lock()
+			store.getErr, store.getErrOnce = &c.StorageFailure{Cause: readCause}, true
+			store.mu.Unlock()
+			releaseCall()
+			var workerErr error
+			select {
+			case workerErr = <-observed:
+			case <-time.After(time.Second):
+				t.Fatal("finish/panic pending read failure did not reach worker observer")
+			}
+			if !errors.Is(workerErr, readCause) || c.AsFault(workerErr).Code != "storage" || observerCalls.Load() != 1 {
+				t.Fatalf("finish/panic lost or misclassified original read cause: err=%v observerCalls=%d", workerErr, observerCalls.Load())
+			}
+			if strings.Contains(workerErr.Error(), readCause.Error()) {
+				t.Fatalf("worker observer exposed private read cause: %v", workerErr)
+			}
+			if err := service.Close(closeCtx, nil); !errors.Is(err, readCause) {
+				t.Fatalf("Close did not preserve finish/panic read cause: %v", err)
+			}
+			if observerCalls.Load() != 1 {
+				t.Fatalf("Close repeated worker observer: %d", observerCalls.Load())
+			}
+		})
+	}
+}
+
+func TestPhysicalSlotOutlivesTerminalObservationAndExpiryBypassesPossibleLimit(t *testing.T) {
+	enteredA, enteredA2, enteredB := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	releaseA := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseA) }) }
+	var aEntered, a2Entered, bEntered sync.Once
+	var aInspect atomic.Int32
+	f := &fakeConnector{
+		invoke: func(call c.Call, _ c.ReportSink) c.Result {
+			switch call.ID {
+			case "slow-a":
+				aEntered.Do(func() { close(enteredA) })
+				<-releaseA
+				return c.Result{CallID: call.ID, State: c.Unknown}
+			case "unknown-b":
+				bEntered.Do(func() { close(enteredB) })
+				return c.Result{CallID: call.ID, State: c.Unknown}
+			case "after-terminal-inspection":
+				a2Entered.Do(func() { close(enteredA2) })
+				return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{}}
+			default:
+				return c.Result{CallID: call.ID, State: c.Failed, Error: &c.Fault{Code: "unexpected_call", Message: "unexpected invocation"}}
+			}
+		},
+		inspect: func(call c.Call) c.Result {
+			state := c.Succeeded
+			if call.ID == "slow-a" && aInspect.Add(1) == 1 {
+				state = c.Running
+			}
+			return c.Result{CallID: call.ID, State: state, Output: c.Data{}}
+		},
+		abort: func(c.Call) (c.AbortObservation, error) { return c.AbortObservation{Requested: true}, nil },
+	}
+	cat, _, journal, root := fixture(t, f)
+	if _, err := cat.Register(context.Background(), c.Registration{ID: "node-b", ConnectorID: "fake", Binding: json.RawMessage(`{"route":"b"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	local := authority.Principal{Namespace: "operators", ID: "local"}
+	grants := []authority.Grant{}
+	for _, id := range []string{"node", "node-b"} {
+		node := authority.Principal{Namespace: "nodes", ID: id}
+		grants = append(grants,
+			authority.Grant{Principal: local, Action: "invoke", Target: node, Operations: []string{"run"}},
+			authority.Grant{Principal: local, Action: "abort", Target: node, Operations: []string{"run"}},
+		)
+	}
+	auth, err := authority.New(grants)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := root.Executions()
+	store := &interceptExecutionStore{ExecutionStore: base}
+	service := invocation.New(store, cat, journal, auth)
+	t.Cleanup(func() {
+		release()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = service.Close(ctx, nil)
+	})
+	policy := invocation.DefaultSchedulingPolicy(3)
+	policy.WaitingLimit = 16
+	policy.PossibleLimit = 2
+	policy.DefaultTarget.WaitingLimit = 16
+	policy.DefaultTarget.PossibleLimit = 1
+	policy.DefaultTarget.ActiveLimit = 1
+	policy.Targets = map[string]invocation.TargetPolicy{
+		(c.Ref{Namespace: "nodes", ID: "node-b"}).Key(): {Weight: 1, WaitingLimit: 16, PossibleLimit: 1, ActiveLimit: 1},
+	}
+	if err := service.SetSchedulingPolicy(policy); err != nil {
+		t.Fatal(err)
+	}
+	blockedA2Read := make(chan struct{})
+	var blockedA2Once sync.Once
+	store.mu.Lock()
+	store.readScheduling = func() (c.SchedulingView, <-chan struct{}, error) {
+		view, wake, err := base.ReadScheduling()
+		if err == nil {
+			for _, candidate := range view.Eligible {
+				if candidate.Call.Subject.ID == "after-terminal-inspection" {
+					blockedA2Once.Do(func() { close(blockedA2Read) })
+				}
+			}
+		}
+		return view, wake, err
+	}
+	store.mu.Unlock()
+	b := call("unknown-b")
+	b.Target = c.Ref{Namespace: "nodes", ID: "node-b"}
+	if _, err := service.SubmitBatch(directOrigin(), []c.Call{call("slow-a"), b}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Start(context.Background(), 3, func(err error) { t.Errorf("unexpected scheduler failure: %v", err) }); err != nil {
+		t.Fatal(err)
+	}
+	for name, ch := range map[string]<-chan struct{}{"slow A": enteredA, "B on another target": enteredB} {
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s did not progress while A was parked", name)
+		}
+	}
+	waitState(t, service, "unknown-b", c.Unknown)
+	status, err := service.SchedulingStatus()
+	if err != nil || status.Possible != 2 || status.Physical == 0 {
+		t.Fatalf("remote-possible calls were not held at the global cap: status=%+v err=%v", status, err)
+	}
+	expiring := call("expires-at-full-possible")
+	expiring.Deadline = c.Now().Add(300 * time.Millisecond)
+	if _, err := service.SubmitBatch(directOrigin(), []c.Call{expiring}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, service, "expires-at-full-possible", c.Expired)
+	if inspected, err := service.Inspect(context.Background(), "unknown-b"); err != nil || inspected.Value.Lifecycle.State != c.Succeeded {
+		t.Fatalf("B terminal inspection failed while A remained active: %+v err=%v", inspected, err)
+	}
+	aborted, err := service.Abort(context.Background(), "slow-a", "hold slot until terminal evidence", nil)
+	if err != nil || aborted.Value.Lifecycle.State != c.Cancelling {
+		t.Fatalf("remote cancellation acknowledgement changed the call unexpectedly: %+v err=%v", aborted, err)
+	}
+	facts, _, _, err := root.Executions().ReadQueueFacts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHeld := func(id string, held bool) {
+		t.Helper()
+		for _, fact := range facts {
+			if fact.Call.Subject.ID == id {
+				if fact.SlotHeld != held {
+					t.Fatalf("call %s held=%v, want %v", id, fact.SlotHeld, held)
+				}
+				return
+			}
+		}
+		t.Fatalf("queue fact for %s missing", id)
+	}
+	assertHeld("slow-a", true)
+	if inspected, err := service.Inspect(context.Background(), "slow-a"); err != nil || inspected.Value.Lifecycle.State != c.Running {
+		t.Fatalf("running inspection after cancel ACK should preserve remote work: %+v err=%v", inspected, err)
+	}
+	if inspected, err := service.Inspect(context.Background(), "slow-a"); err != nil || inspected.Value.Lifecycle.State != c.Succeeded {
+		t.Fatalf("terminal inspection failed: %+v err=%v", inspected, err)
+	}
+	facts, _, _, err = root.Executions().ReadQueueFacts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHeld("slow-a", false)
+	status, err = service.SchedulingStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundPhysicalNode := false
+	for _, target := range status.Targets {
+		if target.Ref.ID == "node" {
+			foundPhysicalNode = true
+			if target.Physical != 1 {
+				t.Fatalf("terminal inspection released the active Invoke physical slot early: %+v", target)
+			}
+		}
+	}
+	if !foundPhysicalNode {
+		t.Fatal("terminal inspection omitted the still-active physical target")
+	}
+	if _, err := service.SubmitBatch(directOrigin(), []c.Call{call("after-terminal-inspection")}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-blockedA2Read:
+	case <-time.After(time.Second):
+		t.Fatal("idle worker did not capture the blocked same-target item")
+	}
+	status, err = service.SchedulingStatus()
+	if err != nil || len(status.Targets) == 0 {
+		t.Fatalf("blocked same-target scheduling evidence is unavailable: %+v err=%v", status, err)
+	}
+	blockedA2 := false
+	for _, target := range status.Targets {
+		if target.Ref.ID != "node" {
+			continue
+		}
+		for _, reason := range target.BlockedReasons {
+			if reason == invocation.BlockTargetActive {
+				blockedA2 = target.Waiting == 1 && target.Physical == 1
+			}
+		}
+	}
+	if !blockedA2 {
+		t.Fatalf("same-target queued work was not held by the physical active limit: %+v", status.Targets)
+	}
+	select {
+	case <-enteredA2:
+		t.Fatal("same-target work started before the physical Invoke returned")
+	default:
+	}
+	release()
+	select {
+	case <-enteredA2:
+	case <-time.After(2 * time.Second):
+		t.Fatal("same-target work did not start after physical slot release")
+	}
+	waitState(t, service, "after-terminal-inspection", c.Succeeded)
+}
+
+func TestSchedulingReadToWaitRootNotifierCannotLoseConcurrentAdmission(t *testing.T) {
+	invoked := make(chan struct{}, 1)
+	f := &fakeConnector{invoke: func(call c.Call, _ c.ReportSink) c.Result {
+		invoked <- struct{}{}
+		return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{}}
+	}}
+	cat, _, journal, root := fixture(t, f)
+	store := &interceptExecutionStore{ExecutionStore: root.Executions()}
+	service := invocation.New(store, cat, journal, fixtureAuthority(t))
+	if err := service.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	captured, release := make(chan struct{}), make(chan struct{})
+	var captureOnce sync.Once
+	store.mu.Lock()
+	store.readScheduling = func() (c.SchedulingView, <-chan struct{}, error) {
+		view, wake, err := root.Executions().ReadScheduling()
+		if err == nil {
+			captureOnce.Do(func() {
+				close(captured)
+				<-release
+			})
+		}
+		return view, wake, err
+	}
+	store.mu.Unlock()
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = service.Close(ctx, nil)
+	})
+	if err := service.Start(context.Background(), 1, func(err error) { t.Errorf("unexpected worker failure: %v", err) }); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-captured:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not capture its scheduling view before waiting")
+	}
+	other := invocation.New(root.Executions(), cat, journal, fixtureAuthority(t))
+	if _, err := other.SubmitBatch(directOrigin(), []c.Call{call("root-notifier-race")}); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	waitState(t, service, "root-notifier-race", c.Succeeded)
+	select {
+	case <-invoked:
+	case <-time.After(time.Second):
+		t.Fatal("admission committed between read and wait was lost")
+	}
+}
+
+func TestSchedulingCASRetryCapturesFreshRootNotifierAfterEightConflicts(t *testing.T) {
+	invoked := make(chan string, 2)
+	f := &fakeConnector{invoke: func(call c.Call, _ c.ReportSink) c.Result {
+		invoked <- call.ID
+		return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{}}
+	}}
+	cat, _, journal, root := fixture(t, f)
+	store := &interceptExecutionStore{
+		ExecutionStore: root.Executions(),
+		failures:       map[c.State]int{c.Preparing: 8},
+		commitFailure:  map[c.State]error{c.Preparing: c.Err("busy", "injected queue contention")},
+	}
+	service := invocation.New(store, cat, journal, fixtureAuthority(t))
+	if err := service.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SubmitBatch(directOrigin(), []c.Call{call("cas-retry-eight")}); err != nil {
+		t.Fatal(err)
+	}
+	freshCaptured, releaseFresh := make(chan struct{}), make(chan struct{})
+	var freshOnce sync.Once
+	store.mu.Lock()
+	store.readScheduling = func() (c.SchedulingView, <-chan struct{}, error) {
+		view, wake, err := root.Executions().ReadScheduling()
+		store.mu.Lock()
+		afterEight := store.failures[c.Preparing] == 0
+		store.mu.Unlock()
+		if err == nil && afterEight {
+			freshOnce.Do(func() {
+				close(freshCaptured)
+				<-releaseFresh
+			})
+		}
+		return view, wake, err
+	}
+	store.mu.Unlock()
+	t.Cleanup(func() {
+		select {
+		case <-releaseFresh:
+		default:
+			close(releaseFresh)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = service.Close(ctx, nil)
+	})
+	if err := service.Start(context.Background(), 1, func(err error) { t.Errorf("ordinary contention became fatal: %v", err) }); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-freshCaptured:
+	case <-time.After(time.Second):
+		t.Fatal("CAS exhaustion did not take a fresh scheduling snapshot")
+	}
+	other := invocation.New(root.Executions(), cat, journal, fixtureAuthority(t))
+	if _, err := other.SubmitBatch(directOrigin(), []c.Call{call("arrived-during-fresh-capture")}); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseFresh)
+	waitState(t, service, "cas-retry-eight", c.Succeeded)
+	waitState(t, service, "arrived-during-fresh-capture", c.Succeeded)
+	seen := map[string]bool{}
+	for range 2 {
+		select {
+		case id := <-invoked:
+			seen[id] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("fresh-notifier wake did not dispatch both calls: %+v", seen)
+		}
+	}
+}
 
 func fault(t *testing.T, err error, code string) {
 	t.Helper()
@@ -229,8 +935,8 @@ func TestCommandNumberGuardRunsBeforeValidatorAndPreservesUseNumber(t *testing.T
 }
 
 func TestMemoryDeliveryCopyAndDigestRetainDecimalTokens(t *testing.T) {
-	store := memory.NewExecutions(1, 1)
-	if err := store.CommitAdmission(c.AdmissionCommit{Changes: queued("json-number-copy"), Deliveries: nil}); err != nil {
+	store := memory.NewExecutions(1)
+	if err := store.CommitAdmission(admissionFor(store, queued("json-number-copy"), nil)); err != nil {
 		t.Fatal(err)
 	}
 	event := c.Event{ID: "number-event", Category: "observation", Payload: c.Data{"integer": json.Number("9007199254740993"), "fraction": json.Number("0.1")}}
@@ -252,9 +958,9 @@ func TestMemoryDeliveryCopyAndDigestRetainDecimalTokens(t *testing.T) {
 }
 
 func TestMemoryDeliveryDigestDistinguishesAdjacentPrivateNodeRevisions(t *testing.T) {
-	store := memory.NewExecutions(2, 2)
+	store := memory.NewExecutions(2)
 	const callID = "dispatch-revision-digest"
-	if err := store.CommitAdmission(c.AdmissionCommit{Changes: queued(callID)}); err != nil {
+	if err := store.CommitAdmission(admissionFor(store, queued(callID), nil)); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := store.Get(c.Ref{Namespace: "calls", ID: callID})
@@ -529,44 +1235,354 @@ func queued(id string) []c.Change[c.Execution] {
 	}
 	return out
 }
-func TestMemoryBatchAllOrNothing(t *testing.T) {
-	for _, tt := range []struct {
-		name           string
-		records, queue int
-	}{{"record capacity", 1, 3}, {"queue capacity", 3, 1}} {
-		t.Run(tt.name, func(t *testing.T) {
-			s := memory.NewExecutions(tt.records, tt.queue)
-			fault(t, s.CommitAdmission(c.AdmissionCommit{Changes: append(queued("a"), queued("b")...), Deliveries: nil}), "busy")
-			if len(mustList(t, s)) != 0 {
-				t.Fatal("partial records after failed batch")
-			}
-			if err := s.CommitAdmission(c.AdmissionCommit{Changes: queued("a"), Deliveries: nil}); err != nil {
-				t.Fatal(err)
-			}
-			fault(t, s.CommitAdmission(c.AdmissionCommit{Changes: queued("a"), Deliveries: nil}), "conflict")
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			id, err := s.Claim(ctx)
-			if err != nil || id != "a" {
-				t.Fatalf("claim %q: %v", id, err)
-			}
-			ctx2, cancel2 := context.WithCancel(context.Background())
-			cancel2()
-			if id, err := s.Claim(ctx2); err == nil {
-				t.Fatalf("failed batch leaked queue entry %q", id)
-			}
-		})
+
+func admissionFor(store c.ExecutionStore, changes []c.Change[c.Execution], deliveries []c.Delivery) c.AdmissionCommit {
+	commit := c.AdmissionCommit{Changes: changes, Deliveries: deliveries}
+	if len(changes) == 0 {
+		return commit
 	}
-	s := memory.NewExecutions(4, 4)
-	fault(t, s.CommitAdmission(c.AdmissionCommit{Changes: append(queued("same"), queued("same")...), Deliveries: nil}), "conflict")
+	view, _, err := store.ReadScheduling()
+	if err != nil {
+		panic(err)
+	}
+	final := map[string]c.Change[c.Execution]{}
+	newCall := map[string]bool{}
+	for _, change := range changes {
+		if change.Before == nil {
+			newCall[change.After.Call.ID] = true
+		}
+		final[change.After.Call.ID] = change
+	}
+	for id, change := range final {
+		if !newCall[id] {
+			continue
+		}
+		metadata := c.QueueMetadata{Admission: c.RevisionRef{Subject: change.Subject, Revision: change.AfterRevision}, At: change.At}
+		commit.Queue = append(commit.Queue, c.QueueMutation{CallID: id, Present: true, Metadata: &metadata})
+	}
+	commit.Scheduling = &c.SchedulingMutation{ExpectedRevision: view.Revision}
+	return commit
+}
+
+func prepareForDispatch(t *testing.T, store c.ExecutionStore, current c.Snapshot[c.Execution]) c.Snapshot[c.Execution] {
+	t.Helper()
+	prepared := lifecycle.Observe(current, c.Report{Evidence: c.Evidence{CallID: current.Value.Call.ID, Local: true, Confirmed: true}, State: c.Preparing})
+	if prepared.Err != nil {
+		t.Fatal(prepared.Err)
+	}
+	scheduling, _, err := store.ReadScheduling()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = store.Commit(c.ExecutionMutation{
+		Subject: current.Subject, ExpectedRevision: current.Revision,
+		Changes: prepared.Changes, Deliveries: prepared.Deliveries,
+		Queue:      &c.QueueMutation{CallID: current.Value.Call.ID, Present: false, SlotHeld: true},
+		Scheduling: &c.SchedulingMutation{ExpectedRevision: scheduling.Revision},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return current
+}
+
+func TestMemoryBatchAllOrNothing(t *testing.T) {
+	s := memory.NewExecutions(1)
+	fault(t, s.CommitAdmission(admissionFor(s, append(queued("a"), queued("b")...), nil)), "busy")
 	if len(mustList(t, s)) != 0 {
+		t.Fatal("partial records after failed batch")
+	}
+	if err := s.CommitAdmission(admissionFor(s, queued("a"), nil)); err != nil {
+		t.Fatal(err)
+	}
+	fault(t, s.CommitAdmission(admissionFor(s, queued("a"), nil)), "conflict")
+	s2 := memory.NewExecutions(4)
+	fault(t, s2.CommitAdmission(admissionFor(s2, append(queued("same"), queued("same")...), nil)), "conflict")
+	if len(mustList(t, s2)) != 0 {
 		t.Fatal("duplicate batch partially committed")
 	}
 }
 
+func TestReadSchedulingRejectsMoreThanRetainedExecutionBound(t *testing.T) {
+	const count = 1001
+	root := memory.NewRoot(memory.Limits{Nodes: 1, Subscriptions: 1, Conversations: 1, Calls: count})
+	var changes []c.Change[c.Execution]
+	for i := 0; i < count; i++ {
+		changes = append(changes, queued(fmt.Sprintf("bounded-queue-%04d", i))...)
+	}
+	if err := root.Executions().CommitAdmission(admissionFor(root.Executions(), changes, nil)); err != nil {
+		t.Fatalf("seed over-bound retained queue: %v", err)
+	}
+	if _, _, err := root.Executions().ReadScheduling(); err == nil || c.AsFault(err).Code != "busy" {
+		t.Fatalf("ReadScheduling accepted an over-bound retained queue: %v", err)
+	}
+}
+
+func TestSchedulingIWRRAndExpiredActionFeasibility(t *testing.T) {
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	a := c.Ref{Namespace: "nodes", ID: "A"}
+	b := c.Ref{Namespace: "nodes", ID: "B"}
+	policy := invocation.SchedulingPolicy{WaitingLimit: 16, PossibleLimit: 16, AgingAfter: time.Minute, Targets: map[string]invocation.TargetPolicy{
+		a.Key(): {Weight: 2, WaitingLimit: 8, PossibleLimit: 4, ActiveLimit: 2},
+		b.Key(): {Weight: 1, WaitingLimit: 8, PossibleLimit: 4, ActiveLimit: 2},
+	}, DefaultTarget: invocation.TargetPolicy{Weight: 1, WaitingLimit: 8, PossibleLimit: 4, ActiveLimit: 2}}
+	view := c.SchedulingView{Eligible: []c.QueueCandidate{
+		{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "a1"}, Revision: 4}, Target: a, Sequence: 1, EnqueuedAt: now, Deadline: now.Add(time.Hour)},
+		{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "a2"}, Revision: 4}, Target: a, Sequence: 2, EnqueuedAt: now, Deadline: now.Add(time.Hour)},
+		{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "b1"}, Revision: 4}, Target: b, Sequence: 3, EnqueuedAt: now, Deadline: now.Add(time.Hour)},
+	}}
+	want := []string{"A", "B", "A", "A", "B", "A"}
+	for i, target := range want {
+		action, ok := invocation.SelectScheduling(view, policy, map[string]uint32{}, 4, now)
+		if !ok {
+			t.Fatalf("selection %d missing", i)
+		}
+		if action.Candidate.Target.ID != target {
+			t.Fatalf("selection %d target=%s want %s", i, action.Candidate.Target.ID, target)
+		}
+		view.Cursor = action.Cursor
+	}
+
+	blocked := c.SchedulingView{Eligible: []c.QueueCandidate{
+		{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "live"}, Revision: 2}, Target: a, Sequence: 1, EnqueuedAt: now.Add(-time.Hour), Deadline: now.Add(time.Hour)},
+		{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "expired"}, Revision: 2}, Target: a, Sequence: 2, EnqueuedAt: now.Add(-time.Hour), Deadline: now.Add(-time.Second)},
+	}}
+	action, ok := invocation.SelectScheduling(blocked, policy, map[string]uint32{a.Key(): 2}, 4, now)
+	if !ok || !action.Expired || action.Candidate.Call.Subject.ID != "expired" {
+		t.Fatalf("expired work was blocked by aged live work: %+v, %v", action, ok)
+	}
+
+	equal := invocation.CopySchedulingPolicy(policy)
+	equal.Targets[a.Key()] = invocation.TargetPolicy{Weight: 1, WaitingLimit: 8, PossibleLimit: 4, ActiveLimit: 2}
+	equal.Targets[b.Key()] = invocation.TargetPolicy{Weight: 1, WaitingLimit: 8, PossibleLimit: 4, ActiveLimit: 2}
+	equalView := c.SchedulingView{Eligible: []c.QueueCandidate{
+		{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "equal-a"}, Revision: 1}, Target: a, Sequence: 1, EnqueuedAt: now, Deadline: now.Add(time.Hour)},
+		{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "equal-b"}, Revision: 1}, Target: b, Sequence: 2, EnqueuedAt: now, Deadline: now.Add(time.Hour)},
+	}}
+	for i, target := range []string{"A", "B", "A", "B"} {
+		action, ok := invocation.SelectScheduling(equalView, equal, nil, 2, now)
+		if !ok || action.Candidate.Target.ID != target {
+			t.Fatalf("equal-weight selection %d = %+v, %v; want %s", i, action, ok, target)
+		}
+		equalView.Cursor = action.Cursor
+	}
+
+	aged := c.SchedulingView{Eligible: []c.QueueCandidate{
+		{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "aged-old"}, Revision: 1}, Target: a, Sequence: 5, EnqueuedAt: now.Add(-time.Minute), Deadline: now.Add(time.Hour)},
+		{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "aged-new"}, Revision: 1}, Target: a, Sequence: 6, EnqueuedAt: now.Add(-40 * time.Second), Deadline: now.Add(time.Second)},
+		{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "edf"}, Revision: 1}, Target: a, Sequence: 1, EnqueuedAt: now, Deadline: now.Add(-time.Second)},
+	}}
+	action, ok = invocation.SelectScheduling(aged, policy, nil, 4, now)
+	if !ok || action.Candidate.Call.Subject.ID != "aged-old" {
+		t.Fatalf("aging did not preserve admission order ahead of EDF and expired work: %+v, %v", action, ok)
+	}
+	aged.Eligible = aged.Eligible[2:]
+	action, ok = invocation.SelectScheduling(aged, policy, nil, 4, now)
+	if !ok || !action.Expired || action.Candidate.Call.Subject.ID != "edf" {
+		t.Fatalf("expired work did not remain independently feasible after one aged action: %+v, %v", action, ok)
+	}
+
+	t.Run("intermittent target keeps its fixed sixteen-to-one weight", func(t *testing.T) {
+		weighted := invocation.CopySchedulingPolicy(equal)
+		weighted.Targets[a.Key()] = invocation.TargetPolicy{Weight: 16, WaitingLimit: 8, PossibleLimit: 4, ActiveLimit: 2}
+		weighted.Targets[b.Key()] = invocation.TargetPolicy{Weight: 1, WaitingLimit: 8, PossibleLimit: 4, ActiveLimit: 2}
+		view := c.SchedulingView{Eligible: []c.QueueCandidate{
+			{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "wa"}, Revision: 1}, Target: a, Sequence: 1, EnqueuedAt: now, Deadline: now.Add(time.Hour)},
+			{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "wb"}, Revision: 1}, Target: b, Sequence: 2, EnqueuedAt: now, Deadline: now.Add(time.Hour)},
+		}}
+		var selectedB []int
+		for i := 0; i < 36; i++ {
+			action, ok := invocation.SelectScheduling(view, weighted, nil, 2, now)
+			if !ok {
+				t.Fatalf("weighted selection %d missing", i)
+			}
+			if action.Candidate.Target.ID == "B" {
+				selectedB = append(selectedB, i)
+			}
+			view.Cursor = action.Cursor
+		}
+		if !reflect.DeepEqual(selectedB, []int{1, 18, 35}) {
+			t.Fatalf("16:1 scheduling positions=%v, want [1 18 35]", selectedB)
+		}
+		view.Cursor = c.SchedulingCursor{Round: 1, AfterTarget: a}
+		bCandidate := view.Eligible[1]
+		view.Eligible = view.Eligible[:1] // B is temporarily absent, but policy weight remains fixed.
+		for i := 0; i < 16; i++ {
+			action, ok := invocation.SelectScheduling(view, weighted, nil, 2, now)
+			if !ok || action.Candidate.Target.ID != "A" {
+				t.Fatalf("selection while B was absent %d = %+v, %v", i, action, ok)
+			}
+			view.Cursor = action.Cursor
+		}
+		view.Eligible = append(view.Eligible, bCandidate)
+		for i := 0; i < 3; i++ {
+			action, ok := invocation.SelectScheduling(view, weighted, nil, 2, now)
+			if !ok {
+				t.Fatalf("selection after B rejoined the active set %d missing", i)
+			}
+			if action.Candidate.Target.ID == "B" {
+				break
+			}
+			view.Cursor = action.Cursor
+			if i == 2 {
+				t.Fatal("rejoined B did not receive its fixed-round opportunity")
+			}
+		}
+	})
+
+	t.Run("removed cursor target wraps and weight shrink remains selectable", func(t *testing.T) {
+		shrunk := invocation.CopySchedulingPolicy(equal)
+		shrunk.Targets[a.Key()] = invocation.TargetPolicy{Weight: 1, WaitingLimit: 8, PossibleLimit: 4, ActiveLimit: 2}
+		shrunk.Targets[b.Key()] = invocation.TargetPolicy{Weight: 2, WaitingLimit: 8, PossibleLimit: 4, ActiveLimit: 2}
+		missing := c.Ref{Namespace: "nodes", ID: "removed"}
+		view := c.SchedulingView{
+			Eligible: []c.QueueCandidate{{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "after-change"}, Revision: 1}, Target: a, Sequence: 1, EnqueuedAt: now, Deadline: now.Add(time.Hour)}},
+			Cursor: c.SchedulingCursor{Round: 16, AfterTarget: missing},
+		}
+		action, ok := invocation.SelectScheduling(view, shrunk, nil, 2, now)
+		if !ok || action.Candidate.Target.ID != "A" {
+			t.Fatalf("selection after target-set/weight change=%+v, %v", action, ok)
+		}
+	})
+
+	t.Run("default high-weight target remains in the fixed round maximum while intermittent", func(t *testing.T) {
+		cTarget := c.Ref{Namespace: "nodes", ID: "C"}
+		fixed := invocation.SchedulingPolicy{
+			WaitingLimit: 16, PossibleLimit: 16, AgingAfter: time.Minute,
+			DefaultTarget: invocation.TargetPolicy{Weight: 16, WaitingLimit: 8, PossibleLimit: 4, ActiveLimit: 2},
+			Targets: map[string]invocation.TargetPolicy{
+				a.Key():       {Weight: 1, WaitingLimit: 8, PossibleLimit: 4, ActiveLimit: 2},
+				cTarget.Key(): {Weight: 1, WaitingLimit: 8, PossibleLimit: 4, ActiveLimit: 2},
+			},
+		}
+		makeCandidate := func(id string, target c.Ref, sequence uint64) c.QueueCandidate {
+			return c.QueueCandidate{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: id}, Revision: 1}, Target: target, Sequence: sequence, EnqueuedAt: now, Deadline: now.Add(time.Hour)}
+		}
+		bTarget := c.Ref{Namespace: "nodes", ID: "B"}
+		view := c.SchedulingView{Cursor: c.SchedulingCursor{Round: 16, AfterTarget: bTarget}, Eligible: []c.QueueCandidate{
+			makeCandidate("fixed-a", a, 1), makeCandidate("fixed-c", cTarget, 2),
+		}}
+		action, ok := invocation.SelectScheduling(view, fixed, nil, 2, now)
+		if !ok || action.Candidate.Target.ID != "A" || action.Cursor.Round != 1 {
+			t.Fatalf("absent default-weight target changed the fixed round maximum: %+v, %v", action, ok)
+		}
+		view.Cursor = action.Cursor
+		for cycle := 0; cycle < 3; cycle++ {
+			view.Eligible = append(view.Eligible, makeCandidate(fmt.Sprintf("fixed-b-%d", cycle), bTarget, uint64(3+cycle)))
+			selectedB := false
+			for step := 0; step < 18; step++ {
+				action, ok = invocation.SelectScheduling(view, fixed, nil, 2, now)
+				if !ok {
+					t.Fatalf("B rejoin cycle %d step %d had no action", cycle, step)
+				}
+				view.Cursor = action.Cursor
+				if action.Candidate.Target.ID == "B" {
+					selectedB = true
+					break
+				}
+			}
+			if !selectedB {
+				t.Fatalf("intermittent default-weight B starved in cycle %d", cycle)
+			}
+			filtered := view.Eligible[:0]
+			for _, candidate := range view.Eligible {
+				if candidate.Target.ID != "B" {
+					filtered = append(filtered, candidate)
+				}
+			}
+			view.Eligible = filtered
+		}
+	})
+
+	t.Run("unaged candidates use earliest deadline before sequence", func(t *testing.T) {
+		view := c.SchedulingView{Eligible: []c.QueueCandidate{
+			{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "later-deadline"}, Revision: 1}, Target: a, Sequence: 1, EnqueuedAt: now, Deadline: now.Add(time.Hour)},
+			{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "earlier-deadline"}, Revision: 1}, Target: a, Sequence: 9, EnqueuedAt: now, Deadline: now.Add(time.Minute)},
+		}}
+		action, ok := invocation.SelectScheduling(view, equal, nil, 2, now)
+		if !ok || action.Candidate.Call.Subject.ID != "earlier-deadline" {
+			t.Fatalf("EDF selection=%+v, %v; want earlier deadline", action, ok)
+		}
+	})
+
+	t.Run("expired flood drains despite saturated remote permits", func(t *testing.T) {
+		limited := invocation.CopySchedulingPolicy(policy)
+		limited.PossibleLimit = 1
+		limited.Targets[a.Key()] = invocation.TargetPolicy{Weight: 2, WaitingLimit: 8, PossibleLimit: 1, ActiveLimit: 1}
+		limited.Targets[b.Key()] = invocation.TargetPolicy{Weight: 1, WaitingLimit: 8, PossibleLimit: 1, ActiveLimit: 1}
+		view := c.SchedulingView{Held: []c.TargetCount{{Target: a, Count: 1}}, Eligible: []c.QueueCandidate{
+			{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "expired-1"}, Revision: 1}, Target: a, Sequence: 1, EnqueuedAt: now.Add(-time.Hour), Deadline: now.Add(-time.Minute)},
+			{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "expired-2"}, Revision: 1}, Target: a, Sequence: 2, EnqueuedAt: now.Add(-time.Hour), Deadline: now.Add(-time.Second)},
+			{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "expired-3"}, Revision: 1}, Target: a, Sequence: 3, EnqueuedAt: now.Add(-time.Hour), Deadline: now.Add(-time.Millisecond)},
+			{Call: c.RevisionRef{Subject: c.Ref{Namespace: "calls", ID: "live"}, Revision: 1}, Target: b, Sequence: 4, EnqueuedAt: now, Deadline: now.Add(time.Hour)},
+		}}
+		physical := map[string]uint32{a.Key(): 1}
+		remove := func(id string) {
+			filtered := view.Eligible[:0]
+			for _, candidate := range view.Eligible {
+				if candidate.Call.Subject.ID != id {
+					filtered = append(filtered, candidate)
+				}
+			}
+			view.Eligible = filtered
+		}
+		for i, want := range []string{"expired-1"} {
+			action, ok := invocation.SelectScheduling(view, limited, physical, 2, now)
+			if !ok || !action.Expired || action.Candidate.Call.Subject.ID != want {
+				t.Fatalf("expired candidate %d did not progress through saturated permits: %+v, %v; want %s", i, action, ok, want)
+			}
+			remove(want)
+			view.Cursor = action.Cursor
+		}
+		view.Held = nil
+		live, ok := invocation.SelectScheduling(view, limited, physical, 2, now)
+		if !ok || live.Expired || live.Candidate.Call.Subject.ID != "live" {
+			t.Fatalf("aged live target lost its opportunity amid remaining expired work: %+v, %v", live, ok)
+		}
+		remove("live")
+		view.Cursor = live.Cursor
+		view.Held = []c.TargetCount{{Target: a, Count: 1}}
+		for i, want := range []string{"expired-2", "expired-3"} {
+			action, ok := invocation.SelectScheduling(view, limited, physical, 2, now)
+			if !ok || !action.Expired || action.Candidate.Call.Subject.ID != want {
+				t.Fatalf("expired candidate %d did not progress through saturated permits: %+v, %v; want %s", i+1, action, ok, want)
+			}
+			remove(want)
+			view.Cursor = action.Cursor
+		}
+	})
+
+	t.Run("target waiting admission rejects a mixed batch atomically", func(t *testing.T) {
+		_, calls, _, root := fixture(t, &fakeConnector{})
+		if err := calls.Recover(); err != nil {
+			t.Fatal(err)
+		}
+		limited := invocation.DefaultSchedulingPolicy(2)
+		limited.WaitingLimit = 4 // Leave global room so the target bound is decisive.
+		limited.DefaultTarget.WaitingLimit = 1
+		if err := calls.SetSchedulingPolicy(limited); err != nil {
+			t.Fatal(err)
+		}
+		beforeOutbox, err := root.Executions().PendingDeliveryCount()
+		if err != nil {
+			t.Fatal(err)
+		}
+		batch := []c.Call{call("target-wait-first"), call("target-wait-second")}
+		if _, err := calls.SubmitBatch(directOrigin(), batch); err == nil || c.AsFault(err).Code != "busy" {
+			t.Fatalf("batch exceeded target waiting capacity without rejection: %v", err)
+		}
+		stored, err := root.Executions().List()
+		view, _, viewErr := root.Executions().ReadScheduling()
+		pending, pendingErr := root.Executions().PendingDeliveryCount()
+		if err != nil || viewErr != nil || pendingErr != nil || len(stored) != 0 || len(view.Eligible) != 0 || pending != beforeOutbox {
+			t.Fatalf("target-capacity rejection partially admitted the batch: calls=%d eligible=%d outbox=%d/%d errors=%v/%v/%v", len(stored), len(view.Eligible), beforeOutbox, pending, err, viewErr, pendingErr)
+		}
+	})
+}
+
 func TestPendingObservationStoreCASCopyAndAtomicConsumption(t *testing.T) {
-	store := memory.NewExecutions(2, 2)
-	if err := store.CommitAdmission(c.AdmissionCommit{Changes: queued("pending-cas"), Deliveries: nil}); err != nil {
+	store := memory.NewExecutions(2)
+	if err := store.CommitAdmission(admissionFor(store, queued("pending-cas"), nil)); err != nil {
 		t.Fatal(err)
 	}
 	old, err := store.Get(c.Ref{Namespace: "calls", ID: "pending-cas"})
@@ -643,8 +1659,8 @@ func TestPendingObservationStoreCASCopyAndAtomicConsumption(t *testing.T) {
 }
 
 func TestTerminalDeliveryUsesAdmissionReservationWhenGeneralOutboxIsFull(t *testing.T) {
-	store := memory.NewExecutions(1, 1)
-	if err := store.CommitAdmission(c.AdmissionCommit{Changes: queued("reserved-terminal"), Deliveries: nil}); err != nil {
+	store := memory.NewExecutions(1)
+	if err := store.CommitAdmission(admissionFor(store, queued("reserved-terminal"), nil)); err != nil {
 		t.Fatal(err)
 	}
 	ref := c.Ref{Namespace: "calls", ID: "reserved-terminal"}
@@ -695,8 +1711,8 @@ func TestTerminalDeliveryUsesAdmissionReservationWhenGeneralOutboxIsFull(t *test
 }
 
 func TestReconciledTerminalBundleUsesAdmissionReservationWhenGeneralOutboxIsFull(t *testing.T) {
-	store := memory.NewExecutions(1, 1)
-	if err := store.CommitAdmission(c.AdmissionCommit{Changes: queued("reserved-reconcile"), Deliveries: nil}); err != nil {
+	store := memory.NewExecutions(1)
+	if err := store.CommitAdmission(admissionFor(store, queued("reserved-reconcile"), nil)); err != nil {
 		t.Fatal(err)
 	}
 	ref := c.Ref{Namespace: "calls", ID: "reserved-reconcile"}
@@ -742,8 +1758,8 @@ func TestReconciledTerminalBundleUsesAdmissionReservationWhenGeneralOutboxIsFull
 }
 
 func TestReservedReceiptsDoNotExhaustGeneralAckFIFO(t *testing.T) {
-	store := memory.NewExecutions(1, 1)
-	if err := store.CommitAdmission(c.AdmissionCommit{Changes: queued("separate-receipts"), Deliveries: nil}); err != nil {
+	store := memory.NewExecutions(1)
+	if err := store.CommitAdmission(admissionFor(store, queued("separate-receipts"), nil)); err != nil {
 		t.Fatal(err)
 	}
 	ref := c.Ref{Namespace: "calls", ID: "separate-receipts"}
@@ -863,7 +1879,7 @@ func fixture(t *testing.T, f *fakeConnector) (*catalog.Service, *invocation.Serv
 	if f.descriptor.Operations == nil {
 		f.descriptor = c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}`), OutputSchema: json.RawMessage(`{"type":"object"}`), Capabilities: c.Capabilities{Abort: true, Inspect: true}}}, Events: map[string]c.Schema{"complete": json.RawMessage(`{"type":"object"}`)}}
 	}
-	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 32, Conversations: 16, Calls: 32, Queue: 32})
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 32, Conversations: 16, Calls: 32})
 	j := newJournal(t, root, 1000)
 	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{"secret":"private"}`)}); err != nil {
@@ -901,6 +1917,58 @@ func fixture(t *testing.T, f *fakeConnector) (*catalog.Service, *invocation.Serv
 	t.Cleanup(stopDrain)
 	return cat, calls, j, root
 }
+
+type queueMetadataOmittingStore struct {
+	c.ExecutionStore
+	callID string
+	mutate func([]c.QueueFact)
+}
+
+func (s *queueMetadataOmittingStore) ReadQueueFacts() ([]c.QueueFact, uint64, uint64, error) {
+	facts, count, revision, err := s.ExecutionStore.ReadQueueFacts()
+	if err == nil {
+		if s.mutate != nil {
+			s.mutate(facts)
+		}
+		for i := range facts {
+			if facts[i].Call.Subject.ID == s.callID {
+				facts[i].Metadata = nil
+			}
+		}
+	}
+	return facts, count, revision, err
+}
+
+type queueSchedulingRaceStore struct {
+	c.ExecutionStore
+	target      c.Ref
+	once        sync.Once
+	mu          sync.Mutex
+	changed     bool
+	injectedErr error
+}
+
+func (s *queueSchedulingRaceStore) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], error) {
+	if m.Queue != nil && m.Scheduling != nil && m.Scheduling.Cursor == nil {
+		s.once.Do(func() {
+			view, _, err := s.ExecutionStore.ReadScheduling()
+			if err != nil {
+				return
+			}
+			cursor := c.SchedulingCursor{Round: 1, AfterTarget: s.target}
+			_, injectedErr := s.ExecutionStore.Commit(c.ExecutionMutation{
+				Subject: m.Subject, ExpectedRevision: m.ExpectedRevision,
+				Queue:      &c.QueueMutation{CallID: m.Queue.CallID, Present: m.Queue.Present, SlotHeld: m.Queue.SlotHeld},
+				Scheduling: &c.SchedulingMutation{ExpectedRevision: view.Revision, Cursor: &cursor},
+			})
+			s.mu.Lock()
+			s.injectedErr = injectedErr
+			s.changed = injectedErr == nil
+			s.mu.Unlock()
+		})
+	}
+	return s.ExecutionStore.Commit(m)
+}
 func newJournal(t *testing.T, root *memory.Root, capacity int) *observation.Journal {
 	t.Helper()
 	journal, err := observation.NewWithStore(root.Journal(), capacity)
@@ -934,7 +2002,7 @@ func (s *journalProbeStore) Commit(mutation observation.JournalMutation) error {
 }
 
 func TestJournalRuntimeReadsStayBoundedAndDoNotReload(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Calls: 2, Queue: 2})
+	root := memory.NewRoot(memory.Limits{Calls: 2})
 	probe := &journalProbeStore{inner: root.Journal()}
 	journal, err := observation.NewWithStore(probe, 600)
 	if err != nil || probe.loads != 1 {
@@ -964,7 +2032,7 @@ func TestJournalRuntimeReadsStayBoundedAndDoNotReload(t *testing.T) {
 }
 
 func TestMemoryJournalSequenceWindowBoundaries(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Calls: 4, Queue: 4})
+	root := memory.NewRoot(memory.Limits{Calls: 4})
 	journal := newJournal(t, root, 3)
 	for _, id := range []string{"window-a", "window-b", "window-c"} {
 		if err := journal.Append(c.Event{ID: id, Name: "window", Category: "observation", Payload: c.Data{}}); err != nil {
@@ -1010,7 +2078,7 @@ func TestMemoryJournalSequenceWindowBoundaries(t *testing.T) {
 }
 
 func TestJournalPinOwnershipAndAppendSemantics(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Calls: 4, Queue: 4})
+	root := memory.NewRoot(memory.Limits{Calls: 4})
 	journal := newJournal(t, root, 2)
 	direct := c.Event{ID: "direct-record", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "direct", Category: "observation", Payload: c.Data{}}
 	if err := journal.Record(direct, ""); err != nil {
@@ -1144,7 +2212,7 @@ func TestJournalPinOwnershipAndAppendSemantics(t *testing.T) {
 		{name: "same_owner_different_content", storedOwner: "owner-a", replayOwner: "owner-a", changeContent: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			caseRoot := memory.NewRoot(memory.Limits{Calls: 4, Queue: 8})
+			caseRoot := memory.NewRoot(memory.Limits{Calls: 4})
 			caseJournal := newJournal(t, caseRoot, 8)
 			event := c.Event{ID: c.ID("owner-guard", tc.name), Source: direct.Source, Name: "owner-guard", Category: "observation", Payload: c.Data{"value": "same"}}
 			if tc.storedOwner != "" {
@@ -1182,7 +2250,7 @@ func TestJournalPinOwnershipAndAppendSemantics(t *testing.T) {
 }
 
 func TestJournalAppendRejectsNonJSONEventWithoutMutation(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Calls: 4, Queue: 4})
+	root := memory.NewRoot(memory.Limits{Calls: 4})
 	journal := newJournal(t, root, 2)
 	before, err := root.Journal().Load()
 	if err != nil {
@@ -1198,7 +2266,7 @@ func TestJournalAppendRejectsNonJSONEventWithoutMutation(t *testing.T) {
 }
 
 func TestJournalStoreRejectsReceiptLineageMetadataTampering(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Calls: 2, Queue: 2})
+	root := memory.NewRoot(memory.Limits{Calls: 2})
 	newJournal(t, root, 4)
 	before, err := root.Journal().Load()
 	if err != nil {
@@ -1219,7 +2287,7 @@ func TestJournalStoreRejectsReceiptLineageMetadataTampering(t *testing.T) {
 func BenchmarkJournalRecordAckRetention(b *testing.B) {
 	for _, capacity := range []int{64, 5000} {
 		b.Run(fmt.Sprintf("capacity=%d", capacity), func(b *testing.B) {
-			root := memory.NewRoot(memory.Limits{Calls: 8, Queue: 8})
+			root := memory.NewRoot(memory.Limits{Calls: 8})
 			journal, err := observation.NewWithStore(root.Journal(), capacity)
 			if err != nil {
 				b.Fatal(err)
@@ -1250,7 +2318,7 @@ func BenchmarkJournalRecordAckRetention(b *testing.B) {
 }
 
 func TestAckWithoutExplicitReleaseIDsReleasesAllOwnedProjections(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Calls: 2, Queue: 2})
+	root := memory.NewRoot(memory.Limits{Calls: 2})
 	journal := newJournal(t, root, 8)
 	original := c.Event{ID: "published-original", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "source-event", Category: "published", CallID: "origin-call", ConversationID: "origin-conversation", Payload: c.Data{}}
 	delivery := c.Delivery{ID: "publish-owner", Kind: c.DeliveryPublish, Event: &original}
@@ -1284,7 +2352,7 @@ func TestAckWithoutExplicitReleaseIDsReleasesAllOwnedProjections(t *testing.T) {
 }
 
 func TestFailedRejectionAckKeepsPinsUntilChangedDispositionRetry(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Calls: 2, Queue: 2})
+	root := memory.NewRoot(memory.Limits{Calls: 2})
 	firstJournal := newJournal(t, root, 8)
 	original := c.Event{ID: "replay-published", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "event", Category: "published", Payload: c.Data{}}
 	delivery := c.Delivery{ID: "replay-owner", Kind: c.DeliveryPublish, Event: &original}
@@ -1329,7 +2397,7 @@ func TestConfigurationApplyCommitsSevenIntentsAtomically(t *testing.T) {
 	sub := c.Subscription{ID: "atomic-sub", Source: c.Ref{Namespace: "nodes", ID: "source"}, Event: "event", Target: c.Ref{Namespace: "nodes", ID: "target"}, Operation: "run"}
 	change := lifecycle.Create(c.Ref{Namespace: "subscriptions", ID: sub.ID}, sub, "subscription.created")
 	change.At = changeAt
-	root := memory.NewRoot(memory.Limits{Subscriptions: 1, Queue: 9000})
+	root := memory.NewRoot(memory.Limits{Subscriptions: 1})
 	if _, err := lifecycle.Commit(root.Subscriptions(), change); err != nil {
 		t.Fatal(err)
 	}
@@ -1362,7 +2430,7 @@ func TestConfigurationApplyCommitsSevenIntentsAtomically(t *testing.T) {
 	if listErr != nil || len(standaloneItems) != 0 {
 		t.Fatalf("non-root Store partially applied an intent-bearing change: %d %v", len(standaloneItems), listErr)
 	}
-	registrationRoot := memory.NewRoot(memory.Limits{Nodes: 1, Queue: 16})
+	registrationRoot := memory.NewRoot(memory.Limits{Nodes: 1})
 	connector := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}}}
 	catalogue := catalog.New(registrationRoot.Nodes(), map[string]c.Connector{"fake": connector}, schema.New())
 	registeredAfterApply := false
@@ -1375,7 +2443,7 @@ func TestConfigurationApplyCommitsSevenIntentsAtomically(t *testing.T) {
 		t.Fatalf("OnRegistered ran before the configuration transaction committed: callback=%v err=%v", registeredAfterApply, err)
 	}
 
-	capacityRoot := memory.NewRoot(memory.Limits{Subscriptions: 0, Queue: 9000})
+	capacityRoot := memory.NewRoot(memory.Limits{Subscriptions: 0})
 	_, beforeRevision, err := capacityRoot.Admissions().ReadSubscriptions()
 	if err != nil {
 		t.Fatal(err)
@@ -1390,7 +2458,7 @@ func TestConfigurationApplyCommitsSevenIntentsAtomically(t *testing.T) {
 		t.Fatalf("capacity failure partially applied: items=%d outbox=%d setrev=%d/%d errors=%v %v %v", len(items), pendingCount, beforeRevision, afterRevision, err, countErr, revisionErr)
 	}
 
-	outboxRoot := memory.NewRoot(memory.Limits{Subscriptions: 1, Queue: 9000})
+	outboxRoot := memory.NewRoot(memory.Limits{Subscriptions: 1})
 	filler := make([]c.Delivery, 8186)
 	for i := range filler {
 		event := c.Event{ID: c.ID("atomic-fill", fmt.Sprint(i)), Name: "fill", Category: "observation", Payload: c.Data{}}
@@ -1422,7 +2490,7 @@ func TestHostShutdownUsesInstanceCapabilityWithoutAbortGrant(t *testing.T) {
 	if f.descriptor.Operations == nil {
 		f.descriptor = c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}`), OutputSchema: json.RawMessage(`{"type":"object"}`), Capabilities: c.Capabilities{Abort: true, Inspect: true}}}}
 	}
-	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8})
 	journal := newJournal(t, root, 100)
 	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
@@ -1467,7 +2535,9 @@ func waitState(t *testing.T, s *invocation.Service, id string, want c.State) c.S
 }
 func start(t *testing.T, s *invocation.Service) {
 	t.Helper()
-	s.Start(context.Background(), 1)
+	if err := s.Start(context.Background(), 1, func(error) {}); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
@@ -1857,6 +2927,10 @@ func TestReportSinkRejectsTerminalResultAndForeignCallIdentity(t *testing.T) {
 type interceptExecutionStore struct {
 	c.ExecutionStore
 	mu                sync.Mutex
+	readScheduling    func() (c.SchedulingView, <-chan struct{}, error)
+	listReads         int
+	schedulingReads   int
+	commitFailure     map[c.State]error
 	listErr           error
 	getErr            error
 	getErrOnce        bool
@@ -1912,19 +2986,16 @@ type duplicateClaimStore struct {
 	claims atomic.Int32
 }
 
-func (s *duplicateClaimStore) Claim(ctx c.Context) (string, error) {
-	if s.claims.Add(1) <= 2 {
-		return s.callID, nil
-	}
-	<-ctx.Done()
-	return "", ctx.Err()
+func (s *duplicateClaimStore) ReadScheduling() (c.SchedulingView, <-chan struct{}, error) {
+	s.claims.Add(1)
+	return s.ExecutionStore.ReadScheduling()
 }
 
-func TestDispatchCASUsesOneCapturedNodeAndOnlyOneDuplicateClaimInvokes(t *testing.T) {
+func TestDispatchCASUsesOneCapturedNodeWithFixedWorkers(t *testing.T) {
 	const callID = "dispatch-cas-capture"
 	originalBinding := json.RawMessage(`{"version":1}`)
 	updatedBinding := json.RawMessage(`{"version":2}`)
-	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
 	nodes := &barrierNodeStore{Store: root.Nodes(), entered: make(chan struct{}, 2), release: make(chan struct{})}
 	f := &fakeConnector{
 		descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{"large": json.RawMessage(`{"type":"object"}`)}},
@@ -1993,7 +3064,9 @@ func TestDispatchCASUsesOneCapturedNodeAndOnlyOneDuplicateClaimInvokes(t *testin
 		}
 		return c.Result{CallID: got.ID, State: c.Succeeded, Output: c.Data{}, Emissions: []c.Emission{{Name: "large", Payload: c.Data{"value": json.Number("9007199254740993")}}}}
 	}
-	service.Start(context.Background(), 2)
+	if err := service.Start(context.Background(), 2, func(error) {}); err != nil {
+		t.Fatal(err)
+	}
 	var releaseBarrier sync.Once
 	var closeService sync.Once
 	var closeErr error
@@ -2011,12 +3084,10 @@ func TestDispatchCASUsesOneCapturedNodeAndOnlyOneDuplicateClaimInvokes(t *testin
 			t.Error(closeErr)
 		}
 	})
-	for i := 0; i < 2; i++ {
-		select {
-		case <-nodes.entered:
-		case <-time.After(time.Second):
-			t.Fatal("duplicate claimed workers did not reach the same Node snapshot barrier")
-		}
+	select {
+	case <-nodes.entered:
+	case <-time.After(time.Second):
+		t.Fatal("scheduled worker did not reach the Node snapshot barrier")
 	}
 	releaseBarrier.Do(func() { close(nodes.release) })
 	completed := waitState(t, service, callID, c.Succeeded)
@@ -2032,7 +3103,7 @@ func TestDispatchCASUsesOneCapturedNodeAndOnlyOneDuplicateClaimInvokes(t *testin
 		t.Fatalf("duplicate claim reached Connector.Invoke %d times, want exactly once", got)
 	}
 	if store.claims.Load() < 2 {
-		t.Fatalf("only %d duplicate claims were attempted", store.claims.Load())
+		t.Fatalf("only %d scheduling snapshots were read by the fixed workers", store.claims.Load())
 	}
 	if completed.Value.Dispatch == nil || completed.Value.Dispatch.NodeRevision != 1 || completed.Value.Dispatch.BindingDigest == "" || completed.Value.Dispatch.RemoteID != callID {
 		t.Fatalf("terminal execution lost its original Dispatch identity: %+v", completed.Value.Dispatch)
@@ -2110,7 +3181,7 @@ func TestAuthorityRevokedBeforeDispatchCancelsLocallyWithoutWire(t *testing.T) {
 			return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{}}
 		},
 	}
-	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
 	journal := newJournal(t, root, 100)
 	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
@@ -2136,7 +3207,7 @@ func TestDispatchCASRevalidatesAfterNodeRevisionChangesDuringPreparation(t *test
 	const id = "dispatch-cas-fresh-node"
 	originalBinding := json.RawMessage(`{"version":1}`)
 	winningBinding := json.RawMessage(`{"version":2}`)
-	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
 	nodes := &barrierNodeStore{Store: root.Nodes(), captureBeforeWait: true, entered: make(chan struct{}, 1), release: make(chan struct{})}
 	var invoked atomic.Int32
 	f := &fakeConnector{
@@ -2158,7 +3229,9 @@ func TestDispatchCASRevalidatesAfterNodeRevisionChangesDuringPreparation(t *test
 		}
 		return c.Result{CallID: got.ID, State: c.Succeeded, Output: c.Data{}}
 	}
-	service.Start(context.Background(), 1)
+	if err := service.Start(context.Background(), 1, func(error) {}); err != nil {
+		t.Fatal(err)
+	}
 	var releaseOnce sync.Once
 	t.Cleanup(func() {
 		releaseOnce.Do(func() { close(nodes.release) })
@@ -2197,7 +3270,7 @@ func TestDispatchCASRevalidatesAfterNodeRevisionChangesDuringPreparation(t *test
 
 func TestLocalCancelWinsBeforeDispatchCASWithoutConnectorInvoke(t *testing.T) {
 	const id = "dispatch-cancel-cas"
-	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
 	nodes := &barrierNodeStore{Store: root.Nodes(), captureBeforeWait: true, entered: make(chan struct{}, 1), release: make(chan struct{})}
 	var invokes atomic.Int32
 	f := &fakeConnector{
@@ -2216,7 +3289,9 @@ func TestLocalCancelWinsBeforeDispatchCASWithoutConnectorInvoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	nodes.gate.Store(true)
-	service.Start(context.Background(), 1)
+	if err := service.Start(context.Background(), 1, func(error) {}); err != nil {
+		t.Fatal(err)
+	}
 	var releaseOnce sync.Once
 	t.Cleanup(func() {
 		releaseOnce.Do(func() { close(nodes.release) })
@@ -2276,12 +3351,34 @@ func (s *interceptExecutionStore) Get(ref c.Ref) (c.Snapshot[c.Execution], error
 
 func (s *interceptExecutionStore) List() ([]c.Snapshot[c.Execution], error) {
 	s.mu.Lock()
+	s.listReads++
 	err := s.listErr
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
 	return s.ExecutionStore.List()
+}
+
+func (s *interceptExecutionStore) ReadSummaries() ([]c.ExecutionSummary, error) {
+	s.mu.Lock()
+	err := s.listErr
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return s.ExecutionStore.ReadSummaries()
+}
+
+func (s *interceptExecutionStore) ReadScheduling() (c.SchedulingView, <-chan struct{}, error) {
+	s.mu.Lock()
+	s.schedulingReads++
+	read := s.readScheduling
+	s.mu.Unlock()
+	if read != nil {
+		return read()
+	}
+	return s.ExecutionStore.ReadScheduling()
 }
 
 func (s *interceptExecutionStore) PendingObservation(id string) (c.PendingObservation, bool, error) {
@@ -2331,7 +3428,11 @@ func (s *interceptExecutionStore) Commit(m c.ExecutionMutation) (c.Snapshot[c.Ex
 	s.lastMutation = &copyMutation
 	if s.failures[state] > 0 {
 		s.failures[state]--
+		err := s.commitFailure[state]
 		s.mu.Unlock()
+		if err != nil {
+			return c.Snapshot[c.Execution]{}, err
+		}
 		return c.Snapshot[c.Execution]{}, c.Err("busy", "simulated delivery capacity failure")
 	}
 	callback := s.afterNextState[state]
@@ -2355,8 +3456,8 @@ func (s *interceptExecutionStore) Commit(m c.ExecutionMutation) (c.Snapshot[c.Ex
 
 func TestSubmitBatchPropagatesListFailureWithoutMutation(t *testing.T) {
 	cat, _, journal, _ := fixture(t, &fakeConnector{})
-	base := memory.NewExecutions(8, 8)
-	if err := base.CommitAdmission(c.AdmissionCommit{Changes: queued("existing-before-list-error"), Deliveries: nil}); err != nil {
+	base := memory.NewExecutions(8)
+	if err := base.CommitAdmission(admissionFor(base, queued("existing-before-list-error"), nil)); err != nil {
 		t.Fatal(err)
 	}
 	existingBefore, err := base.Get(c.Ref{Namespace: "calls", ID: "existing-before-list-error"})
@@ -2378,8 +3479,8 @@ func TestSubmitBatchPropagatesListFailureWithoutMutation(t *testing.T) {
 
 func TestRetryPendingPreservesTypedPendingReadFailures(t *testing.T) {
 	cat, _, journal, _ := fixture(t, &fakeConnector{})
-	base := memory.NewExecutions(8, 8)
-	if err := base.CommitAdmission(c.AdmissionCommit{Changes: queued("pending-read-error"), Deliveries: nil}); err != nil {
+	base := memory.NewExecutions(8)
+	if err := base.CommitAdmission(admissionFor(base, queued("pending-read-error"), nil)); err != nil {
 		t.Fatal(err)
 	}
 	call, err := base.Get(c.Ref{Namespace: "calls", ID: "pending-read-error"})
@@ -2417,7 +3518,7 @@ func TestPendingSuccessfulResultKeepsExecutionAndCatalogReadFailures(t *testing.
 			name = "catalog_store"
 		}
 		t.Run(name, func(t *testing.T) {
-			root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+			root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
 			nodes := &faultNodeStore{Store: root.Nodes()}
 			f := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}}}
 			cat := catalog.New(nodes, map[string]c.Connector{"fake": f}, schema.New())
@@ -2468,8 +3569,8 @@ func TestPendingAuditWriteFailureIsNotMaskedByReportConflict(t *testing.T) {
 		wantRetryLimit bool
 	}{{code: "conflict", wantAttempts: 8, wantRetryLimit: true}, {code: "storage_write", wantAttempts: 1}} {
 		t.Run(tc.code, func(t *testing.T) {
-			base := memory.NewExecutions(8, 8)
-			if err := base.CommitAdmission(c.AdmissionCommit{Changes: queued("pending-audit-priority"), Deliveries: nil}); err != nil {
+			base := memory.NewExecutions(8)
+			if err := base.CommitAdmission(admissionFor(base, queued("pending-audit-priority"), nil)); err != nil {
 				t.Fatal(err)
 			}
 			current, err := base.Get(c.Ref{Namespace: "calls", ID: "pending-audit-priority"})
@@ -2562,7 +3663,7 @@ func TestInspectPropagatesObservationReadAndAuditWriteFailures(t *testing.T) {
 					return c.AbortObservation{Requested: true}, nil
 				},
 			}
-			root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
+			root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8})
 			journal := newJournal(t, root, 100)
 			nodes := &faultNodeStore{Store: root.Nodes()}
 			cat := catalog.New(nodes, map[string]c.Connector{"fake": f}, schema.New())
@@ -2588,7 +3689,25 @@ func TestInspectPropagatesObservationReadAndAuditWriteFailures(t *testing.T) {
 				t.Fatal(err)
 			}
 			preparing := lifecycle.Observe(current, c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Preparing})
-			current, err = base.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: preparing.Changes, Deliveries: preparing.Deliveries})
+			facts, _, _, err := base.ReadQueueFacts()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var metadata *c.QueueMetadata
+			for i := range facts {
+				if facts[i].Call.Subject == current.Subject {
+					metadata = facts[i].Metadata
+					break
+				}
+			}
+			if metadata == nil {
+				t.Fatalf("missing admission queue metadata for %s", id)
+			}
+			schedule, _, err := base.ReadScheduling()
+			if err != nil {
+				t.Fatal(err)
+			}
+			current, err = base.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: preparing.Changes, Deliveries: preparing.Deliveries, Queue: &c.QueueMutation{CallID: id, Present: false, SlotHeld: true}, Scheduling: &c.SchedulingMutation{ExpectedRevision: schedule.Revision}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2699,8 +3818,8 @@ func TestInspectPropagatesObservationReadAndAuditWriteFailures(t *testing.T) {
 }
 
 func TestRetryPendingConsumesRejectedReportAndNextRetryIsNoop(t *testing.T) {
-	base := memory.NewExecutions(8, 8)
-	if err := base.CommitAdmission(c.AdmissionCommit{Changes: queued("rejected-pending-retry"), Deliveries: nil}); err != nil {
+	base := memory.NewExecutions(8)
+	if err := base.CommitAdmission(admissionFor(base, queued("rejected-pending-retry"), nil)); err != nil {
 		t.Fatal(err)
 	}
 	ref := c.Ref{Namespace: "calls", ID: "rejected-pending-retry"}
@@ -2833,7 +3952,7 @@ func TestRejectedNewerObservationDoesNotConsumeOlderPendingInspection(t *testing
 		}
 		return c.Result{CallID: call.ID, State: c.Unknown}
 	}
-	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8})
 	base = root.Executions()
 	journal := newJournal(t, root, 100)
 	f.descriptor = c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`), Capabilities: c.Capabilities{Abort: true, Inspect: true}}}, Events: map[string]c.Schema{}}
@@ -2872,8 +3991,8 @@ func TestRejectedNewerObservationDoesNotConsumeOlderPendingInspection(t *testing
 }
 
 func TestPendingRetryCASConflictThenConsumesOnce(t *testing.T) {
-	base := memory.NewExecutions(8, 8)
-	if err := base.CommitAdmission(c.AdmissionCommit{Changes: queued("pending-cas-once"), Deliveries: nil}); err != nil {
+	base := memory.NewExecutions(8)
+	if err := base.CommitAdmission(admissionFor(base, queued("pending-cas-once"), nil)); err != nil {
 		t.Fatal(err)
 	}
 	ref := c.Ref{Namespace: "calls", ID: "pending-cas-once"}
@@ -2957,7 +4076,7 @@ func TestCASRetryDoesNotLeakPriorObservationError(t *testing.T) {
 			return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{"answer": "ok"}}
 		},
 	}
-	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
 	journal := newJournal(t, root, 100)
 	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
@@ -3004,7 +4123,7 @@ func TestPendingTerminalWinsAndRetryDoesNotDeleteReplacement(t *testing.T) {
 			return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{"answer": "inspected"}}
 		},
 	}
-	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8})
 	journal := newJournal(t, root, 100)
 	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
@@ -3079,7 +4198,7 @@ func TestConfirmedWaitingPendingReplacesUnknownResult(t *testing.T) {
 		},
 		inspect: func(call c.Call) c.Result { return c.Result{CallID: call.ID, State: c.Waiting} },
 	}
-	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8})
 	journal := newJournal(t, root, 100)
 	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
@@ -3465,7 +4584,7 @@ func TestDispatchCommitRejectsInvalidCarrierAndImmutableExecutionChanges(t *test
 		}, wantCode: "conflict"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+			root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
 			f := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}}}
 			cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 			if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{"binding":1}`)}); err != nil {
@@ -3481,14 +4600,7 @@ func TestDispatchCommitRejectsInvalidCarrierAndImmutableExecutionChanges(t *test
 			if err != nil {
 				t.Fatal(err)
 			}
-			preparing := lifecycle.Observe(current, c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Preparing})
-			if preparing.Err != nil {
-				t.Fatal(preparing.Err)
-			}
-			current, err = store.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: preparing.Changes, Deliveries: preparing.Deliveries})
-			if err != nil {
-				t.Fatal(err)
-			}
+			current = prepareForDispatch(t, store, current)
 			node, err := root.Nodes().Get(c.Ref{Namespace: "nodes", ID: "node"})
 			if err != nil {
 				t.Fatal(err)
@@ -3525,7 +4637,7 @@ func TestDispatchCommitRejectsInvalidCarrierAndImmutableExecutionChanges(t *test
 	}
 
 	t.Run("immutable after accepted dispatch", func(t *testing.T) {
-		root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+		root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
 		f := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}}}
 		cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 		if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{"binding":1}`)}); err != nil {
@@ -3541,11 +4653,7 @@ func TestDispatchCommitRejectsInvalidCarrierAndImmutableExecutionChanges(t *test
 		if err != nil {
 			t.Fatal(err)
 		}
-		preparing := lifecycle.Observe(current, c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Preparing})
-		current, err = store.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: preparing.Changes, Deliveries: preparing.Deliveries})
-		if err != nil {
-			t.Fatal(err)
-		}
+		current = prepareForDispatch(t, store, current)
 		node, err := root.Nodes().Get(c.Ref{Namespace: "nodes", ID: "node"})
 		if err != nil {
 			t.Fatal(err)
@@ -3690,7 +4798,7 @@ func TestNewerInspectionPendingReplacesAndRetriesOnlyItsLineage(t *testing.T) {
 			return c.Result{CallID: call.ID, State: c.Unknown}
 		},
 	}
-	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8})
 	journal := newJournal(t, root, 100)
 	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
@@ -3781,7 +4889,7 @@ func TestInspectionQueryDoesNotReplacePendingWaitingStream(t *testing.T) {
 		},
 		inspect: func(call c.Call) c.Result { return c.Result{CallID: call.ID, State: c.Unknown} },
 	}
-	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8})
 	journal := newJournal(t, root, 100)
 	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
@@ -3828,7 +4936,7 @@ func TestAcceptedInspectionDoesNotClearPendingWaitingStream(t *testing.T) {
 		},
 		inspect: func(call c.Call) c.Result { return c.Result{CallID: call.ID, State: c.Unknown} },
 	}
-	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8})
 	journal := newJournal(t, root, 100)
 	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
@@ -3857,13 +4965,20 @@ func TestAcceptedInspectionDoesNotClearPendingWaitingStream(t *testing.T) {
 }
 
 func TestZeroCallAdmissionEffectsAreAtomicAndFenceSubscriptionPhantoms(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Nodes: 2, Subscriptions: 4, Conversations: 2, Calls: 4, Queue: 4})
-	calls := invocation.New(root.Executions(), nil, nil, fixtureAuthority(t))
+	root := memory.NewRoot(memory.Limits{Nodes: 2, Subscriptions: 4, Conversations: 2, Calls: 4})
+	store := &interceptExecutionStore{ExecutionStore: root.Executions()}
+	calls := invocation.New(store, nil, nil, fixtureAuthority(t))
 	eventValue := c.Event{ID: "zero-subscriber-event", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "complete", Category: "published", OccurredAt: c.Now(), Payload: c.Data{}}
 	origin := sourceOrigin("node")
 	effect := c.AdmissionEffect{Published: &c.PublishedAdmission{Event: eventValue, Digest: "stable", Origin: origin, SubscriptionSetRevision: 0, CallIDs: []string{}}, Deliveries: []c.Delivery{{ID: c.ID(eventValue.ID, "journal"), Kind: c.DeliveryJournal, Event: &eventValue}}}
 	if _, err := calls.SubmitBatch(origin, nil, effect); err != nil {
 		t.Fatalf("zero-call effect was dropped: %v", err)
+	}
+	store.mu.Lock()
+	listReads, schedulingReads := store.listReads, store.schedulingReads
+	store.mu.Unlock()
+	if listReads != 0 || schedulingReads != 0 {
+		t.Fatalf("zero-call effect performed unnecessary call/scheduling reads: list=%d scheduling=%d", listReads, schedulingReads)
 	}
 	if len(mustList(t, calls)) != 0 || mustPendingCount(t, root.Executions()) != 1 {
 		t.Fatal("zero-call effect created calls or lost its journal intent")
@@ -3904,7 +5019,7 @@ func TestZeroCallAdmissionEffectsAreAtomicAndFenceSubscriptionPhantoms(t *testin
 }
 
 func TestConcurrentAdmissionCollisionCommitsOneReceipt(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Nodes: 1, Subscriptions: 1, Conversations: 1, Calls: 1, Queue: 1})
+	root := memory.NewRoot(memory.Limits{Nodes: 1, Subscriptions: 1, Conversations: 1, Calls: 1})
 	effect := c.AdmissionEffect{Published: &c.PublishedAdmission{Event: c.Event{ID: "race-event"}, Digest: "same", Origin: sourceOrigin("node"), SubscriptionSetRevision: 0}}
 	start := make(chan struct{})
 	results := make(chan error, 2)
@@ -3929,7 +5044,8 @@ func TestConcurrentAdmissionCollisionCommitsOneReceipt(t *testing.T) {
 }
 
 func TestExecutionAdmissionRejectsMismatchedCallIdentityWithoutMutation(t *testing.T) {
-	store := memory.NewExecutions(2, 2)
+	root := memory.NewRoot(memory.Limits{Nodes: 1, Subscriptions: 1, Conversations: 1, Calls: 2})
+	store := root.Executions()
 	ch := queued("actual-call")[0]
 	ch.Subject = c.Ref{Namespace: "calls", ID: "other-call"}
 	if err := store.CommitAdmission(c.AdmissionCommit{Changes: []c.Change[c.Execution]{ch}}); err == nil || c.AsFault(err).Code != "invalid_input" {
@@ -3939,7 +5055,7 @@ func TestExecutionAdmissionRejectsMismatchedCallIdentityWithoutMutation(t *testi
 		t.Fatal("invalid identity partially wrote call or queue state")
 	}
 	valid := queued("actual-call")
-	if err := store.CommitAdmission(c.AdmissionCommit{Changes: valid, Deliveries: nil}); err != nil {
+	if err := store.CommitAdmission(admissionFor(store, valid, nil)); err != nil {
 		t.Fatal(err)
 	}
 	old, err := store.Get(c.Ref{Namespace: "calls", ID: "actual-call"})
@@ -3958,8 +5074,516 @@ func TestExecutionAdmissionRejectsMismatchedCallIdentityWithoutMutation(t *testi
 	}
 }
 
+func TestRecoveryClassifiesRemotePossibleAsUnknownWithCapturedSchedulingCAS(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
+	fake := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}}}
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": fake}, schema.New())
+	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	store := root.Executions()
+	service := invocation.New(store, cat, newJournal(t, root, 64), fixtureAuthority(t))
+	const id = "recover-remote-possible"
+	callValue := call(id)
+	callValue.CorrelationID, callValue.CausationID, callValue.ConversationID = "corr-recover", "cause-recover", "conversation-recover"
+	if _, err := service.SubmitBatch(directOrigin(), []c.Call{callValue}); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := store.Get(c.Ref{Namespace: "calls", ID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap = prepareForDispatch(t, store, snap)
+	node, err := root.Nodes().Get(c.Ref{Namespace: "nodes", ID: "node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := c.CanonicalJSONDigest(node.Value.Binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := lifecycle.Dispatch(snap, c.DispatchIdentity{NodeID: node.Value.ID, NodeRevision: node.Revision, ConnectorID: node.Value.ConnectorID, BindingDigest: digest, RemoteID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	carrier := c.RevisionRef{Subject: node.Subject, Revision: node.Revision}
+	snap, err = store.Commit(c.ExecutionMutation{Subject: snap.Subject, ExpectedRevision: snap.Revision, Changes: []c.Change[c.Execution]{dispatch}, NodeRevision: &carrier})
+	if err != nil {
+		t.Fatal(err)
+	}
+	running := lifecycle.Observe(snap, c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id, ReportID: "running-before-recovery", Confirmed: true}, State: c.Running})
+	if running.Err != nil {
+		t.Fatal(running.Err)
+	}
+	snap, err = store.Commit(c.ExecutionMutation{Subject: snap.Subject, ExpectedRevision: snap.Revision, Changes: running.Changes, Deliveries: running.Deliveries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialReports := c.Clone(snap.Value.Observation.Reports)
+	initialSequence := snap.Value.Observation.Sequence
+	beforeView, _, err := store.ReadScheduling()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeFacts, _, beforeRevision, err := store.ReadQueueFacts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := store.Get(snap.Subject)
+	if err != nil || after.Value.Lifecycle.State != c.Unknown || after.Value.Dispatch == nil {
+		t.Fatalf("remote-possible recovery did not preserve Dispatch as Unknown: %+v err=%v", after, err)
+	}
+	if !reflect.DeepEqual(after.Value.Observation.Reports, initialReports) || after.Value.Observation.Sequence != initialSequence {
+		t.Fatalf("local restart classification wrote a synthetic remote receipt: reports=%+v seq=%d", after.Value.Observation.Reports, after.Value.Observation.Sequence)
+	}
+	deliveries, err := store.PendingDeliveries(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restartEvent *c.Event
+	for _, delivery := range deliveries {
+		if delivery.Kind == c.DeliveryJournal && delivery.Event != nil && delivery.Event.Name == "state.changed" && delivery.Event.Payload["reason"] == "process_restart" {
+			event := *delivery.Event
+			restartEvent = &event
+		}
+	}
+	if restartEvent == nil || restartEvent.CallID != after.Value.Call.ID || restartEvent.CorrelationID != after.Value.Call.CorrelationID || restartEvent.CausationID != after.Value.Call.CausationID || restartEvent.ConversationID != after.Value.Call.ConversationID {
+		t.Fatalf("restart state event lost Call lineage: %+v", restartEvent)
+	}
+	afterFacts, _, afterRevision, err := store.ReadQueueFacts()
+	if err != nil || afterRevision != beforeRevision || len(afterFacts) != len(beforeFacts) || afterFacts[0].Present || !afterFacts[0].SlotHeld {
+		t.Fatalf("Unknown recovery changed queue facts or revision: before=%+v/%d after=%+v/%d err=%v", beforeFacts, beforeRevision, afterFacts, afterRevision, err)
+	}
+	afterView, _, err := store.ReadScheduling()
+	if err != nil || afterView.Revision != beforeView.Revision {
+		t.Fatalf("remote classification changed scheduling revision: before=%d after=%d err=%v", beforeView.Revision, afterView.Revision, err)
+	}
+	remoteReports := c.Clone(after.Value.Observation.Reports)
+	remoteSequence := after.Value.Observation.Sequence
+	reconciling, err := lifecycle.Move(after, c.Transition{Subject: after.Subject, ExpectedRevision: after.Revision, From: c.Unknown, To: c.Reconciling, Reason: "inspect", Evidence: c.Evidence{CallID: id, Local: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspecting, err := store.Commit(c.ExecutionMutation{Subject: after.Subject, ExpectedRevision: after.Revision, Changes: []c.Change[c.Execution]{reconciling}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspected := lifecycle.Observe(inspecting, c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id, ReportID: "explicit-inspect-running", Confirmed: true}, State: c.Running, ObservedRevision: inspecting.Revision})
+	if inspected.Err != nil || len(inspected.Changes) != 1 {
+		t.Fatalf("explicit Inspect result was not applied: changes=%+v err=%v", inspected.Changes, inspected.Err)
+	}
+	inspecting, err = store.Commit(c.ExecutionMutation{Subject: inspecting.Subject, ExpectedRevision: inspecting.Revision, Changes: inspected.Changes, Deliveries: inspected.Deliveries})
+	if err != nil || inspecting.Value.Lifecycle.State != c.Running {
+		t.Fatalf("explicit Inspect did not restore Running: %+v err=%v", inspecting, err)
+	}
+	remoteReports = c.Clone(inspecting.Value.Observation.Reports)
+	remoteSequence = inspecting.Value.Observation.Sequence
+	if err := service.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	afterRestart, err := store.Get(snap.Subject)
+	if err != nil || afterRestart.Value.Lifecycle.State != c.Unknown || afterRestart.Value.Lifecycle.Reason != "process_restart" || afterRestart.Value.Dispatch == nil {
+		t.Fatalf("second restart failed to restore remote uncertainty: %+v err=%v", afterRestart, err)
+	}
+	if !reflect.DeepEqual(afterRestart.Value.Observation.Reports, remoteReports) || afterRestart.Value.Observation.Sequence != remoteSequence {
+		t.Fatalf("local recovery changed remote report receipts or sequence: reports=%+v seq=%d", afterRestart.Value.Observation.Reports, afterRestart.Value.Observation.Sequence)
+	}
+}
+
+func TestRecoveryRejectsOffsettingSameTargetHeldFactCorruption(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
+	fake := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}}}
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": fake}, schema.New())
+	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	base := root.Executions()
+	journal := newJournal(t, root, 64)
+	setup := invocation.New(base, cat, journal, fixtureAuthority(t))
+	const unsentID, remoteID = "offset-unsent", "offset-remote"
+	if _, err := setup.SubmitBatch(directOrigin(), []c.Call{call(unsentID), call(remoteID)}); err != nil {
+		t.Fatal(err)
+	}
+	remote, err := base.Get(c.Ref{Namespace: "calls", ID: remoteID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote = prepareForDispatch(t, base, remote)
+	node, err := root.Nodes().Get(c.Ref{Namespace: "nodes", ID: "node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := c.CanonicalJSONDigest(node.Value.Binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := lifecycle.Dispatch(remote, c.DispatchIdentity{NodeID: node.Value.ID, NodeRevision: node.Revision, ConnectorID: node.Value.ConnectorID, BindingDigest: digest, RemoteID: remoteID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeRef := c.RevisionRef{Subject: node.Subject, Revision: node.Revision}
+	remote, err = base.Commit(c.ExecutionMutation{Subject: remote.Subject, ExpectedRevision: remote.Revision, Changes: []c.Change[c.Execution]{dispatch}, NodeRevision: &nodeRef})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown := lifecycle.Observe(remote, c.Report{Evidence: c.Evidence{CallID: remoteID, RemoteID: remoteID, ReportID: "offset-unknown", Confirmed: true}, State: c.Unknown})
+	if unknown.Err != nil {
+		t.Fatal(unknown.Err)
+	}
+	if _, err = base.Commit(c.ExecutionMutation{Subject: remote.Subject, ExpectedRevision: remote.Revision, Changes: unknown.Changes, Deliveries: unknown.Deliveries}); err != nil {
+		t.Fatal(err)
+	}
+	beforeFacts, _, beforeSchedulingRevision, err := base.ReadQueueFacts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(beforeFacts) != 2 {
+		t.Fatalf("expected two queue rows: %+v", beforeFacts)
+	}
+	for _, fact := range beforeFacts {
+		if (fact.Call.Subject.ID == unsentID && (!fact.Present || fact.SlotHeld)) || (fact.Call.Subject.ID == remoteID && (fact.Present || !fact.SlotHeld)) {
+			t.Fatalf("seed does not have same-target queued and remote-held facts: %+v", beforeFacts)
+		}
+	}
+	beforeUnsent, err := base.Get(c.Ref{Namespace: "calls", ID: unsentID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeRemote, err := base.Get(c.Ref{Namespace: "calls", ID: remoteID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beforeUnsent.Value.Call.Target != beforeRemote.Value.Call.Target || beforeRemote.Value.Lifecycle.State != c.Unknown {
+		t.Fatalf("fixture must pair same-target known-unsent and remote-Unknown calls: unsent=%+v remote=%+v", beforeUnsent.Value.Call.Target, beforeRemote.Value)
+	}
+	beforeOutbox, err := base.PendingDeliveryCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := &queueMetadataOmittingStore{ExecutionStore: base, mutate: func(facts []c.QueueFact) {
+		for i := range facts {
+			switch facts[i].Call.Subject.ID {
+			case unsentID:
+				facts[i].Present, facts[i].SlotHeld = false, true
+			case remoteID:
+				facts[i].Present, facts[i].SlotHeld = false, false
+			}
+		}
+	}}
+	// The same target still has one held row in aggregate: the unsent row's
+	// excess held bit offsets the remote-possible row's missing held bit.
+	mutated, _, _, err := corrupt.ReadQueueFacts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var aggregateHeld int
+	for _, fact := range mutated {
+		if fact.SlotHeld {
+			aggregateHeld++
+		}
+	}
+	if aggregateHeld != 1 {
+		t.Fatalf("corrupt facts should preserve aggregate held count 1, got %+v", mutated)
+	}
+	service := invocation.New(corrupt, cat, journal, fixtureAuthority(t))
+	if err := service.Recover(); err == nil || c.AsFault(err).Code != "invalid_input" {
+		t.Fatalf("same-target per-row held corruption passed recovery preflight: %v", err)
+	}
+	afterFacts, _, afterSchedulingRevision, err := base.ReadQueueFacts()
+	afterOutbox, outboxErr := base.PendingDeliveryCount()
+	afterUnsent, unsentErr := base.Get(beforeUnsent.Subject)
+	afterRemote, remoteErr := base.Get(beforeRemote.Subject)
+	if err != nil || outboxErr != nil || unsentErr != nil || remoteErr != nil || afterSchedulingRevision != beforeSchedulingRevision || !reflect.DeepEqual(beforeFacts, afterFacts) || afterOutbox != beforeOutbox || afterUnsent.Revision != beforeUnsent.Revision || afterRemote.Revision != beforeRemote.Revision {
+		t.Fatalf("rejected recovery partially repaired offsetting corruption: facts=%v revision=%d/%d outbox=%d/%d calls=%d/%d err=%v/%v/%v/%v", !reflect.DeepEqual(beforeFacts, afterFacts), beforeSchedulingRevision, afterSchedulingRevision, beforeOutbox, afterOutbox, afterUnsent.Revision, afterRemote.Revision, err, outboxErr, unsentErr, remoteErr)
+	}
+}
+
+func TestRecoveryRejectsQueueOnlySchedulingRace(t *testing.T) {
+	f := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}}}
+	cat, _, journal, root := fixture(t, f)
+	base := root.Executions()
+	traced := &queueSchedulingRaceStore{ExecutionStore: base, target: c.Ref{Namespace: "nodes", ID: "node"}}
+	service := invocation.New(traced, cat, journal, fixtureAuthority(t))
+	if err := service.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	const id = "recover-queue-only-race"
+	if _, err := service.SubmitBatch(directOrigin(), []c.Call{call(id)}); err != nil {
+		t.Fatal(err)
+	}
+	beforeCall, err := base.Get(c.Ref{Namespace: "calls", ID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeQueue, _, beforeSchedulingRevision, err := base.ReadQueueFacts()
+	if err != nil || len(beforeQueue) != 1 || !beforeQueue[0].Present || beforeQueue[0].SlotHeld {
+		t.Fatalf("invalid queue-only race fixture: %+v err=%v", beforeQueue, err)
+	}
+	err = service.Recover()
+	if err == nil || c.AsFault(err).Code != "conflict" {
+		t.Fatalf("recovery accepted stale scheduling facts after a queue-only CAS: %v", err)
+	}
+	traced.mu.Lock()
+	changed, injectedErr := traced.changed, traced.injectedErr
+	traced.mu.Unlock()
+	if !changed || injectedErr != nil {
+		t.Fatalf("queue-only competitor did not successfully advance scheduling: changed=%v err=%v", changed, injectedErr)
+	}
+	afterCall, err := base.Get(beforeCall.Subject)
+	if err != nil || afterCall.Revision != beforeCall.Revision || afterCall.Value.Lifecycle.State != c.Queued {
+		t.Fatalf("stale Recover changed execution despite queue-only conflict: before=%+v after=%+v err=%v", beforeCall, afterCall, err)
+	}
+	afterQueue, _, afterSchedulingRevision, err := base.ReadQueueFacts()
+	if err != nil || afterSchedulingRevision != beforeSchedulingRevision+1 || len(afterQueue) != 1 || !afterQueue[0].Present || afterQueue[0].SlotHeld {
+		t.Fatalf("stale Recover changed queue facts: before=%+v/%d after=%+v/%d err=%v", beforeQueue, beforeSchedulingRevision, afterQueue, afterSchedulingRevision, err)
+	}
+}
+
+func TestRecoveryPreflights320RowsAndPreservesSequenceAndLowQuota(t *testing.T) {
+	const total = 320
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: total + 8})
+	invoked := make(chan string, 1)
+	f := &fakeConnector{
+		descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}},
+		invoke: func(call c.Call, sink c.ReportSink) c.Result {
+			select {
+			case invoked <- call.ID:
+			default:
+			}
+			if err := sink(c.Report{Evidence: c.Evidence{CallID: call.ID, RemoteID: call.ID, Confirmed: true}, State: c.Running}); err != nil {
+				panic(err)
+			}
+			return c.Result{CallID: call.ID, State: c.Unknown}
+		},
+	}
+	journal := newJournal(t, root, total+32)
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
+	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	base := root.Executions()
+	changes := make([]c.Change[c.Execution], 0, total*3)
+	for i := range total {
+		id := fmt.Sprintf("recovery-row-%03d", i)
+		value := call(id)
+		value.Deadline = c.Now().Add(time.Hour)
+		for _, original := range queued(id) {
+			change := original
+			after := c.CopyExecution(change.After)
+			after.Call, after.Origin = value, directOrigin()
+			change.After = after
+			if change.Before != nil {
+				before := c.CopyExecution(*change.Before)
+				before.Call, before.Origin = value, directOrigin()
+				change.Before = &before
+			}
+			changes = append(changes, change)
+		}
+	}
+	if err := base.CommitAdmission(admissionFor(base, changes, nil)); err != nil {
+		t.Fatalf("seed retained queue: %v", err)
+	}
+	const preparingCount = 64
+	firstID := "recovery-row-000"
+	var first c.Snapshot[c.Execution]
+	for i := range preparingCount {
+		id := fmt.Sprintf("recovery-row-%03d", i)
+		current, getErr := base.Get(c.Ref{Namespace: "calls", ID: id})
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if i == 0 {
+			first = current
+		}
+		prepared := lifecycle.Observe(current, c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Preparing})
+		if prepared.Err != nil {
+			t.Fatal(prepared.Err)
+		}
+		view, _, readErr := base.ReadScheduling()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if _, commitErr := base.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: prepared.Changes, Deliveries: prepared.Deliveries, Queue: &c.QueueMutation{CallID: id, Present: false, SlotHeld: true}, Scheduling: &c.SchedulingMutation{ExpectedRevision: view.Revision}}); commitErr != nil {
+			t.Fatalf("seed interrupted Preparing row %s: %v", id, commitErr)
+		}
+	}
+	store := &queueMetadataOmittingStore{ExecutionStore: base, mutate: func(facts []c.QueueFact) {
+		facts[len(facts)-1].Metadata.Admission.Subject.ID = "foreign-call"
+	}}
+	service := invocation.New(store, cat, journal, fixtureAuthority(t))
+	beforeFacts, _, beforeQueueRev, err := base.ReadQueueFacts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeMetadata := make(map[string]c.QueueMetadata, len(beforeFacts))
+	for _, fact := range beforeFacts {
+		if fact.Metadata == nil {
+			t.Fatalf("seeded row %s has no admission metadata", fact.Call.Subject.ID)
+		}
+		beforeMetadata[fact.Call.Subject.ID] = *fact.Metadata
+	}
+	beforeView, _, err := base.ReadScheduling()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(beforeView.Eligible) != total-preparingCount || len(beforeView.Held) != 1 || beforeView.Held[0].Count != preparingCount {
+		t.Fatalf("seed did not model 64 held Preparing and 256 queued rows: eligible=%d held=%+v", len(beforeView.Eligible), beforeView.Held)
+	}
+	beforeOutbox, err := base.PendingDeliveryCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Recover(); err == nil {
+		t.Fatal("late malformed queue fact passed full preflight")
+	}
+	store.mutate = nil
+	stillFirst, err := base.Get(first.Subject)
+	if err != nil || stillFirst.Revision != first.Revision+1 || stillFirst.Value.Lifecycle.State != c.Preparing {
+		t.Fatalf("late preflight failure partially repaired the first row: %+v err=%v", stillFirst, err)
+	}
+	afterFacts, _, afterQueueRev, err := base.ReadQueueFacts()
+	afterView, _, viewErr := base.ReadScheduling()
+	afterOutbox, outboxErr := base.PendingDeliveryCount()
+	if err != nil || viewErr != nil || outboxErr != nil || afterQueueRev != beforeQueueRev || !reflect.DeepEqual(beforeFacts, afterFacts) || afterView.Revision != beforeView.Revision || afterOutbox != beforeOutbox {
+		t.Fatalf("failed full preflight mutated queue/scheduling/outbox: facts=%v queueRev=%d/%d viewRev=%d/%d outbox=%d/%d err=%v/%v/%v", !reflect.DeepEqual(beforeFacts, afterFacts), beforeQueueRev, afterQueueRev, beforeView.Revision, afterView.Revision, beforeOutbox, afterOutbox, err, viewErr, outboxErr)
+	}
+
+	policy := invocation.DefaultSchedulingPolicy(1)
+	policy.PossibleLimit = 1
+	policy.WaitingLimit = 256
+	policy.DefaultTarget.WaitingLimit = 256
+	policy.DefaultTarget.PossibleLimit = 1
+	policy.DefaultTarget.ActiveLimit = 1
+	if err := service.SetSchedulingPolicy(policy); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Recover(); err != nil {
+		t.Fatalf("valid 320-row recovery: %v", err)
+	}
+	if err := service.Recover(); err != nil {
+		t.Fatalf("idempotent recovery: %v", err)
+	}
+	repaired, _, repairedQueueRev, err := base.ReadQueueFacts()
+	if err != nil || repairedQueueRev != beforeQueueRev+preparingCount || len(repaired) != total {
+		t.Fatalf("recovery did not repair all known-unsent rows atomically: count=%d queueRev=%d/%d err=%v", len(repaired), beforeQueueRev, repairedQueueRev, err)
+	}
+	firstAfter, err := base.Get(first.Subject)
+	if err != nil || firstAfter.Value.Lifecycle.State != c.Preparing {
+		debugFacts, _, _, debugErr := base.ReadQueueFacts()
+		for _, fact := range debugFacts {
+			if fact.Call.Subject.ID == firstID {
+				t.Fatalf("known-unsent Preparing row was not safely restored: %+v fact=%+v err=%v debug=%v", firstAfter, fact, err, debugErr)
+			}
+		}
+		t.Fatalf("known-unsent Preparing row was not safely restored: %+v err=%v debug=%v", firstAfter, err, debugErr)
+	}
+	firstFactPresent := false
+	for _, fact := range repaired {
+		if fact.Metadata == nil || !reflect.DeepEqual(*fact.Metadata, beforeMetadata[fact.Call.Subject.ID]) {
+			t.Fatalf("recovery changed admission-time ordering metadata for %s: before=%+v after=%+v", fact.Call.Subject.ID, beforeMetadata[fact.Call.Subject.ID], fact.Metadata)
+		}
+		if !fact.Present || fact.SlotHeld {
+			t.Fatalf("recovery did not restore known-unsent row %s to eligible queue: %+v", fact.Call.Subject.ID, fact)
+		}
+		if fact.Call.Subject.ID == firstID {
+			firstFactPresent = fact.Present && !fact.SlotHeld
+		}
+	}
+	if !firstFactPresent {
+		t.Fatal("known-unsent row was not returned to the eligible queue")
+	}
+	ordered, _, err := base.ReadScheduling()
+	if err != nil || len(ordered.Eligible) != total {
+		t.Fatalf("recovered queue view: eligible=%d err=%v", len(ordered.Eligible), err)
+	}
+	if len(ordered.Held) != 0 {
+		t.Fatalf("recovery left possible slots held: %+v", ordered.Held)
+	}
+	for i := 1; i < len(ordered.Eligible); i++ {
+		if ordered.Eligible[i-1].Sequence >= ordered.Eligible[i].Sequence {
+			t.Fatalf("recovery sequence is not strictly FIFO at %d: %d then %d", i, ordered.Eligible[i-1].Sequence, ordered.Eligible[i].Sequence)
+		}
+	}
+	for i := range preparingCount {
+		id := fmt.Sprintf("recovery-row-%03d", i)
+		snap, getErr := base.Get(c.Ref{Namespace: "calls", ID: id})
+		if getErr != nil || snap.Value.Lifecycle.State != c.Preparing {
+			t.Fatalf("recovery changed interrupted Preparing row %s: state=%s err=%v", id, snap.Value.Lifecycle.State, getErr)
+		}
+	}
+	if _, submitErr := service.SubmitBatch(directOrigin(), []c.Call{call("overquota")}); submitErr == nil || c.AsFault(submitErr).Code != "busy" {
+		t.Fatalf("lowered full waiting quota admitted another call: %v", submitErr)
+	}
+	if _, getErr := base.Get(c.Ref{Namespace: "calls", ID: "overquota"}); getErr == nil {
+		t.Fatal("rejected over-quota submission left a call record")
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		defer cancel()
+		if closeErr := service.Close(ctx, nil); closeErr != nil {
+			t.Errorf("Close: %v", closeErr)
+		}
+	})
+	if err := service.Start(context.Background(), 1, func(err error) { t.Errorf("unexpected worker error: %v", err) }); err != nil {
+		t.Fatal(err)
+	}
+	var invokedID string
+	select {
+	case invokedID = <-invoked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("low-quota worker did not claim a recovered row")
+	}
+	waitState(t, service, invokedID, c.Unknown)
+	status, err := service.SchedulingStatus()
+	if err != nil || status.Waiting != total-1 || status.Possible != 1 {
+		t.Fatalf("low possible quota did not bound 320 recovered rows: status=%+v err=%v", status, err)
+	}
+}
+
+func TestRecoveryAcceptsTerminalFactWithoutMetadataAsNoopCAS(t *testing.T) {
+	cat, _, journal, root := fixture(t, &fakeConnector{})
+	const id = "recover-terminal-without-metadata"
+	base := root.Executions()
+	calls := invocation.New(base, cat, journal, fixtureAuthority(t))
+	if _, err := calls.SubmitBatch(directOrigin(), []c.Call{call(id)}); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := base.Get(c.Ref{Namespace: "calls", ID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	change, err := lifecycle.Move(snap, c.Transition{Subject: snap.Subject, ExpectedRevision: snap.Revision, From: c.Queued, To: c.Cancelled, Reason: "operator_cancelled", Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, _, err := base.ReadScheduling()
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue := &c.QueueMutation{CallID: id, Present: false, SlotHeld: false}
+	if _, err := base.Commit(c.ExecutionMutation{Subject: snap.Subject, ExpectedRevision: snap.Revision, Changes: []c.Change[c.Execution]{change}, Queue: queue, Scheduling: &c.SchedulingMutation{ExpectedRevision: view.Revision}}); err != nil {
+		t.Fatal(err)
+	}
+	before, _, beforeRevision, err := base.ReadQueueFacts()
+	if err != nil || len(before) != 1 || before[0].Metadata == nil || before[0].Present || before[0].SlotHeld {
+		t.Fatalf("terminal fixture was not in the expected false/false state: %+v err=%v", before, err)
+	}
+	wrapped := &queueMetadataOmittingStore{ExecutionStore: base, callID: id}
+	recovered := invocation.New(wrapped, cat, journal, fixtureAuthority(t))
+	if err := recovered.Recover(); err != nil {
+		t.Fatalf("terminal recovery rejected an absent metadata fact: %v", err)
+	}
+	after, _, afterRevision, err := base.ReadQueueFacts()
+	if err != nil || afterRevision != beforeRevision || len(after) != 1 || after[0].Metadata == nil || after[0].Present || after[0].SlotHeld {
+		t.Fatalf("terminal no-op recovery mutated scheduling facts: before=%+v/%d after=%+v/%d err=%v", before, beforeRevision, after, afterRevision, err)
+	}
+}
+
 func TestAdmissionEffectCallReferencesMustExactlyMatchNewCalls(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Nodes: 1, Subscriptions: 1, Conversations: 2, Calls: 8, Queue: 8})
+	root := memory.NewRoot(memory.Limits{Nodes: 1, Subscriptions: 1, Conversations: 2, Calls: 8})
 	conversationRef := c.Ref{Namespace: "conversations", ID: "admission-refs"}
 	conversation := c.Conversation{ID: conversationRef.ID}
 	if _, err := root.Conversations().Apply(c.Change[c.Conversation]{ID: "create-admission-refs", Subject: conversationRef, AfterRevision: 1, After: conversation}); err != nil {

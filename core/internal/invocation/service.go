@@ -16,19 +16,28 @@ import (
 )
 
 type Service struct {
-	mu          sync.Mutex
-	store       c.ExecutionStore
-	catalog     *catalog.Service
-	authority   c.Authority
-	shutdown    c.HostShutdownCapability
-	journal     c.Journal
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-	closing     bool
-	workersDone chan struct{}
-	OnResult    func(c.Delivery) error
-	OnCommit    func()
+	mu               sync.Mutex
+	store            c.ExecutionStore
+	catalog          *catalog.Service
+	authority        c.Authority
+	shutdown         c.HostShutdownCapability
+	journal          c.Journal
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
+	closing          bool
+	workersDone      chan struct{}
+	started          bool
+	recovering       bool
+	workers          int
+	workerErr        error
+	observeFailure   func(error)
+	policy           SchedulingPolicy
+	policyConfigured bool
+	physical         map[string]uint32
+	localWake        chan struct{}
+	OnResult         func(c.Delivery) error
+	OnCommit         func()
 }
 
 type pendingReadFailure struct{ cause error }
@@ -73,29 +82,231 @@ func pendingPersistenceError(err error) error {
 var _ c.Caller = (*Service)(nil)
 
 func New(store c.ExecutionStore, cat *catalog.Service, j c.Journal, auth c.Authority) *Service {
-	s := &Service{store: store, catalog: cat, authority: auth, journal: j}
+	s := &Service{store: store, catalog: cat, authority: auth, journal: j, physical: map[string]uint32{}, localWake: make(chan struct{}), policy: DefaultSchedulingPolicy(8)}
 	if auth != nil {
 		s.shutdown = auth.ShutdownCapability(s)
 	}
 	return s
 }
-func (s *Service) Start(ctx context.Context, workers int) {
-	s.ctx, s.cancel = context.WithCancel(ctx)
-	s.workersDone = make(chan struct{})
-	for range workers {
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			for {
-				id, err := s.store.Claim(s.ctx)
-				if err != nil {
-					return
-				}
-				s.run(id)
-			}
-		}()
+func (s *Service) Recover() error {
+	s.mu.Lock()
+	if s.started || s.recovering {
+		s.mu.Unlock()
+		return c.Err("conflict", "Recovery must complete before workers start")
 	}
-	go func() { s.wg.Wait(); close(s.workersDone) }()
+	s.recovering = true
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.recovering = false
+		s.mu.Unlock()
+	}()
+	if _, _, err := s.preflightQueueFacts(); err != nil {
+		return err
+	}
+	if err := s.RetryPending(); err != nil {
+		// A bounded outbox-capacity or CAS race is ordinary retryable work.
+		// Recovery must still fail closed for read and persistence provenance,
+		// even when the underlying fault uses a normally transient code.
+		if IsPendingReadFailure(err) || IsPendingPersistenceFailure(err) {
+			return err
+		}
+		var storageFailure *c.StorageFailure
+		if errors.As(err, &storageFailure) {
+			return err
+		}
+		code := c.AsFault(err).Code
+		if code != "busy" && code != "conflict" {
+			return err
+		}
+	}
+	facts, expectedSchedulingRevision, err := s.preflightQueueFacts()
+	if err != nil {
+		return err
+	}
+	for _, fact := range facts {
+		snap, err := s.store.Get(fact.Call.Subject)
+		if err != nil {
+			return err
+		}
+		if snap.Revision != fact.Call.Revision {
+			return c.Err("conflict", "Execution changed during recovery")
+		}
+		if snap.Value.Lifecycle.State.Terminal() {
+			changesScheduling := fact.Present || fact.SlotHeld
+			_, err = s.store.Commit(c.ExecutionMutation{Subject: snap.Subject, ExpectedRevision: snap.Revision, Queue: &c.QueueMutation{CallID: snap.Value.Call.ID}, Scheduling: &c.SchedulingMutation{ExpectedRevision: expectedSchedulingRevision}})
+			if err != nil {
+				return err
+			}
+			expectedSchedulingRevision, err = s.verifyRecoverySchedulingRevision(expectedSchedulingRevision, changesScheduling)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		unsent := (snap.Value.Lifecycle.State == c.Queued || snap.Value.Lifecycle.State == c.Preparing) && snap.Value.Dispatch == nil
+		if !unsent {
+			state := snap.Value.Lifecycle.State
+			remotePossible := state == c.Dispatching || state == c.Accepted || state == c.Running || state == c.Waiting || state == c.Resuming || state == c.Cancelling || state == c.Unknown || state == c.Reconciling
+			if !remotePossible || snap.Value.Dispatch == nil {
+				return c.Err("conflict", "Execution queue facts do not match its lifecycle")
+			}
+			if err := s.applyRecoveryUnknown(snap, expectedSchedulingRevision); err != nil {
+				return err
+			}
+			changesScheduling := fact.Present || !fact.SlotHeld
+			expectedSchedulingRevision, err = s.verifyRecoverySchedulingRevision(expectedSchedulingRevision, changesScheduling)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		if !snap.Value.Call.Deadline.After(c.Now()) {
+			changesScheduling := fact.Present || fact.SlotHeld
+			if err := s.applyReportAtWithScheduling(c.Report{Evidence: c.Evidence{CallID: snap.Value.Call.ID, Local: true, Confirmed: true}, State: c.Expired, Payload: c.Data{"reason": "deadline_expired"}}, &snap.Revision, &expectedSchedulingRevision); err != nil {
+				return err
+			}
+			expectedSchedulingRevision, err = s.verifyRecoverySchedulingRevision(expectedSchedulingRevision, changesScheduling)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		if s.authority == nil || s.authority.Authorize(snap.Value.Origin, "invoke", snap.Value.Call.Target, snap.Value.Call.Operation) != nil {
+			changesScheduling := fact.Present || fact.SlotHeld
+			if err := s.applyReportAtWithScheduling(c.Report{Evidence: c.Evidence{CallID: snap.Value.Call.ID, Local: true, Confirmed: true}, State: c.Cancelled, Payload: c.Data{"reason": "invoke_authority_revoked"}}, &snap.Revision, &expectedSchedulingRevision); err != nil {
+				return err
+			}
+			expectedSchedulingRevision, err = s.verifyRecoverySchedulingRevision(expectedSchedulingRevision, changesScheduling)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		if fact.Present && !fact.SlotHeld {
+			_, err = s.store.Commit(c.ExecutionMutation{Subject: snap.Subject, ExpectedRevision: snap.Revision, Queue: &c.QueueMutation{CallID: snap.Value.Call.ID, Present: true, SlotHeld: false}, Scheduling: &c.SchedulingMutation{ExpectedRevision: expectedSchedulingRevision}})
+			if err != nil {
+				return err
+			}
+			expectedSchedulingRevision, err = s.verifyRecoverySchedulingRevision(expectedSchedulingRevision, false)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		queue := c.QueueMutation{CallID: snap.Value.Call.ID, Present: true, SlotHeld: false}
+		_, err = s.store.Commit(c.ExecutionMutation{Subject: snap.Subject, ExpectedRevision: snap.Revision, Queue: &queue, Scheduling: &c.SchedulingMutation{ExpectedRevision: expectedSchedulingRevision}})
+		if err != nil {
+			return err
+		}
+		expectedSchedulingRevision, err = s.verifyRecoverySchedulingRevision(expectedSchedulingRevision, true)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) applyRecoveryUnknown(snap c.Snapshot[c.Execution], expectedSchedulingRevision uint64) error {
+	queue := &c.QueueMutation{CallID: snap.Value.Call.ID, Present: false, SlotHeld: true}
+	scheduling := &c.SchedulingMutation{ExpectedRevision: expectedSchedulingRevision}
+	if snap.Value.Lifecycle.State == c.Unknown {
+		_, err := s.store.Commit(c.ExecutionMutation{Subject: snap.Subject, ExpectedRevision: snap.Revision, Queue: queue, Scheduling: scheduling})
+		return err
+	}
+	change, err := lifecycle.Move(snap, c.Transition{
+		Subject: snap.Subject, ExpectedRevision: snap.Revision,
+		From: snap.Value.Lifecycle.State, To: c.Unknown, Reason: "process_restart",
+		Evidence: c.Evidence{CallID: snap.Value.Call.ID, Local: true},
+	})
+	if err != nil {
+		return err
+	}
+	change.After.Result = nil
+	stateChange := c.Change[c.Lifecycle]{
+		ID: change.ID, Subject: change.Subject, BeforeRevision: change.BeforeRevision,
+		AfterRevision: change.AfterRevision, After: change.After.Lifecycle,
+		Reason: change.Reason, At: change.At,
+	}
+	event := lifecycle.StateEvent(stateChange, c.Event{
+		CallID: snap.Value.Call.ID, CorrelationID: snap.Value.Call.CorrelationID,
+		CausationID: snap.Value.Call.CausationID, ConversationID: snap.Value.Call.ConversationID,
+	})
+	delivery := c.Delivery{ID: event.ID, Kind: c.DeliveryJournal, Event: &event}
+	_, err = s.store.Commit(c.ExecutionMutation{
+		Subject: snap.Subject, ExpectedRevision: snap.Revision,
+		Changes: []c.Change[c.Execution]{change}, Deliveries: []c.Delivery{delivery},
+		Queue: queue, Scheduling: scheduling,
+	})
+	return err
+}
+
+func (s *Service) preflightQueueFacts() ([]c.QueueFact, uint64, error) {
+	facts, count, schedulingRevision, err := s.store.ReadQueueFacts()
+	if err != nil {
+		return nil, 0, err
+	}
+	if count > 1000 || uint64(len(facts)) != count {
+		return nil, 0, c.Err("invalid_input", "Queue recovery facts are incomplete")
+	}
+	seenCalls, seenSequences := map[string]bool{}, map[uint64]bool{}
+	for _, fact := range facts {
+		if !fact.Call.Subject.Valid() || fact.Call.Subject.Namespace != "calls" || fact.Call.Revision == 0 || fact.Present && fact.SlotHeld || seenCalls[fact.Call.Subject.Key()] {
+			return nil, 0, c.Err("invalid_input", "Queue recovery fact identity is invalid")
+		}
+		seenCalls[fact.Call.Subject.Key()] = true
+		snap, err := s.store.Get(fact.Call.Subject)
+		if err != nil {
+			return nil, 0, err
+		}
+		if snap.Revision != fact.Call.Revision || snap.Value.Call.ID != fact.Call.Subject.ID || !snap.Value.Call.Target.Valid() {
+			return nil, 0, c.Err("invalid_input", "Queue recovery execution reference is invalid")
+		}
+		if fact.Metadata != nil {
+			m := fact.Metadata
+			if !m.Admission.Subject.Valid() || m.Admission.Subject != fact.Call.Subject || m.Admission.Revision == 0 || m.Admission.Revision > fact.Call.Revision || m.At.IsZero() || m.Sequence == 0 || seenSequences[m.Sequence] {
+				return nil, 0, c.Err("invalid_input", "Queue recovery metadata is invalid")
+			}
+			seenSequences[m.Sequence] = true
+		}
+		state := snap.Value.Lifecycle.State
+		if state.Terminal() {
+			if fact.Present || fact.SlotHeld {
+				return nil, 0, c.Err("invalid_input", "Terminal execution has active queue facts")
+			}
+			continue
+		}
+		if fact.Metadata == nil {
+			return nil, 0, c.Err("invalid_input", "Nonterminal execution is missing queue metadata")
+		}
+		unsent := state == c.Queued || state == c.Preparing
+		if unsent {
+			if snap.Value.Dispatch != nil {
+				return nil, 0, c.Err("invalid_input", "Unsent execution has inconsistent dispatch facts")
+			}
+			continue
+		}
+		remotePossible := state == c.Dispatching || state == c.Accepted || state == c.Running || state == c.Waiting || state == c.Resuming || state == c.Cancelling || state == c.Unknown || state == c.Reconciling
+		if !remotePossible || snap.Value.Dispatch == nil || fact.Present || !fact.SlotHeld {
+			return nil, 0, c.Err("invalid_input", "Remote-possible execution has inconsistent queue facts")
+		}
+	}
+	return facts, schedulingRevision, nil
+}
+
+func (s *Service) verifyRecoverySchedulingRevision(expected uint64, changed bool) (uint64, error) {
+	view, _, err := s.store.ReadScheduling()
+	if err != nil {
+		return 0, err
+	}
+	want := expected
+	if changed {
+		want++
+	}
+	if view.Revision != want {
+		return 0, c.Err("conflict", "Scheduling facts changed during recovery")
+	}
+	return want, nil
 }
 
 func (s *Service) LocalStopped() bool {
@@ -144,18 +355,44 @@ func (s *Service) SubmitBatch(origin c.AdmissionOrigin, calls []c.Call, effects 
 	if s.closing {
 		return nil, c.Err("busy", "Host is draining")
 	}
-	if len(calls) > 256 {
-		return nil, c.Err("busy", "Batch exceeds queue capacity")
+	if s.recovering {
+		return nil, c.Err("busy", "Host recovery is in progress")
+	}
+	if s.workerErr != nil {
+		return nil, s.workerErr
+	}
+	var scheduling c.SchedulingView
+	if len(calls) > 0 {
+		var readErr error
+		scheduling, _, readErr = s.store.ReadScheduling()
+		if readErr != nil {
+			return nil, asStorageFailure(readErr)
+		}
+		if uint32(len(scheduling.Eligible)+len(calls)) > s.policy.WaitingLimit {
+			return nil, c.Err("busy", "Waiting call capacity exhausted")
+		}
+		targetWaiting := map[string]uint32{}
+		for _, candidate := range scheduling.Eligible {
+			targetWaiting[candidate.Target.Key()]++
+		}
+		for _, call := range calls {
+			if targetWaiting[call.Target.Key()]+1 > s.policy.target(call.Target).WaitingLimit {
+				return nil, c.Err("busy", "Target waiting call capacity exhausted")
+			}
+			targetWaiting[call.Target.Key()]++
+		}
 	}
 	changes := []c.Change[c.Execution]{}
 	out := []c.Snapshot[c.Execution]{}
 	counts := map[string]int{}
-	storedCalls, err := s.store.List()
-	if err != nil {
-		return nil, err
-	}
-	for _, old := range storedCalls {
-		counts[old.Value.Call.CorrelationID]++
+	if len(calls) > 0 {
+		storedCalls, err := s.store.List()
+		if err != nil {
+			return nil, err
+		}
+		for _, old := range storedCalls {
+			counts[old.Value.Call.CorrelationID]++
+		}
 	}
 	for _, call := range calls {
 		encoded, encodeErr := json.Marshal(call)
@@ -212,7 +449,24 @@ func (s *Service) SubmitBatch(origin c.AdmissionOrigin, calls []c.Call, effects 
 		ev := lifecycle.StateEvent(c.Change[c.Lifecycle]{ID: ch.ID, Subject: ch.Subject, BeforeRevision: ch.BeforeRevision, AfterRevision: ch.AfterRevision, After: ch.After.Lifecycle, Reason: ch.Reason, At: ch.At}, context)
 		deliveries = append(deliveries, c.Delivery{ID: ev.ID, Event: &ev})
 	}
-	if err := s.store.CommitAdmission(c.AdmissionCommit{Changes: changes, Deliveries: deliveries, Effect: effect}); err != nil {
+	queues := make([]c.QueueMutation, 0, len(calls))
+	for _, snap := range out {
+		var admission c.Change[c.Execution]
+		for i := len(changes) - 1; i >= 0; i-- {
+			if changes[i].Subject == snap.Subject {
+				admission = changes[i]
+				break
+			}
+		}
+		metadata := c.QueueMetadata{Admission: c.RevisionRef{Subject: admission.Subject, Revision: admission.AfterRevision}, At: admission.At}
+		queues = append(queues, c.QueueMutation{CallID: snap.Value.Call.ID, Present: true, Metadata: &metadata})
+	}
+	commit := c.AdmissionCommit{Changes: changes, Deliveries: deliveries, Effect: effect}
+	if len(calls) > 0 {
+		commit.Queue = queues
+		commit.Scheduling = &c.SchedulingMutation{ExpectedRevision: scheduling.Revision}
+	}
+	if err := s.store.CommitAdmission(commit); err != nil {
 		return nil, err
 	}
 	wake = s.OnCommit
@@ -237,6 +491,15 @@ func (s *Service) List() ([]c.Snapshot[c.Execution], error) {
 	sort.Slice(out, func(i, j int) bool { return out[i].Value.Call.ID < out[j].Value.Call.ID })
 	return out, nil
 }
+func (s *Service) ReadSummaries() ([]c.ExecutionSummary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out, err := s.store.ReadSummaries()
+	if err != nil {
+		return nil, asStorageFailure(err)
+	}
+	return out, nil
+}
 func (s *Service) localMove(old c.Snapshot[c.Execution], next c.State) (c.Snapshot[c.Execution], error) {
 	reason := string(next)
 	err := s.applyReport(c.Report{Evidence: c.Evidence{CallID: old.Value.Call.ID, Confirmed: true, Local: true}, State: next, Payload: c.Data{"reason": reason}})
@@ -253,91 +516,144 @@ func (s *Service) PendingObservationCount() (int, error) {
 	}
 	return len(items), nil
 }
-func (s *Service) run(id string) {
-	defer func() {
-		if recover() != nil {
-			s.failPanic(id)
+func (s *Service) prepareClaim(old c.Snapshot[c.Execution]) (c.Call, c.Node, c.Connector, bool) {
+	id := old.Value.Call.ID
+	call := old.Value.Call
+	if !call.Deadline.After(c.Now()) {
+		s.applyClaimReport(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Expired, Payload: c.Data{"reason": "deadline_expired"}}, old.Revision)
+		return c.Call{}, c.Node{}, nil, false
+	}
+	if s.authority == nil || s.authority.Authorize(old.Value.Origin, "invoke", call.Target, call.Operation) != nil {
+		s.applyClaimReport(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Cancelled, Payload: c.Data{"reason": "invoke_authority_revoked"}}, old.Revision)
+		return c.Call{}, c.Node{}, nil, false
+	}
+	node, _, err := s.catalog.Validate(call.Target, call.Operation, call.Input)
+	if err != nil {
+		if catalog.ReadCause(err) != nil {
+			failure := &c.StorageFailure{Cause: catalog.ReadCause(err)}
+			s.mu.Lock()
+			observer := s.recordWorkerFailureLocked(failure)
+			s.mu.Unlock()
+			if observer != nil {
+				observer(failure)
+			}
+			return c.Call{}, c.Node{}, nil, false
 		}
-	}()
-	call, n, connector, ready := s.prepare(id)
-	if !ready {
+		result := c.Result{CallID: id, State: c.Failed, Error: c.AsFault(err)}
+		s.applyClaimReport(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, Result: &result}, old.Revision)
+		return c.Call{}, c.Node{}, nil, false
+	}
+	connector := s.catalog.Connector(node.Value.ConnectorID)
+	if connector == nil {
+		result := c.Result{CallID: id, State: c.Failed, Error: &c.Fault{Code: "connector_unavailable", Message: "Node connector is unavailable"}}
+		s.applyClaimReport(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, Result: &result}, old.Revision)
+		return c.Call{}, c.Node{}, nil, false
+	}
+	bindingDigest, err := c.CanonicalJSONDigest(node.Value.Binding)
+	if err != nil {
+		result := c.Result{CallID: id, State: c.Failed, Error: &c.Fault{Code: "invalid_input", Message: "Node binding is invalid"}}
+		s.applyClaimReport(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, Result: &result}, old.Revision)
+		return c.Call{}, c.Node{}, nil, false
+	}
+	identity := c.DispatchIdentity{NodeID: node.Value.ID, NodeRevision: node.Revision, ConnectorID: node.Value.ConnectorID, BindingDigest: bindingDigest, RemoteID: call.ID}
+	change, err := lifecycle.Dispatch(old, identity)
+	if err != nil {
+		s.requeueClaim(old)
+		return c.Call{}, c.Node{}, nil, false
+	}
+	event := lifecycle.StateEvent(c.Change[c.Lifecycle]{ID: change.ID, Subject: change.Subject, BeforeRevision: change.BeforeRevision, AfterRevision: change.AfterRevision, After: change.After.Lifecycle, Reason: change.Reason, At: change.At}, c.Event{CallID: call.ID, CorrelationID: call.CorrelationID, ConversationID: call.ConversationID})
+	carrier := c.RevisionRef{Subject: node.Subject, Revision: node.Revision}
+	s.mu.Lock()
+	if s.workerErr != nil || s.ctx.Err() != nil {
+		s.mu.Unlock()
+		s.requeueClaim(old)
+		return c.Call{}, c.Node{}, nil, false
+	}
+	if s.authority == nil || s.authority.Authorize(old.Value.Origin, "invoke", call.Target, call.Operation) != nil {
+		s.mu.Unlock()
+		s.applyClaimReport(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Cancelled, Payload: c.Data{"reason": "invoke_authority_revoked"}}, old.Revision)
+		return c.Call{}, c.Node{}, nil, false
+	}
+	_, err = s.store.Commit(c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: old.Revision, Changes: []c.Change[c.Execution]{change}, Deliveries: []c.Delivery{{ID: event.ID, Event: &event}}, NodeRevision: &carrier})
+	failure, _ := classifySchedulingCommit(err)
+	if failure != nil {
+		observer := s.recordWorkerFailureLocked(failure)
+		s.mu.Unlock()
+		if observer != nil {
+			observer(failure)
+		}
+		return c.Call{}, c.Node{}, nil, false
+	}
+	s.mu.Unlock()
+	if err != nil {
+		s.requeueClaim(old)
+		return c.Call{}, c.Node{}, nil, false
+	}
+	return call, node.Value, connector, true
+}
+
+func (s *Service) applyClaimReport(report c.Report, expectedRevision uint64) {
+	err := s.applyReportAt(report, &expectedRevision)
+	s.recordClaimFailure(err)
+}
+
+func (s *Service) recordClaimFailure(err error) {
+	if err == nil {
 		return
 	}
-	ctx, cancel := context.WithDeadline(s.ctx, call.Deadline)
-	defer cancel()
-	result := connector.Invoke(ctx, n.Binding, call, func(report c.Report) error { return s.report(id, report) })
-	s.finish(id, result)
-}
-func (s *Service) prepare(id string) (c.Call, c.Node, c.Connector, bool) {
-	for attempt := 0; attempt < 8; attempt++ {
-		old, err := s.store.Get(ref(id))
-		if err != nil {
-			return c.Call{}, c.Node{}, nil, false
-		}
-		state := old.Value.Lifecycle.State
-		if state != c.Queued && state != c.Preparing || old.Value.Dispatch != nil {
-			return c.Call{}, c.Node{}, nil, false
-		}
-		if state == c.Queued {
-			obs := lifecycle.Observe(old, c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Preparing, Payload: c.Data{"reason": "preparing"}})
-			if obs.Err != nil || len(obs.Changes) != 1 {
-				return c.Call{}, c.Node{}, nil, false
-			}
-			old, err = s.store.Commit(c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: old.Revision, Changes: obs.Changes, Deliveries: obs.Deliveries})
-			if err != nil {
-				if c.AsFault(err).Code == "conflict" {
-					continue
-				}
-				return c.Call{}, c.Node{}, nil, false
-			}
-		}
-		call := old.Value.Call
-		if !call.Deadline.After(c.Now()) {
-			_ = s.applyReportAt(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Expired, Payload: c.Data{"reason": "deadline_expired"}}, &old.Revision)
-			return c.Call{}, c.Node{}, nil, false
-		}
-		if s.authority == nil || s.authority.Authorize(old.Value.Origin, "invoke", call.Target, call.Operation) != nil {
-			_ = s.applyReportAt(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Cancelled, Payload: c.Data{"reason": "invoke_authority_revoked"}}, &old.Revision)
-			return c.Call{}, c.Node{}, nil, false
-		}
-		node, _, err := s.catalog.Validate(call.Target, call.Operation, call.Input)
-		if err != nil {
-			if catalog.ReadCause(err) != nil {
-				return c.Call{}, c.Node{}, nil, false
-			}
-			result := c.Result{CallID: id, State: c.Failed, Error: c.AsFault(err)}
-			_ = s.applyReportAt(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, Result: &result}, &old.Revision)
-			return c.Call{}, c.Node{}, nil, false
-		}
-		connector := s.catalog.Connector(node.Value.ConnectorID)
-		if connector == nil {
-			result := c.Result{CallID: id, State: c.Failed, Error: &c.Fault{Code: "connector_unavailable", Message: "Node connector is unavailable"}}
-			_ = s.applyReportAt(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, Result: &result}, &old.Revision)
-			return c.Call{}, c.Node{}, nil, false
-		}
-		bindingDigest, err := c.CanonicalJSONDigest(node.Value.Binding)
-		if err != nil {
-			result := c.Result{CallID: id, State: c.Failed, Error: &c.Fault{Code: "invalid_input", Message: "Node binding is invalid"}}
-			_ = s.applyReportAt(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, Result: &result}, &old.Revision)
-			return c.Call{}, c.Node{}, nil, false
-		}
-		identity := c.DispatchIdentity{NodeID: node.Value.ID, NodeRevision: node.Revision, ConnectorID: node.Value.ConnectorID, BindingDigest: bindingDigest, RemoteID: call.ID}
-		change, err := lifecycle.Dispatch(old, identity)
-		if err != nil {
-			return c.Call{}, c.Node{}, nil, false
-		}
-		event := lifecycle.StateEvent(c.Change[c.Lifecycle]{ID: change.ID, Subject: change.Subject, BeforeRevision: change.BeforeRevision, AfterRevision: change.AfterRevision, After: change.After.Lifecycle, Reason: change.Reason, At: change.At}, c.Event{CallID: call.ID, CorrelationID: call.CorrelationID, ConversationID: call.ConversationID})
-		carrier := c.RevisionRef{Subject: node.Subject, Revision: node.Revision}
-		if _, err = s.store.Commit(c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: old.Revision, Changes: []c.Change[c.Execution]{change}, Deliveries: []c.Delivery{{ID: event.ID, Event: &event}}, NodeRevision: &carrier}); err != nil {
-			if c.AsFault(err).Code == "conflict" {
-				continue
-			}
-			return c.Call{}, c.Node{}, nil, false
-		}
-		return call, node.Value, connector, true
+	cause := PendingReadCause(err)
+	if cause == nil {
+		cause = PendingPersistenceCause(err)
 	}
-	_ = s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, Name: "observation", Payload: c.Data{"reason": "prepare_revalidation_exhausted"}})
-	return c.Call{}, c.Node{}, nil, false
+	if cause == nil {
+		var storageFailure *c.StorageFailure
+		if errors.As(err, &storageFailure) {
+			cause = err
+		}
+	}
+	if cause == nil {
+		return
+	}
+	failure := asStorageFailure(cause)
+	s.mu.Lock()
+	observer := s.recordWorkerFailureLocked(failure)
+	s.mu.Unlock()
+	if observer != nil {
+		observer(failure)
+	}
+}
+
+func (s *Service) requeueClaim(old c.Snapshot[c.Execution]) {
+	s.mu.Lock()
+	current, err := s.store.Get(old.Subject)
+	if err != nil {
+		failure := asStorageFailure(err)
+		observer := s.recordWorkerFailureLocked(failure)
+		s.mu.Unlock()
+		if observer != nil {
+			observer(failure)
+		}
+		return
+	}
+	if current.Value.Lifecycle.State.Terminal() || current.Value.Dispatch != nil || current.Revision != old.Revision {
+		s.mu.Unlock()
+		return
+	}
+	queue := c.QueueMutation{CallID: old.Value.Call.ID, Present: true, SlotHeld: false}
+	_, err = s.store.Commit(c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: current.Revision, Queue: &queue})
+	failure, _ := classifySchedulingCommit(err)
+	if failure != nil {
+		observer := s.recordWorkerFailureLocked(failure)
+		s.mu.Unlock()
+		if observer != nil {
+			observer(failure)
+		}
+		return
+	}
+	s.mu.Unlock()
+	if err == nil {
+		s.wakeCommit()
+	}
 }
 func (s *Service) report(id string, r c.Report) error {
 	if r.Evidence.CallID == "" {
@@ -358,7 +674,8 @@ func (s *Service) report(id string, r c.Report) error {
 	return s.applyReport(r)
 }
 func (s *Service) finish(id string, result c.Result) {
-	_ = s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id, Confirmed: result.State.Terminal() || result.State == c.Waiting}, Result: &result})
+	err := s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id, Confirmed: result.State.Terminal() || result.State == c.Waiting}, Result: &result})
+	s.recordClaimFailure(err)
 }
 
 func (s *Service) dispatchRoute(execution c.Snapshot[c.Execution]) (c.Snapshot[c.Node], c.Operation, c.Connector, error) {
@@ -432,6 +749,10 @@ func (s *Service) applyReport(r c.Report) error {
 }
 
 func (s *Service) applyReportAt(r c.Report, expectedRevision *uint64) error {
+	return s.applyReportAtWithScheduling(r, expectedRevision, nil)
+}
+
+func (s *Service) applyReportAtWithScheduling(r c.Report, expectedRevision, expectedSchedulingRevision *uint64) error {
 	id := r.Evidence.CallID
 	if id == "" {
 		return c.Err("invalid_input", "Report has no Call ID")
@@ -505,10 +826,20 @@ func (s *Service) applyReportAt(r c.Report, expectedRevision *uint64) error {
 		if err != nil {
 			return err
 		}
-		if len(obs.Changes) == 0 && len(obs.Deliveries) == 0 && pendingMutation == nil {
+		if len(obs.Changes) == 0 && len(obs.Deliveries) == 0 && pendingMutation == nil && expectedSchedulingRevision == nil {
 			return resultErr
 		}
-		_, err = s.store.Commit(c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: old.Revision, Changes: obs.Changes, Deliveries: obs.Deliveries, Pending: pendingMutation})
+		mutation := c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: old.Revision, Changes: obs.Changes, Deliveries: obs.Deliveries, Pending: pendingMutation}
+		if expectedSchedulingRevision != nil {
+			mutation.Scheduling = &c.SchedulingMutation{ExpectedRevision: *expectedSchedulingRevision}
+			if len(obs.Changes) == 0 || !obs.Changes[len(obs.Changes)-1].After.Lifecycle.State.Terminal() {
+				mutation.Queue = &c.QueueMutation{CallID: id, Present: false, SlotHeld: true}
+			}
+		}
+		if len(obs.Changes) > 0 && obs.Changes[len(obs.Changes)-1].After.Lifecycle.State.Terminal() {
+			mutation.Queue = &c.QueueMutation{CallID: id, Present: false, SlotHeld: false}
+		}
+		_, err = s.store.Commit(mutation)
 		if err == nil {
 			s.mu.Lock()
 			wake = s.OnCommit
@@ -723,7 +1054,11 @@ func (s *Service) RetryPending() error {
 	var transient error
 	for _, item := range items {
 		if err := s.applyReport(item.Report); err != nil {
-			if IsPendingReadFailure(err) {
+			if IsPendingReadFailure(err) || IsPendingPersistenceFailure(err) {
+				return err
+			}
+			var storageFailure *c.StorageFailure
+			if errors.As(err, &storageFailure) {
 				return err
 			}
 			code := c.AsFault(err).Code
@@ -742,7 +1077,16 @@ func (s *Service) RetryPending() error {
 func (s *Service) failPanic(id string) {
 	s.mu.Lock()
 	old, err := s.store.Get(ref(id))
-	if err != nil || old.Value.Lifecycle.State.Terminal() {
+	if err != nil {
+		failure := asStorageFailure(err)
+		observer := s.recordWorkerFailureLocked(failure)
+		s.mu.Unlock()
+		if observer != nil {
+			observer(failure)
+		}
+		return
+	}
+	if old.Value.Lifecycle.State.Terminal() {
 		s.mu.Unlock()
 		return
 	}
@@ -751,15 +1095,16 @@ func (s *Service) failPanic(id string) {
 		s.mu.Unlock()
 		old, err = s.localMove(old, c.Preparing)
 		if err != nil {
+			s.recordClaimFailure(err)
 			return
 		}
 		state = c.Preparing
 		s.mu.Lock()
 	}
 	if state == c.Preparing {
-		s.mu.Unlock()
 		result := c.Result{CallID: id, State: c.Failed, Error: &c.Fault{Code: "connector_panic", Message: "Preparation interrupted before dispatch"}}
-		_ = s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, Result: &result})
+		s.mu.Unlock()
+		s.applyClaimReport(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, Result: &result}, old.Revision)
 		return
 	}
 	s.mu.Unlock()
@@ -999,15 +1344,21 @@ func (s *Service) Close(ctx context.Context, observeFirstError func(error)) (clo
 	}
 	s.mu.Lock()
 	s.closing = true
+	workersDone := s.workersDone
+	cancelWorkers := s.cancel
+	firstWorkerErr := s.workerErr
 	s.mu.Unlock()
-	initial, err := s.List()
+	if firstWorkerErr != nil {
+		recordQueryError(firstWorkerErr)
+	}
+	initial, err := s.ReadSummaries()
 	if err != nil {
 		recordQueryError(err)
 	} else {
-		for _, snap := range initial {
-			state := snap.Value.Lifecycle.State
+		for _, summary := range initial {
+			state := summary.State
 			if state == c.Created || state == c.Validating || state == c.Queued || state == c.Preparing {
-				_, abortErr := s.abort(ctx, snap.Value.Call.ID, "host_shutdown", nil, true)
+				_, abortErr := s.abort(ctx, summary.Call.Subject.ID, "host_shutdown", nil, true)
 				if cause := pendingControlFailureCause(abortErr); cause != nil {
 					recordQueryError(cause)
 				}
@@ -1021,13 +1372,13 @@ func (s *Service) Close(ctx context.Context, observeFirstError func(error)) (clo
 draining:
 	for {
 		active := false
-		calls, listErr := s.List()
+		calls, listErr := s.ReadSummaries()
 		if listErr != nil {
 			recordQueryError(listErr)
 			break draining
 		}
-		for _, snap := range calls {
-			state := snap.Value.Lifecycle.State
+		for _, summary := range calls {
+			state := summary.State
 			if !state.Terminal() && state != c.Waiting && state != c.Unknown {
 				active = true
 				break
@@ -1044,27 +1395,28 @@ draining:
 		case <-tick.C:
 		}
 	}
-	remaining, listErr := s.List()
+	remaining, listErr := s.ReadSummaries()
 	if listErr != nil {
 		recordQueryError(listErr)
 	} else {
-		for _, snap := range remaining {
-			state := snap.Value.Lifecycle.State
+		for _, summary := range remaining {
+			state := summary.State
 			if !state.Terminal() && state != c.Waiting && state != c.Unknown {
-				_, abortErr := s.abort(ctx, snap.Value.Call.ID, "host_shutdown", nil, true)
+				_, abortErr := s.abort(ctx, summary.Call.Subject.ID, "host_shutdown", nil, true)
 				if cause := pendingControlFailureCause(abortErr); cause != nil {
 					recordQueryError(cause)
 				}
 			}
 		}
 	}
-	if s.cancel != nil {
-		s.cancel()
+	if cancelWorkers != nil {
+		cancelWorkers()
 	}
-	done := make(chan struct{})
-	go func() { s.wg.Wait(); close(done) }()
+	if workersDone == nil {
+		return closeErr
+	}
 	select {
-	case <-done:
+	case <-workersDone:
 		return closeErr
 	case <-ctx.Done():
 		recordError(ctx.Err())
