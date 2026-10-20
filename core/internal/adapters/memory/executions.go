@@ -12,7 +12,7 @@ import (
 const (
 	generalPendingLimit         = 8192
 	generalReceiptLimit         = 65536
-	terminalDeliveryReservation = 24
+	terminalDeliveryReservation = 48
 )
 
 type deliveryReceipt struct {
@@ -30,14 +30,37 @@ type Executions struct {
 	terminalReceipts map[string]deliveryReceipt
 	ackOrder         []string
 	reserved         map[string]int
+	root             *Root
 }
 
 func NewExecutions(records, queue int) *Executions {
-	return &Executions{Store: NewStore[c.Execution](records), queue: NewQueue(queue), pending: []c.Delivery{}, receipts: map[string]deliveryReceipt{}, terminalReceipts: map[string]deliveryReceipt{}, reserved: map[string]int{}}
+	return newExecutions(NewStore[c.Execution](records), queue, nil)
+}
+func newExecutions(store *Store[c.Execution], queue int, root *Root) *Executions {
+	return &Executions{Store: store, queue: NewQueue(queue), pending: []c.Delivery{}, receipts: map[string]deliveryReceipt{}, terminalReceipts: map[string]deliveryReceipt{}, reserved: map[string]int{}, root: root}
 }
 func (s *Executions) Claim(ctx context.Context) (string, error) { return s.queue.Claim(ctx) }
 
 func (s *Executions) CommitBatch(changes []c.Change[c.Execution], deliveries ...c.Delivery) error {
+	return s.CommitAdmission(c.AdmissionCommit{Changes: changes, Deliveries: deliveries})
+}
+func (s *Executions) CommitAdmission(admission c.AdmissionCommit) error {
+	if admission.Effect != nil {
+		staged, err := copyAdmissionEffect(*admission.Effect)
+		if err != nil {
+			return c.Err("invalid_input", "Admission effect cannot be stored")
+		}
+		admission.Effect = &staged
+	}
+	changes, deliveries := admission.Changes, admission.Deliveries
+	allDeliveries := append(append([]c.Delivery{}, deliveries...), admissionDeliveries(admission.Effect)...)
+	for i, d := range allDeliveries {
+		staged, err := copyDelivery(d)
+		if err != nil {
+			return c.Err("invalid_input", "Delivery cannot be stored")
+		}
+		allDeliveries[i] = staged
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.queue.mu.Lock()
@@ -51,11 +74,14 @@ func (s *Executions) CommitBatch(changes []c.Change[c.Execution], deliveries ...
 		key := ch.Subject.Key()
 		old, stagedAlready := staged[key]
 		_, exists := s.entries[key]
+		if ch.Subject.Namespace != "calls" || ch.Subject.ID != ch.After.Call.ID || !c.ValidID(ch.After.Call.ID) {
+			return c.Err("invalid_input", "Call change identity does not match its subject")
+		}
 		if exists || !ch.Subject.Valid() || ch.AfterRevision != ch.BeforeRevision+1 || (!stagedAlready && ch.BeforeRevision != 0) || stagedAlready && old.Revision != ch.BeforeRevision {
 			return c.Err("conflict", "Call ID already exists or batch revision is invalid")
 		}
 		if stagedAlready {
-			if ch.Before == nil || !reflect.DeepEqual(*ch.Before, old.Value) {
+			if ch.Before == nil || ch.After.Call.ID != old.Value.Call.ID || !reflect.DeepEqual(*ch.Before, old.Value) {
 				return c.Err("conflict", "Call batch before value is invalid")
 			}
 		} else if ch.Before != nil {
@@ -75,7 +101,15 @@ func (s *Executions) CommitBatch(changes []c.Change[c.Execution], deliveries ...
 			return c.Err("invalid_input", "Batch must end at queued")
 		}
 	}
-	if err := s.checkDeliveriesLocked(deliveries, newCalls); err != nil {
+	if admission.Effect != nil {
+		if s.root == nil {
+			return c.Err("internal", "Admission state is unavailable")
+		}
+		if err := s.root.validateEffectLocked(admission.Effect, newCalls); err != nil {
+			return err
+		}
+	}
+	if err := s.checkDeliveriesLocked(allDeliveries, newCalls); err != nil {
 		return err
 	}
 	for k, v := range staged {
@@ -84,7 +118,10 @@ func (s *Executions) CommitBatch(changes []c.Change[c.Execution], deliveries ...
 	for id := range newCalls {
 		s.reserved[id] = terminalDeliveryReservation
 	}
-	s.appendDeliveriesLocked(deliveries, newCalls)
+	s.appendDeliveriesLocked(allDeliveries, newCalls)
+	if admission.Effect != nil {
+		s.root.commitEffectLocked(admission.Effect)
+	}
 	for _, id := range ids {
 		s.queue.pending <- id
 	}
@@ -92,12 +129,22 @@ func (s *Executions) CommitBatch(changes []c.Change[c.Execution], deliveries ...
 }
 
 func (s *Executions) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], error) {
+	for i, d := range m.Deliveries {
+		staged, err := copyDelivery(d)
+		if err != nil {
+			return c.Snapshot[c.Execution]{}, c.Err("invalid_input", "Delivery cannot be stored")
+		}
+		m.Deliveries[i] = staged
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.outboxMu.Lock()
 	defer s.outboxMu.Unlock()
+	if m.Subject.Namespace != "calls" {
+		return c.Snapshot[c.Execution]{}, c.Err("invalid_input", "Execution subject must be a call")
+	}
 	old, exists := s.entries[m.Subject.Key()]
-	if !exists || old.Revision != m.ExpectedRevision {
+	if !exists || old.Revision != m.ExpectedRevision || old.Value.Call.ID != m.Subject.ID {
 		return c.Snapshot[c.Execution]{}, c.Err("conflict", "Execution revision conflict")
 	}
 	if len(m.Changes) == 0 {
@@ -109,7 +156,10 @@ func (s *Executions) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], err
 	}
 	current := c.Clone(old)
 	for _, ch := range m.Changes {
-		if ch.Subject != m.Subject || ch.BeforeRevision != current.Revision || ch.AfterRevision != ch.BeforeRevision+1 || ch.Before == nil || !reflect.DeepEqual(*ch.Before, current.Value) {
+		if ch.Subject.Namespace != "calls" || ch.Subject.ID != m.Subject.ID || ch.After.Call.ID != m.Subject.ID {
+			return c.Snapshot[c.Execution]{}, c.Err("invalid_input", "Execution mutation changed Call identity")
+		}
+		if ch.BeforeRevision != current.Revision || ch.AfterRevision != ch.BeforeRevision+1 || ch.Before == nil || !reflect.DeepEqual(*ch.Before, current.Value) {
 			return c.Snapshot[c.Execution]{}, c.Err("conflict", "Execution mutation changes are not contiguous")
 		}
 		current = c.Snapshot[c.Execution]{Subject: ch.Subject, Revision: ch.AfterRevision, Value: c.Clone(ch.After)}
@@ -123,13 +173,77 @@ func (s *Executions) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], err
 }
 
 func deliveryDigest(d c.Delivery) (string, error) {
+	kind := d.Kind
+	if kind == "" {
+		if d.Execution != nil {
+			kind = c.DeliveryCompletion
+		} else if d.Event != nil && d.Event.Category == "published" {
+			kind = c.DeliveryPublish
+		} else {
+			kind = c.DeliveryJournal
+		}
+	}
+	d.Kind = kind
 	b, e := json.Marshal(d)
 	if e != nil {
 		return "", e
 	}
-	return c.ID(string(b)), nil
+	var canonical any
+	if e = json.Unmarshal(b, &canonical); e != nil {
+		return "", e
+	}
+	object, ok := canonical.(map[string]any)
+	if !ok {
+		return "", c.Err("invalid_input", "Delivery is not an object")
+	}
+	var emissions any
+	if d.Execution != nil && d.Execution.Value.Result != nil {
+		emissionBytes, err := json.Marshal(d.Execution.Value.Result.Emissions)
+		if err != nil {
+			return "", err
+		}
+		if err = json.Unmarshal(emissionBytes, &emissions); err != nil {
+			return "", err
+		}
+	}
+	object["private_emissions"] = emissions
+	canonicalBytes, err := json.Marshal(object)
+	if err != nil {
+		return "", err
+	}
+	return c.ID(string(canonicalBytes)), nil
+}
+func cloneDelivery(d c.Delivery) c.Delivery {
+	out, err := copyDelivery(d)
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+func copyDelivery(d c.Delivery) (c.Delivery, error) {
+	b, err := json.Marshal(d)
+	if err != nil {
+		return c.Delivery{}, err
+	}
+	var out c.Delivery
+	if err = json.Unmarshal(b, &out); err != nil {
+		return c.Delivery{}, err
+	}
+	if d.Execution != nil && d.Execution.Value.Result != nil && out.Execution != nil && out.Execution.Value.Result != nil {
+		b, err = json.Marshal(d.Execution.Value.Result.Emissions)
+		if err != nil {
+			return c.Delivery{}, err
+		}
+		if err = json.Unmarshal(b, &out.Execution.Value.Result.Emissions); err != nil {
+			return c.Delivery{}, err
+		}
+	}
+	return out, nil
 }
 func deliveryCallID(d c.Delivery) string {
+	if d.ReservationCallID != "" {
+		return d.ReservationCallID
+	}
 	if d.Execution != nil {
 		return d.Execution.Value.Call.ID
 	}
@@ -139,37 +253,7 @@ func deliveryCallID(d c.Delivery) string {
 	return ""
 }
 func needsTerminalReservation(d c.Delivery) bool {
-	if d.Execution != nil {
-		return true
-	}
-	if d.Event == nil {
-		return false
-	}
-	if d.Event.Category == "published" && d.Event.CallID != "" && d.Event.CausationID == d.Event.CallID {
-		return true
-	}
-	if d.Event.Name == "state.changed" {
-		switch state := d.Event.Payload["state"].(type) {
-		case c.State:
-			return state.Terminal()
-		case string:
-			return c.State(state).Terminal()
-		}
-	}
-	return false
-}
-func isReconcilingStateEvent(d c.Delivery) bool {
-	if d.Event == nil || d.Event.Name != "state.changed" {
-		return false
-	}
-	switch state := d.Event.Payload["state"].(type) {
-	case c.State:
-		return state == c.Reconciling
-	case string:
-		return c.State(state) == c.Reconciling
-	default:
-		return false
-	}
+	return d.ReservationCallID != "" || d.Execution != nil
 }
 func (s *Executions) receiptLocked(id string) (deliveryReceipt, bool) {
 	if r, ok := s.terminalReceipts[id]; ok {
@@ -193,17 +277,32 @@ func (s *Executions) checkDeliveriesLocked(ds []c.Delivery, newCalls map[string]
 	newReceipts := 0
 	newReserved := map[string]int{}
 	batchIDs := map[string]string{}
-	terminalOwners := map[string]bool{}
-	for _, d := range ds {
-		if needsTerminalReservation(d) {
-			if owner := deliveryCallID(d); owner != "" {
-				terminalOwners[owner] = true
-			}
-		}
-	}
 	for _, d := range ds {
 		if d.ID == "" || ((d.Event == nil) == (d.Execution == nil)) {
 			return c.Err("invalid_input", "Delivery must contain exactly one payload")
+		}
+		kind := d.Kind
+		if kind == "" {
+			if d.Execution != nil {
+				kind = c.DeliveryCompletion
+			} else if d.Event.Category == "published" {
+				kind = c.DeliveryPublish
+			} else {
+				kind = c.DeliveryJournal
+			}
+		}
+		if kind == c.DeliveryCompletion && d.Execution == nil || kind != c.DeliveryCompletion && d.Event == nil || kind != c.DeliveryJournal && kind != c.DeliveryPublish && kind != c.DeliveryCompletion || kind == c.DeliveryPublish && d.Event.Category != "published" {
+			return c.Err("invalid_input", "Delivery kind does not match payload")
+		}
+		if d.ReservationCallID != "" && (deliveryCallID(c.Delivery{Event: d.Event, Execution: d.Execution}) != d.ReservationCallID) {
+			return c.Err("invalid_input", "Delivery reservation marker does not match payload")
+		}
+		if d.ReservationCallID != "" {
+			_, newOwner := newCalls[d.ReservationCallID]
+			_, admitted := s.reserved[d.ReservationCallID]
+			if !newOwner && !admitted {
+				return c.Err("invalid_input", "Delivery reservation owner is not admitted")
+			}
 		}
 		digest, err := deliveryDigest(d)
 		if err != nil {
@@ -219,7 +318,7 @@ func (s *Executions) checkDeliveriesLocked(ds []c.Delivery, newCalls map[string]
 		owner := deliveryCallID(d)
 		_, isNew := newCalls[owner]
 		_, admitted := s.reserved[owner]
-		reserved := owner != "" && (isNew || admitted) && (needsTerminalReservation(d) || terminalOwners[owner] && isReconcilingStateEvent(d))
+		reserved := owner != "" && (isNew || admitted) && needsTerminalReservation(d)
 		if prior, ok := s.receiptLocked(d.ID); ok {
 			if prior.digest != digest {
 				return c.Err("conflict", "Delivery ID reused with different content")
@@ -251,38 +350,64 @@ func (s *Executions) checkDeliveriesLocked(ds []c.Delivery, newCalls map[string]
 	if generalPending+newPending > generalPendingLimit {
 		return c.Err("busy", "Pending delivery capacity exhausted")
 	}
-	s.pruneReceiptsLocked(newReceipts)
-	if len(s.receipts)+newReceipts > generalReceiptLimit {
+	prunable := 0
+	for _, id := range s.ackOrder {
+		if r, ok := s.receipts[id]; ok && r.acked {
+			prunable++
+		}
+	}
+	if len(s.receipts)+newReceipts-min(prunable, max(0, len(s.receipts)+newReceipts-generalReceiptLimit)) > generalReceiptLimit {
 		return c.Err("busy", "Delivery receipt capacity exhausted")
 	}
 	return nil
 }
 func (s *Executions) appendDeliveriesLocked(ds []c.Delivery, newCalls map[string]bool) {
-	terminalOwners := map[string]bool{}
-	for _, d := range ds {
-		if needsTerminalReservation(d) {
-			if owner := deliveryCallID(d); owner != "" {
-				terminalOwners[owner] = true
-			}
-		}
+	type plannedDelivery struct {
+		delivery c.Delivery
+		digest   string
+		owner    string
+		reserved bool
 	}
+	planned := make([]plannedDelivery, 0, len(ds))
+	seen := make(map[string]string, len(ds))
+	newReceipts := 0
 	for _, d := range ds {
 		digest, _ := deliveryDigest(d)
-		if prior, ok := s.receiptLocked(d.ID); ok && prior.digest == digest {
-			continue
+		if prior, ok := seen[d.ID]; ok {
+			if prior == digest {
+				continue
+			}
+			continue // checkDeliveriesLocked rejects conflicting batch IDs before this point.
 		}
-		owner := deliveryCallID(d)
+		seen[d.ID] = digest
+		if prior, ok := s.receiptLocked(d.ID); ok {
+			if prior.digest == digest {
+				continue
+			}
+			continue // checkDeliveriesLocked rejects receipt conflicts before this point.
+		}
+		owner := d.ReservationCallID
+		if owner == "" {
+			owner = deliveryCallID(d)
+		}
 		_, isNew := newCalls[owner]
 		_, admitted := s.reserved[owner]
-		reserved := owner != "" && (admitted || isNew) && (needsTerminalReservation(d) || terminalOwners[owner] && isReconcilingStateEvent(d))
-		if reserved {
-			s.reserved[owner]--
+		reserved := owner != "" && (admitted || isNew) && needsTerminalReservation(d)
+		if !reserved {
+			newReceipts++
 		}
-		d = c.Clone(d)
-		if reserved {
-			s.terminalReceipts[d.ID] = deliveryReceipt{digest: digest}
+		planned = append(planned, plannedDelivery{delivery: d, digest: digest, owner: owner, reserved: reserved})
+	}
+	s.pruneReceiptsLocked(newReceipts)
+	for _, item := range planned {
+		d := item.delivery
+		if item.reserved {
+			s.reserved[item.owner]--
+		}
+		if item.reserved {
+			s.terminalReceipts[d.ID] = deliveryReceipt{digest: item.digest}
 		} else {
-			s.receipts[d.ID] = deliveryReceipt{digest: digest}
+			s.receipts[d.ID] = deliveryReceipt{digest: item.digest}
 		}
 		s.pending = append(s.pending, d)
 	}
@@ -298,7 +423,7 @@ func (s *Executions) PendingDeliveries(limit int) ([]c.Delivery, error) {
 	}
 	out := make([]c.Delivery, limit)
 	for i := 0; i < limit; i++ {
-		out[i] = c.Clone(s.pending[i])
+		out[i] = cloneDelivery(s.pending[i])
 	}
 	return out, nil
 }

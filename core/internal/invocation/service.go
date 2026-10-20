@@ -24,7 +24,7 @@ type Service struct {
 	wg          sync.WaitGroup
 	closing     bool
 	workersDone chan struct{}
-	OnResult    func(c.Snapshot[c.Execution])
+	OnResult    func(c.Delivery) error
 	OnCommit    func()
 	pending     map[string]c.Report
 }
@@ -72,8 +72,15 @@ func (s *Service) LocalStopped() bool {
 	}
 }
 func ref(id string) c.Ref { return c.Ref{Namespace: "calls", ID: id} }
-func (s *Service) SubmitBatch(origin c.AdmissionOrigin, calls []c.Call) ([]c.Snapshot[c.Execution], error) {
-	if len(calls) == 0 {
+func (s *Service) SubmitBatch(origin c.AdmissionOrigin, calls []c.Call, effects ...c.AdmissionEffect) ([]c.Snapshot[c.Execution], error) {
+	if len(effects) > 1 {
+		return nil, c.Err("invalid_input", "At most one admission effect is allowed")
+	}
+	var effect *c.AdmissionEffect
+	if len(effects) == 1 {
+		effect = &effects[0]
+	}
+	if len(calls) == 0 && effect == nil {
 		return []c.Snapshot[c.Execution]{}, nil
 	}
 	if s.authority == nil || !c.ValidAdmissionOrigin(origin) {
@@ -157,7 +164,7 @@ func (s *Service) SubmitBatch(origin c.AdmissionOrigin, calls []c.Call) ([]c.Sna
 		ev := lifecycle.StateEvent(c.Change[c.Lifecycle]{ID: ch.ID, Subject: ch.Subject, BeforeRevision: ch.BeforeRevision, AfterRevision: ch.AfterRevision, After: ch.After.Lifecycle, Reason: ch.Reason, At: ch.At}, context)
 		deliveries = append(deliveries, c.Delivery{ID: ev.ID, Event: &ev})
 	}
-	if err := s.store.CommitBatch(changes, deliveries...); err != nil {
+	if err := s.store.CommitAdmission(c.AdmissionCommit{Changes: changes, Deliveries: deliveries, Effect: effect}); err != nil {
 		return nil, err
 	}
 	wake = s.OnCommit
@@ -335,6 +342,13 @@ func (s *Service) applyReportAt(r c.Report, expectedRevision *uint64) error {
 			return c.Err("conflict", "Execution revision conflict")
 		}
 		obs := lifecycle.Observe(old, r)
+		terminalCompletion := false
+		for _, d := range obs.Deliveries {
+			if d.Execution != nil && d.Execution.Value.Lifecycle.State.Terminal() {
+				terminalCompletion = true
+				break
+			}
+		}
 		if len(obs.Deliveries) > 0 && old.Value.Origin != (c.AdmissionOrigin{}) {
 			origin := old.Value.Origin
 			origin.Actor = old.Value.Call.Target
@@ -347,6 +361,12 @@ func (s *Service) applyReportAt(r c.Report, expectedRevision *uint64) error {
 					copy := origin
 					delivery.Origin = &copy
 				}
+			}
+		}
+		for i := range obs.Deliveries {
+			delivery := &obs.Deliveries[i]
+			if delivery.Execution != nil && delivery.Execution.Value.Lifecycle.State.Terminal() || terminalCompletion && delivery.Event != nil && delivery.Event.CallID == id {
+				delivery.ReservationCallID = id
 			}
 		}
 		if obs.Err != nil {

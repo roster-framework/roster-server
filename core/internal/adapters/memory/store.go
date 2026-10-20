@@ -8,13 +8,14 @@ import (
 
 // Store provides the same atomic revision contract to every owning module.
 type Store[T any] struct {
-	mu       sync.RWMutex
+	mu       *sync.RWMutex
 	entries  map[string]c.Snapshot[T]
 	capacity int
+	applied  func(c.Change[T])
 }
 
 func NewStore[T any](capacity int) *Store[T] {
-	return &Store[T]{entries: make(map[string]c.Snapshot[T]), capacity: capacity}
+	return &Store[T]{mu: &sync.RWMutex{}, entries: make(map[string]c.Snapshot[T]), capacity: capacity}
 }
 func (s *Store[T]) Get(ref c.Ref) (c.Snapshot[T], error) {
 	s.mu.RLock()
@@ -46,6 +47,9 @@ func (s *Store[T]) Apply(ch c.Change[T]) (c.Snapshot[T], error) {
 	}
 	next := c.Snapshot[T]{Subject: ch.Subject, Revision: ch.AfterRevision, Value: c.Clone(ch.After)}
 	s.entries[ch.Subject.Key()] = next
+	if s.applied != nil {
+		s.applied(ch)
+	}
 	return c.Clone(next), nil
 }
 

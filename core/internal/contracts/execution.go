@@ -91,21 +91,80 @@ type Validator interface {
 	Validate(Schema, any) error
 }
 type Caller interface {
-	SubmitBatch(AdmissionOrigin, []Call) ([]Snapshot[Execution], error)
+	SubmitBatch(AdmissionOrigin, []Call, ...AdmissionEffect) ([]Snapshot[Execution], error)
 	Get(string) (Snapshot[Execution], error)
 }
 type ExecutionStore interface {
 	Store[Execution]
 	CommitBatch([]Change[Execution], ...Delivery) error
+	CommitAdmission(AdmissionCommit) error
 	Commit(ExecutionMutation) (Snapshot[Execution], error)
 	Outbox
 	Claim(Context) (string, error)
 }
 type Delivery struct {
-	ID        string               `json:"id"`
-	Origin    *AdmissionOrigin     `json:"origin,omitempty"`
-	Event     *Event               `json:"event,omitempty"`
-	Execution *Snapshot[Execution] `json:"execution,omitempty"`
+	ID                string               `json:"id"`
+	Origin            *AdmissionOrigin     `json:"origin,omitempty"`
+	Event             *Event               `json:"event,omitempty"`
+	Execution         *Snapshot[Execution] `json:"execution,omitempty"`
+	Kind              DeliveryKind         `json:"kind,omitempty"`
+	ReservationCallID string               `json:"reservation_call_id,omitempty"`
+}
+type DeliveryKind string
+
+const (
+	DeliveryJournal    DeliveryKind = "journal"
+	DeliveryPublish    DeliveryKind = "publish"
+	DeliveryCompletion DeliveryKind = "completion"
+)
+
+type RevisionRef struct {
+	Subject  Ref
+	Revision uint64
+}
+type PendingReply struct {
+	CallID, ConversationID, MessageID string
+	Author                            Ref
+}
+type PublishedAdmission struct {
+	Event                   Event
+	Digest                  string
+	Origin                  AdmissionOrigin
+	SubscriptionSetRevision uint64
+	SubscriptionRevisions   []RevisionRef
+	CallIDs                 []string
+}
+type MessageAdmission struct {
+	Conversation   RevisionRef
+	Message        Message
+	Digest         string
+	PendingReplies []PendingReply
+	Reserved       int
+}
+type AdmissionEffect struct {
+	Published  *PublishedAdmission
+	Message    *MessageAdmission
+	Deliveries []Delivery
+}
+type AdmissionCommit struct {
+	Changes    []Change[Execution]
+	Deliveries []Delivery
+	Effect     *AdmissionEffect
+}
+type ReplyCommit struct {
+	Delivery   Delivery
+	Pending    *PendingReply
+	Message    *Message
+	Deliveries []Delivery
+}
+type AdmissionState interface {
+	ReadPublished(string) (PublishedAdmission, bool, error)
+	ReadMessage(string, string) (MessageAdmission, bool, error)
+	ReadPendingReply(string) (PendingReply, bool, error)
+	ReadSubscriptions() ([]Snapshot[Subscription], uint64, error)
+	Messages(string, int, int) ([]Message, error)
+	ReservedReplies(string) (int, error)
+	CommitReply(ReplyCommit) error
 }
 type ExecutionMutation struct {
 	Subject          Ref

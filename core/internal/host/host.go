@@ -61,6 +61,14 @@ type Options struct {
 	Workers    int
 	Lookup     func(string) string
 	Authority  c.Authority
+	Storage    *Storage
+}
+type Storage struct {
+	Nodes         c.Store[c.Node]
+	Subscriptions c.Store[c.Subscription]
+	Conversations c.Store[c.Conversation]
+	Executions    c.ExecutionStore
+	Admissions    c.AdmissionState
 }
 
 func New(ctx context.Context, opts Options) (*Core, error) {
@@ -74,14 +82,23 @@ func New(ctx context.Context, opts Options) (*Core, error) {
 		connectors = map[string]c.Connector{"runtime": runtimeadapter.New(nil, lookup), "resource": resourceadapter.New(nil, lookup)}
 	}
 	j := observation.New(5000)
-	cat := catalog.New(memory.NewStore[c.Node](256), connectors, schema.New(), j)
+	storage := opts.Storage
+	if storage == nil {
+		root := memory.NewRoot(memory.Limits{Nodes: 256, Subscriptions: 512, Conversations: 128, Calls: 1000, Queue: 256})
+		storage = &Storage{Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: root.Executions(), Admissions: root.Admissions()}
+	}
+	if storage.Nodes == nil || storage.Subscriptions == nil || storage.Conversations == nil || storage.Executions == nil || storage.Admissions == nil {
+		cancel()
+		return nil, c.Err("invalid_input", "Storage must provide every shared adapter view")
+	}
+	cat := catalog.New(storage.Nodes, connectors, schema.New(), j)
 	auth := opts.Authority
 	if auth == nil {
 		auth = authority.Empty()
 	}
-	calls := invocation.New(memory.NewExecutions(1000, 256), cat, j, auth)
-	events := event.New(memory.NewStore[c.Subscription](512), cat, calls, j)
-	conv := conversation.New(memory.NewStore[c.Conversation](128), cat, calls, j)
+	calls := invocation.New(storage.Executions, cat, j, auth)
+	events := event.New(storage.Subscriptions, cat, calls, j, storage.Admissions)
+	conv := conversation.New(storage.Conversations, cat, calls, j, storage.Admissions)
 	instanceID := c.ID(strconv.FormatInt(time.Now().UnixNano(), 10), "core")
 	core := &Core{Catalog: cat, Calls: calls, Events: events, Conversations: conv, Journal: j, Commands: command.New(), cancel: cancel, cancelSources: cancel, sourceContext: sourceContext, instanceID: instanceID, hostDone: make(chan struct{}), parentWatchDone: make(chan struct{})}
 	core.lifecycle = c.Snapshot[c.Lifecycle]{Subject: c.Ref{Namespace: "cores", ID: instanceID}, Revision: 1, Value: c.Lifecycle{State: c.Created, Reason: "host_created", UpdatedAt: c.Now()}}
@@ -135,7 +152,7 @@ func New(ctx context.Context, opts Options) (*Core, error) {
 			}
 		}()
 	}
-	calls.OnResult = func(snap c.Snapshot[c.Execution]) { conv.Complete(snap) }
+	calls.OnResult = conv.Complete
 	if err := core.bindCommands(); err != nil {
 		cancel()
 		return nil, err
@@ -197,11 +214,11 @@ func (s *Core) deliveryLoop(ctx context.Context) {
 	defer ticker.Stop()
 	for {
 		s.Calls.RetryPending()
-		err := s.Events.Drain(s.Calls.Outbox(), s.Journal, func(snap c.Snapshot[c.Execution]) error {
+		err := s.Events.Drain(s.Calls.Outbox(), s.Journal, func(delivery c.Delivery) error {
 			if s.Calls.OnResult != nil {
-				s.Calls.OnResult(snap)
+				return s.Calls.OnResult(delivery)
 			}
-			return nil
+			return c.Err("internal", "Terminal delivery sink is not configured")
 		})
 		s.mu.Lock()
 		if err != nil {
