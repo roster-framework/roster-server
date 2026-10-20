@@ -102,6 +102,34 @@ func TestSharedJSONNumberBoundsPrecisionAndCompositeCopies(t *testing.T) {
 	}
 }
 
+func TestCopyExecutionPreservesPrivateDispatchAndEmissionNilness(t *testing.T) {
+	for _, emissions := range [][]c.Emission{nil, {}, {{Name: "large", Payload: c.Data{"value": json.Number("9007199254740993")}}}} {
+		original := c.Execution{Dispatch: &c.DispatchIdentity{NodeID: "node", NodeRevision: ^uint64(0), ConnectorID: "fake", BindingDigest: "digest", RemoteID: "call"}, Result: &c.Result{CallID: "call", State: c.Succeeded, Emissions: emissions}}
+		copyValue := c.CopyExecution(original)
+		if copyValue.Dispatch == nil || copyValue.Dispatch == original.Dispatch || *copyValue.Dispatch != *original.Dispatch || copyValue.Result == nil {
+			t.Fatalf("CopyExecution lost or aliased private Dispatch: original=%+v copy=%+v", original.Dispatch, copyValue.Dispatch)
+		}
+		if (emissions == nil) != (copyValue.Result.Emissions == nil) || len(copyValue.Result.Emissions) != len(emissions) {
+			t.Fatalf("CopyExecution changed emission nilness/length: input=%#v output=%#v", emissions, copyValue.Result.Emissions)
+		}
+		if len(emissions) != 0 && copyValue.Result.Emissions[0].Payload["value"] != json.Number("9007199254740993") {
+			t.Fatalf("CopyExecution rounded private emission number: %#v", copyValue.Result.Emissions[0])
+		}
+		original.Dispatch.NodeID = "mutated"
+		if copyValue.Dispatch.NodeID != "node" {
+			t.Fatal("copied Dispatch aliased the source pointer")
+		}
+		copyValue.Dispatch.NodeID = "also-mutated"
+		if original.Dispatch.NodeID != "mutated" {
+			t.Fatal("source Dispatch aliased the copied pointer")
+		}
+		wire, err := json.Marshal(copyValue)
+		if err != nil || strings.Contains(string(wire), "dispatch") || strings.Contains(string(wire), "emissions") {
+			t.Fatalf("private Dispatch or emissions leaked into public JSON: %s err=%v", wire, err)
+		}
+	}
+}
+
 func mustJSON(t *testing.T, value any) json.RawMessage {
 	t.Helper()
 	data, err := json.Marshal(value)
@@ -202,12 +230,12 @@ func TestCommandNumberGuardRunsBeforeValidatorAndPreservesUseNumber(t *testing.T
 
 func TestMemoryDeliveryCopyAndDigestRetainDecimalTokens(t *testing.T) {
 	store := memory.NewExecutions(1, 1)
-	if err := store.CommitBatch(queued("json-number-copy")); err != nil {
+	if err := store.CommitAdmission(c.AdmissionCommit{Changes: queued("json-number-copy"), Deliveries: nil}); err != nil {
 		t.Fatal(err)
 	}
 	event := c.Event{ID: "number-event", Category: "observation", Payload: c.Data{"integer": json.Number("9007199254740993"), "fraction": json.Number("0.1")}}
 	delivery := c.Delivery{ID: "number-delivery", Event: &event}
-	if err := store.CommitBatch(nil, delivery); err != nil {
+	if err := store.CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{delivery}}); err != nil {
 		t.Fatal(err)
 	}
 	read, err := store.PendingDeliveries(10)
@@ -220,7 +248,47 @@ func TestMemoryDeliveryCopyAndDigestRetainDecimalTokens(t *testing.T) {
 	}
 	conflict := event
 	conflict.Payload = c.Data{"integer": json.Number("9007199254740992"), "fraction": json.Number("0.1")}
-	fault(t, store.CommitBatch(nil, c.Delivery{ID: delivery.ID, Event: &conflict}), "conflict")
+	fault(t, store.CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{c.Delivery{ID: delivery.ID, Event: &conflict}}}), "conflict")
+}
+
+func TestMemoryDeliveryDigestDistinguishesAdjacentPrivateNodeRevisions(t *testing.T) {
+	store := memory.NewExecutions(2, 2)
+	const callID = "dispatch-revision-digest"
+	if err := store.CommitAdmission(c.AdmissionCommit{Changes: queued(callID)}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.Get(c.Ref{Namespace: "calls", ID: callID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const firstRevision = uint64(9007199254740992)
+	stored.Value.Dispatch = &c.DispatchIdentity{NodeID: "node", NodeRevision: firstRevision, ConnectorID: "fake", BindingDigest: "binding", RemoteID: callID}
+	stored.Value.Result = &c.Result{CallID: callID, State: c.Succeeded, Output: c.Data{"exact": json.Number("9007199254740993")}}
+	delivery := c.Delivery{ID: "same-completion", Execution: &stored}
+	mutation := c.ExecutionMutation{Subject: stored.Subject, ExpectedRevision: stored.Revision, Deliveries: []c.Delivery{delivery}}
+	if _, err := store.Commit(mutation); err != nil {
+		t.Fatalf("initial private dispatch delivery: %v", err)
+	}
+	pending, err := store.PendingDeliveries(10)
+	if err != nil || len(pending) != 1 || pending[0].Execution == nil || pending[0].Execution.Value.Dispatch == nil || pending[0].Execution.Value.Dispatch.NodeRevision != firstRevision {
+		t.Fatalf("private dispatch was not retained in outbox: pending=%+v err=%v", pending, err)
+	}
+	if err := store.AckDelivery(delivery.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	adjacent := delivery
+	adjacentSnapshot := *delivery.Execution
+	adjacentSnapshot.Value = c.CopyExecution(delivery.Execution.Value)
+	adjacent.Execution = &adjacentSnapshot
+	adjacent.Execution.Value.Dispatch.NodeRevision = firstRevision + 1
+	fault(t, func() error {
+		_, err := store.Commit(c.ExecutionMutation{Subject: stored.Subject, ExpectedRevision: stored.Revision, Deliveries: []c.Delivery{adjacent}})
+		return err
+	}(), "conflict")
+	if count := mustPendingCount(t, store); count != 0 {
+		t.Fatalf("ACKed delivery reappeared after adjacent private revision conflict: pending=%d", count)
+	}
 }
 
 func mustList[T any](t *testing.T, source interface {
@@ -468,14 +536,14 @@ func TestMemoryBatchAllOrNothing(t *testing.T) {
 	}{{"record capacity", 1, 3}, {"queue capacity", 3, 1}} {
 		t.Run(tt.name, func(t *testing.T) {
 			s := memory.NewExecutions(tt.records, tt.queue)
-			fault(t, s.CommitBatch(append(queued("a"), queued("b")...)), "busy")
+			fault(t, s.CommitAdmission(c.AdmissionCommit{Changes: append(queued("a"), queued("b")...), Deliveries: nil}), "busy")
 			if len(mustList(t, s)) != 0 {
 				t.Fatal("partial records after failed batch")
 			}
-			if err := s.CommitBatch(queued("a")); err != nil {
+			if err := s.CommitAdmission(c.AdmissionCommit{Changes: queued("a"), Deliveries: nil}); err != nil {
 				t.Fatal(err)
 			}
-			fault(t, s.CommitBatch(queued("a")), "conflict")
+			fault(t, s.CommitAdmission(c.AdmissionCommit{Changes: queued("a"), Deliveries: nil}), "conflict")
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
 			id, err := s.Claim(ctx)
@@ -490,7 +558,7 @@ func TestMemoryBatchAllOrNothing(t *testing.T) {
 		})
 	}
 	s := memory.NewExecutions(4, 4)
-	fault(t, s.CommitBatch(append(queued("same"), queued("same")...)), "conflict")
+	fault(t, s.CommitAdmission(c.AdmissionCommit{Changes: append(queued("same"), queued("same")...), Deliveries: nil}), "conflict")
 	if len(mustList(t, s)) != 0 {
 		t.Fatal("duplicate batch partially committed")
 	}
@@ -498,7 +566,7 @@ func TestMemoryBatchAllOrNothing(t *testing.T) {
 
 func TestPendingObservationStoreCASCopyAndAtomicConsumption(t *testing.T) {
 	store := memory.NewExecutions(2, 2)
-	if err := store.CommitBatch(queued("pending-cas")); err != nil {
+	if err := store.CommitAdmission(c.AdmissionCommit{Changes: queued("pending-cas"), Deliveries: nil}); err != nil {
 		t.Fatal(err)
 	}
 	old, err := store.Get(c.Ref{Namespace: "calls", ID: "pending-cas"})
@@ -576,7 +644,7 @@ func TestPendingObservationStoreCASCopyAndAtomicConsumption(t *testing.T) {
 
 func TestTerminalDeliveryUsesAdmissionReservationWhenGeneralOutboxIsFull(t *testing.T) {
 	store := memory.NewExecutions(1, 1)
-	if err := store.CommitBatch(queued("reserved-terminal")); err != nil {
+	if err := store.CommitAdmission(c.AdmissionCommit{Changes: queued("reserved-terminal"), Deliveries: nil}); err != nil {
 		t.Fatal(err)
 	}
 	ref := c.Ref{Namespace: "calls", ID: "reserved-terminal"}
@@ -628,7 +696,7 @@ func TestTerminalDeliveryUsesAdmissionReservationWhenGeneralOutboxIsFull(t *test
 
 func TestReconciledTerminalBundleUsesAdmissionReservationWhenGeneralOutboxIsFull(t *testing.T) {
 	store := memory.NewExecutions(1, 1)
-	if err := store.CommitBatch(queued("reserved-reconcile")); err != nil {
+	if err := store.CommitAdmission(c.AdmissionCommit{Changes: queued("reserved-reconcile"), Deliveries: nil}); err != nil {
 		t.Fatal(err)
 	}
 	ref := c.Ref{Namespace: "calls", ID: "reserved-reconcile"}
@@ -675,7 +743,7 @@ func TestReconciledTerminalBundleUsesAdmissionReservationWhenGeneralOutboxIsFull
 
 func TestReservedReceiptsDoNotExhaustGeneralAckFIFO(t *testing.T) {
 	store := memory.NewExecutions(1, 1)
-	if err := store.CommitBatch(queued("separate-receipts")); err != nil {
+	if err := store.CommitAdmission(c.AdmissionCommit{Changes: queued("separate-receipts"), Deliveries: nil}); err != nil {
 		t.Fatal(err)
 	}
 	ref := c.Ref{Namespace: "calls", ID: "separate-receipts"}
@@ -755,16 +823,30 @@ func TestInvocationConcurrentDuplicateSubmission(t *testing.T) {
 }
 
 type fakeConnector struct {
-	descriptor c.Descriptor
-	invoke     func(c.Call, c.ReportSink) c.Result
-	inspect    func(c.Call) c.Result
-	abort      func(c.Call) (c.AbortObservation, error)
+	descriptor  c.Descriptor
+	invoke      func(c.Call, c.ReportSink) c.Result
+	invokeBound func(json.RawMessage, c.Call, c.ReportSink) c.Result
+	inspect     func(c.Call) c.Result
+	abort       func(c.Call) (c.AbortObservation, error)
 }
+
+type revocableAuthority struct{ allowed atomic.Bool }
+
+func (a *revocableAuthority) Authorize(c.AdmissionOrigin, string, c.Ref, string) error {
+	if !a.allowed.Load() {
+		return c.Err("forbidden", "test authority revoked")
+	}
+	return nil
+}
+func (*revocableAuthority) ShutdownCapability(any) c.HostShutdownCapability { return nil }
 
 func (f *fakeConnector) Describe(c.Context, json.RawMessage) (c.Descriptor, error) {
 	return c.Clone(f.descriptor), nil
 }
-func (f *fakeConnector) Invoke(_ c.Context, _ json.RawMessage, call c.Call, sink c.ReportSink) c.Result {
+func (f *fakeConnector) Invoke(_ c.Context, binding json.RawMessage, call c.Call, sink c.ReportSink) c.Result {
+	if f.invokeBound != nil {
+		return f.invokeBound(binding, call, sink)
+	}
 	return f.invoke(call, sink)
 }
 func (f *fakeConnector) Inspect(_ c.Context, _ json.RawMessage, call c.Call) c.Result {
@@ -997,7 +1079,7 @@ func TestJournalPinOwnershipAndAppendSemantics(t *testing.T) {
 
 	owned := c.Event{ID: "owned-record", Source: direct.Source, Name: "owned", Category: "observation", Payload: c.Data{}}
 	delivery := c.Delivery{ID: "owned-delivery", Kind: c.DeliveryJournal, Event: &owned}
-	if err = root.Executions().CommitBatch(nil, delivery); err != nil {
+	if err = root.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{delivery}}); err != nil {
 		t.Fatal(err)
 	}
 	if err = journal.Record(owned, delivery.ID); err != nil {
@@ -1067,7 +1149,7 @@ func TestJournalPinOwnershipAndAppendSemantics(t *testing.T) {
 			event := c.Event{ID: c.ID("owner-guard", tc.name), Source: direct.Source, Name: "owner-guard", Category: "observation", Payload: c.Data{"value": "same"}}
 			if tc.storedOwner != "" {
 				storedDelivery := c.Delivery{ID: tc.storedOwner, Kind: c.DeliveryJournal, Event: &event}
-				if err := caseRoot.Executions().CommitBatch(nil, storedDelivery); err != nil {
+				if err := caseRoot.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{storedDelivery}}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1076,7 +1158,7 @@ func TestJournalPinOwnershipAndAppendSemantics(t *testing.T) {
 			}
 			if tc.replayOwner != "" && tc.replayOwner != tc.storedOwner {
 				replayDelivery := c.Delivery{ID: tc.replayOwner, Kind: c.DeliveryJournal, Event: &event}
-				if err := caseRoot.Executions().CommitBatch(nil, replayDelivery); err != nil {
+				if err := caseRoot.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{replayDelivery}}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1153,7 +1235,7 @@ func BenchmarkJournalRecordAckRetention(b *testing.B) {
 				id := c.ID("benchmark-delivery", fmt.Sprint(i))
 				event := c.Event{ID: c.ID("benchmark-event", fmt.Sprint(i)), Name: "benchmark", Category: "observation", Payload: c.Data{}}
 				delivery := c.Delivery{ID: id, Kind: c.DeliveryJournal, Event: &event}
-				if err := root.Executions().CommitBatch(nil, delivery); err != nil {
+				if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{delivery}}); err != nil {
 					b.Fatal(err)
 				}
 				if err := journal.Record(event, id); err != nil {
@@ -1172,7 +1254,7 @@ func TestAckWithoutExplicitReleaseIDsReleasesAllOwnedProjections(t *testing.T) {
 	journal := newJournal(t, root, 8)
 	original := c.Event{ID: "published-original", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "source-event", Category: "published", CallID: "origin-call", ConversationID: "origin-conversation", Payload: c.Data{}}
 	delivery := c.Delivery{ID: "publish-owner", Kind: c.DeliveryPublish, Event: &original}
-	if err := root.Executions().CommitBatch(nil, delivery); err != nil {
+	if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{delivery}}); err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"rejection-one", "rejection-two"} {
@@ -1206,7 +1288,7 @@ func TestFailedRejectionAckKeepsPinsUntilChangedDispositionRetry(t *testing.T) {
 	firstJournal := newJournal(t, root, 8)
 	original := c.Event{ID: "replay-published", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "event", Category: "published", Payload: c.Data{}}
 	delivery := c.Delivery{ID: "replay-owner", Kind: c.DeliveryPublish, Event: &original}
-	if err := root.Executions().CommitBatch(nil, delivery); err != nil {
+	if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{delivery}}); err != nil {
 		t.Fatal(err)
 	}
 	firstRejection := c.Event{ID: "rejected-forbidden", Source: original.Source, Name: "event.rejected", Category: "observation", CausationID: original.ID, Payload: c.Data{"code": "forbidden"}}
@@ -1314,7 +1396,7 @@ func TestConfigurationApplyCommitsSevenIntentsAtomically(t *testing.T) {
 		event := c.Event{ID: c.ID("atomic-fill", fmt.Sprint(i)), Name: "fill", Category: "observation", Payload: c.Data{}}
 		filler[i] = c.Delivery{ID: event.ID, Kind: c.DeliveryJournal, Event: &event}
 	}
-	if err = outboxRoot.Executions().CommitBatch(nil, filler...); err != nil {
+	if err = outboxRoot.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: filler}); err != nil {
 		t.Fatal(err)
 	}
 	_, beforeRevision, err = outboxRoot.Admissions().ReadSubscriptions()
@@ -1787,6 +1869,7 @@ type interceptExecutionStore struct {
 	afterPendingList  func([]c.PendingObservation)
 	lastMutation      *c.ExecutionMutation
 	pendingWriteCalls int
+	afterMutation     func(c.ExecutionMutation)
 }
 
 type faultNodeStore struct {
@@ -1799,6 +1882,383 @@ func (s *faultNodeStore) Get(ref c.Ref) (c.Snapshot[c.Node], error) {
 		return c.Snapshot[c.Node]{}, s.getErr
 	}
 	return s.Store.Get(ref)
+}
+
+type barrierNodeStore struct {
+	c.Store[c.Node]
+	gate              atomic.Bool
+	captureBeforeWait bool
+	entered           chan struct{}
+	release           chan struct{}
+}
+
+func (s *barrierNodeStore) Get(ref c.Ref) (c.Snapshot[c.Node], error) {
+	if s.gate.Load() {
+		if s.captureBeforeWait {
+			snapshot, err := s.Store.Get(ref)
+			s.entered <- struct{}{}
+			<-s.release
+			return snapshot, err
+		}
+		s.entered <- struct{}{}
+		<-s.release
+	}
+	return s.Store.Get(ref)
+}
+
+type duplicateClaimStore struct {
+	c.ExecutionStore
+	callID string
+	claims atomic.Int32
+}
+
+func (s *duplicateClaimStore) Claim(ctx c.Context) (string, error) {
+	if s.claims.Add(1) <= 2 {
+		return s.callID, nil
+	}
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+func TestDispatchCASUsesOneCapturedNodeAndOnlyOneDuplicateClaimInvokes(t *testing.T) {
+	const callID = "dispatch-cas-capture"
+	originalBinding := json.RawMessage(`{"version":1}`)
+	updatedBinding := json.RawMessage(`{"version":2}`)
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	nodes := &barrierNodeStore{Store: root.Nodes(), entered: make(chan struct{}, 2), release: make(chan struct{})}
+	f := &fakeConnector{
+		descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{"large": json.RawMessage(`{"type":"object"}`)}},
+	}
+	cat := catalog.New(nodes, map[string]c.Connector{"fake": f}, schema.New())
+	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: originalBinding}); err != nil {
+		t.Fatal(err)
+	}
+	base := root.Executions()
+	var nodeUpdates atomic.Int32
+	var dispatchChangeMu sync.Mutex
+	var dispatchChange *c.Change[c.Execution]
+	var terminalChangeMu sync.Mutex
+	var terminalChange *c.Change[c.Execution]
+	updateNode := func() {
+		nodeUpdates.Add(1)
+		before, err := root.Nodes().Get(c.Ref{Namespace: "nodes", ID: "node"})
+		if err != nil {
+			t.Errorf("read Node after Dispatch CAS: %v", err)
+			return
+		}
+		after := before.Value
+		after.Binding = updatedBinding
+		change := c.Change[c.Node]{ID: "dispatch-test-node-update", Subject: before.Subject, BeforeRevision: before.Revision, AfterRevision: before.Revision + 1, Before: &before.Value, After: after, At: c.Now(), Reason: "test_update"}
+		if _, err = root.Nodes().Apply(change); err != nil {
+			t.Errorf("update Node after Dispatch CAS: %v", err)
+		}
+	}
+	intercept := &interceptExecutionStore{ExecutionStore: base, afterNextState: map[c.State]func(){}, afterMutation: func(m c.ExecutionMutation) {
+		if len(m.Changes) == 1 && m.Changes[0].After.Lifecycle.State == c.Dispatching {
+			updateNode()
+			change := m.Changes[0]
+			if change.Before != nil {
+				before := c.CopyExecution(*change.Before)
+				change.Before = &before
+			}
+			change.After = c.CopyExecution(change.After)
+			dispatchChangeMu.Lock()
+			dispatchChange = &change
+			dispatchChangeMu.Unlock()
+		}
+		if len(m.Changes) == 1 && m.Changes[0].After.Lifecycle.State == c.Succeeded {
+			change := m.Changes[0]
+			if change.Before != nil {
+				before := c.CopyExecution(*change.Before)
+				change.Before = &before
+			}
+			change.After = c.CopyExecution(change.After)
+			terminalChangeMu.Lock()
+			terminalChange = &change
+			terminalChangeMu.Unlock()
+		}
+	}}
+	store := &duplicateClaimStore{ExecutionStore: intercept, callID: callID}
+	journal := newJournal(t, root, 100)
+	service := invocation.New(store, cat, journal, fixtureAuthority(t))
+	if _, err := service.SubmitBatch(directOrigin(), []c.Call{call(callID)}); err != nil {
+		t.Fatal(err)
+	}
+	nodes.gate.Store(true)
+	var actualInvokes atomic.Int32
+	f.invokeBound = func(binding json.RawMessage, got c.Call, _ c.ReportSink) c.Result {
+		actualInvokes.Add(1)
+		if got.ID != callID || string(binding) != string(originalBinding) {
+			t.Errorf("Invoke received call=%q binding=%s, want captured call=%q binding=%s", got.ID, binding, callID, originalBinding)
+		}
+		return c.Result{CallID: got.ID, State: c.Succeeded, Output: c.Data{}, Emissions: []c.Emission{{Name: "large", Payload: c.Data{"value": json.Number("9007199254740993")}}}}
+	}
+	service.Start(context.Background(), 2)
+	var releaseBarrier sync.Once
+	var closeService sync.Once
+	var closeErr error
+	closeWorkers := func() {
+		closeService.Do(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			closeErr = service.Close(ctx, nil)
+		})
+	}
+	t.Cleanup(func() {
+		releaseBarrier.Do(func() { close(nodes.release) })
+		closeWorkers()
+		if closeErr != nil {
+			t.Error(closeErr)
+		}
+	})
+	for i := 0; i < 2; i++ {
+		select {
+		case <-nodes.entered:
+		case <-time.After(time.Second):
+			t.Fatal("duplicate claimed workers did not reach the same Node snapshot barrier")
+		}
+	}
+	releaseBarrier.Do(func() { close(nodes.release) })
+	completed := waitState(t, service, callID, c.Succeeded)
+	closeWorkers()
+	stopDeadline := time.Now().Add(time.Second)
+	for !service.LocalStopped() && time.Now().Before(stopDeadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if closeErr != nil || !service.LocalStopped() {
+		t.Fatalf("duplicate-claim workers did not stop cleanly: LocalStopped=%v err=%v", service.LocalStopped(), closeErr)
+	}
+	if got := actualInvokes.Load(); got != 1 {
+		t.Fatalf("duplicate claim reached Connector.Invoke %d times, want exactly once", got)
+	}
+	if store.claims.Load() < 2 {
+		t.Fatalf("only %d duplicate claims were attempted", store.claims.Load())
+	}
+	if completed.Value.Dispatch == nil || completed.Value.Dispatch.NodeRevision != 1 || completed.Value.Dispatch.BindingDigest == "" || completed.Value.Dispatch.RemoteID != callID {
+		t.Fatalf("terminal execution lost its original Dispatch identity: %+v", completed.Value.Dispatch)
+	}
+	dispatchChangeMu.Lock()
+	claimed := dispatchChange
+	dispatchChangeMu.Unlock()
+	if claimed == nil || claimed.Before == nil || claimed.Before.Dispatch != nil || claimed.After.Dispatch == nil || *claimed.After.Dispatch != *completed.Value.Dispatch {
+		t.Fatalf("Dispatch lifecycle Move did not retain its private identity in Change.After: %+v", claimed)
+	}
+	if completed.Value.Result == nil || completed.Value.Result.Emissions != nil {
+		t.Fatalf("Observe must preserve its public terminal result policy by clearing consumed emissions: %+v", completed.Value.Result)
+	}
+	terminalChangeMu.Lock()
+	change := terminalChange
+	terminalChangeMu.Unlock()
+	if change == nil || change.Before == nil || change.Before.Dispatch == nil || change.After.Dispatch == nil || change.After.Dispatch.NodeRevision != completed.Value.Dispatch.NodeRevision || change.After.Result == nil || change.After.Result.Emissions != nil {
+		t.Fatalf("terminal Observe change lost Dispatch or changed public emissions policy: %+v", change)
+	}
+	listed := mustList[c.Execution](t, base)
+	if len(listed) != 1 || listed[0].Value.Dispatch == nil || *listed[0].Value.Dispatch != *completed.Value.Dispatch || listed[0].Value.Result == nil || listed[0].Value.Result.Emissions != nil {
+		t.Fatalf("same-root List lost terminal Dispatch or emissions policy: %+v", listed)
+	}
+	listed[0].Value.Dispatch.NodeID = "mutated-list"
+	deliveries, err := base.PendingDeliveries(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var emitted c.Delivery
+	var completion c.Delivery
+	for _, delivery := range deliveries {
+		if delivery.Event != nil && delivery.Event.Name == "large" {
+			emitted = delivery
+		}
+		if delivery.Execution != nil && delivery.Execution.Value.Lifecycle.State == c.Succeeded {
+			completion = delivery
+		}
+	}
+	if completion.Execution == nil || completion.Execution.Value.Dispatch == nil || *completion.Execution.Value.Dispatch != *completed.Value.Dispatch || completion.Execution.Value.Result == nil || completion.Execution.Value.Result.Emissions != nil {
+		t.Fatalf("terminal outbox delivery lost private Dispatch or emissions policy: %+v", completion)
+	}
+	if emitted.Event == nil || emitted.Event.Payload["value"] != json.Number("9007199254740993") {
+		t.Fatalf("terminal emission outbox lost its exact number: %+v", emitted)
+	}
+	emitted.Event.Payload["value"] = "caller mutation"
+	storedDeliveries, err := base.PendingDeliveries(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, delivery := range storedDeliveries {
+		if delivery.ID == emitted.ID && (delivery.Event == nil || delivery.Event.Payload["value"] != json.Number("9007199254740993")) {
+			t.Fatalf("returned outbox delivery aliased stored emission payload: %+v", delivery)
+		}
+	}
+	completed.Value.Dispatch.NodeID = "snapshot-alias"
+	stored, err := service.Get(callID)
+	if err != nil || stored.Value.Dispatch == nil || stored.Value.Dispatch.NodeID != "node" {
+		t.Fatalf("returned execution snapshot aliased stored Dispatch: %+v err=%v", stored.Value.Dispatch, err)
+	}
+	updated, err := root.Nodes().Get(c.Ref{Namespace: "nodes", ID: "node"})
+	if nodeUpdates.Load() != 1 {
+		t.Fatalf("Node update callback ran %d times, want once after Dispatch CAS", nodeUpdates.Load())
+	}
+	if err != nil || updated.Revision != 2 || string(updated.Value.Binding) != string(updatedBinding) {
+		t.Fatalf("test Node update did not win after Dispatch CAS: %+v err=%v", updated, err)
+	}
+}
+
+func TestAuthorityRevokedBeforeDispatchCancelsLocallyWithoutWire(t *testing.T) {
+	var invoked atomic.Int32
+	f := &fakeConnector{
+		descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}},
+		invoke: func(call c.Call, _ c.ReportSink) c.Result {
+			invoked.Add(1)
+			return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{}}
+		},
+	}
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	journal := newJournal(t, root, 100)
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
+	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	auth := &revocableAuthority{}
+	auth.allowed.Store(true)
+	service := invocation.New(root.Executions(), cat, journal, auth)
+	const id = "authority-revoked-before-dispatch"
+	origin := directOrigin()
+	if _, err := service.SubmitBatch(origin, []c.Call{call(id)}); err != nil {
+		t.Fatal(err)
+	}
+	auth.allowed.Store(false)
+	start(t, service)
+	final := waitState(t, service, id, c.Cancelled)
+	if final.Value.Dispatch != nil || final.Value.Result != nil || final.Value.Origin != origin || invoked.Load() != 0 {
+		t.Fatalf("revoked queued work was not canceled locally: state=%s dispatch=%+v result=%+v origin=%+v invoked=%d", final.Value.Lifecycle.State, final.Value.Dispatch, final.Value.Result, final.Value.Origin, invoked.Load())
+	}
+}
+
+func TestDispatchCASRevalidatesAfterNodeRevisionChangesDuringPreparation(t *testing.T) {
+	const id = "dispatch-cas-fresh-node"
+	originalBinding := json.RawMessage(`{"version":1}`)
+	winningBinding := json.RawMessage(`{"version":2}`)
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	nodes := &barrierNodeStore{Store: root.Nodes(), captureBeforeWait: true, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	var invoked atomic.Int32
+	f := &fakeConnector{
+		descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}},
+	}
+	cat := catalog.New(nodes, map[string]c.Connector{"fake": f}, schema.New())
+	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: originalBinding}); err != nil {
+		t.Fatal(err)
+	}
+	service := invocation.New(root.Executions(), cat, newJournal(t, root, 100), fixtureAuthority(t))
+	if _, err := service.SubmitBatch(directOrigin(), []c.Call{call(id)}); err != nil {
+		t.Fatal(err)
+	}
+	nodes.gate.Store(true)
+	f.invokeBound = func(binding json.RawMessage, got c.Call, _ c.ReportSink) c.Result {
+		invoked.Add(1)
+		if got.ID != id || string(binding) != string(winningBinding) {
+			t.Errorf("Invoke used stale prepared identity: call=%q binding=%s want=%s", got.ID, binding, winningBinding)
+		}
+		return c.Result{CallID: got.ID, State: c.Succeeded, Output: c.Data{}}
+	}
+	service.Start(context.Background(), 1)
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(nodes.release) })
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := service.Close(ctx, nil); err != nil {
+			t.Error(err)
+		}
+	})
+	select {
+	case <-nodes.entered:
+	case <-time.After(time.Second):
+		t.Fatal("prepare did not capture the original Node revision")
+	}
+	node, err := root.Nodes().Get(c.Ref{Namespace: "nodes", ID: "node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := node.Value
+	updated.Binding = winningBinding
+	change := c.Change[c.Node]{ID: "dispatch-cas-winning-node", Subject: node.Subject, BeforeRevision: node.Revision, AfterRevision: node.Revision + 1, Before: &node.Value, After: updated, At: c.Now(), Reason: "test_rotation"}
+	if _, err := root.Nodes().Apply(change); err != nil {
+		t.Fatal(err)
+	}
+	nodes.gate.Store(false)
+	releaseOnce.Do(func() { close(nodes.release) })
+	completed := waitState(t, service, id, c.Succeeded)
+	if invoked.Load() != 1 || completed.Value.Dispatch == nil || completed.Value.Dispatch.NodeRevision != node.Revision+1 {
+		t.Fatalf("stale Node revision reached dispatch or was not retried: invokes=%d dispatch=%+v", invoked.Load(), completed.Value.Dispatch)
+	}
+	digest, err := c.CanonicalJSONDigest(winningBinding)
+	if err != nil || completed.Value.Dispatch.BindingDigest != digest {
+		t.Fatalf("retry did not capture the winning Node binding digest: dispatch=%+v want=%s err=%v", completed.Value.Dispatch, digest, err)
+	}
+}
+
+func TestLocalCancelWinsBeforeDispatchCASWithoutConnectorInvoke(t *testing.T) {
+	const id = "dispatch-cancel-cas"
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	nodes := &barrierNodeStore{Store: root.Nodes(), captureBeforeWait: true, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	var invokes atomic.Int32
+	f := &fakeConnector{
+		descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}},
+	}
+	f.invokeBound = func(_ json.RawMessage, got c.Call, _ c.ReportSink) c.Result {
+		invokes.Add(1)
+		return c.Result{CallID: got.ID, State: c.Succeeded, Output: c.Data{}}
+	}
+	cat := catalog.New(nodes, map[string]c.Connector{"fake": f}, schema.New())
+	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{"version":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+	service := invocation.New(root.Executions(), cat, newJournal(t, root, 100), fixtureAuthority(t))
+	if _, err := service.SubmitBatch(directOrigin(), []c.Call{call(id)}); err != nil {
+		t.Fatal(err)
+	}
+	nodes.gate.Store(true)
+	service.Start(context.Background(), 1)
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(nodes.release) })
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := service.Close(ctx, nil); err != nil {
+			t.Error(err)
+		}
+	})
+	select {
+	case <-nodes.entered:
+	case <-time.After(time.Second):
+		t.Fatal("prepare did not capture Node before the cancellation race")
+	}
+	preparing, err := service.Get(id)
+	if err != nil || preparing.Value.Lifecycle.State != c.Preparing {
+		t.Fatalf("call was not paused in Preparing: %+v err=%v", preparing, err)
+	}
+	expected := preparing.Revision
+	cancelled, err := service.Abort(context.Background(), id, "cancel before dispatch", &expected)
+	if err != nil || cancelled.Value.Lifecycle.State != c.Cancelled || cancelled.Value.Dispatch != nil {
+		t.Fatalf("local cancellation did not win before Dispatch CAS: %+v err=%v", cancelled, err)
+	}
+	nodes.gate.Store(false)
+	releaseOnce.Do(func() { close(nodes.release) })
+	closeCtx, cancelClose := context.WithTimeout(context.Background(), time.Second)
+	err = service.Close(closeCtx, nil)
+	cancelClose()
+	if err != nil {
+		t.Fatalf("wait for the losing Dispatch worker to stop: %v", err)
+	}
+	stopDeadline := time.Now().Add(time.Second)
+	for !service.LocalStopped() && time.Now().Before(stopDeadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !service.LocalStopped() {
+		t.Fatal("worker did not stop after the cancelled Dispatch CAS")
+	}
+	final := waitState(t, service, id, c.Cancelled)
+	if invokes.Load() != 0 || final.Value.Dispatch != nil {
+		t.Fatalf("losing Dispatch CAS reached the Connector: invokes=%d dispatch=%+v", invokes.Load(), final.Value.Dispatch)
+	}
 }
 
 func (s *interceptExecutionStore) Get(ref c.Ref) (c.Snapshot[c.Execution], error) {
@@ -1876,6 +2336,7 @@ func (s *interceptExecutionStore) Commit(m c.ExecutionMutation) (c.Snapshot[c.Ex
 	}
 	callback := s.afterNextState[state]
 	delete(s.afterNextState, state)
+	afterMutation := s.afterMutation
 	conflictOnce := s.conflictOnce
 	s.conflictOnce = nil
 	s.mu.Unlock()
@@ -1886,13 +2347,16 @@ func (s *interceptExecutionStore) Commit(m c.ExecutionMutation) (c.Snapshot[c.Ex
 	if err == nil && callback != nil {
 		callback()
 	}
+	if err == nil && afterMutation != nil {
+		afterMutation(m)
+	}
 	return snap, err
 }
 
 func TestSubmitBatchPropagatesListFailureWithoutMutation(t *testing.T) {
 	cat, _, journal, _ := fixture(t, &fakeConnector{})
 	base := memory.NewExecutions(8, 8)
-	if err := base.CommitBatch(queued("existing-before-list-error")); err != nil {
+	if err := base.CommitAdmission(c.AdmissionCommit{Changes: queued("existing-before-list-error"), Deliveries: nil}); err != nil {
 		t.Fatal(err)
 	}
 	existingBefore, err := base.Get(c.Ref{Namespace: "calls", ID: "existing-before-list-error"})
@@ -1915,7 +2379,7 @@ func TestSubmitBatchPropagatesListFailureWithoutMutation(t *testing.T) {
 func TestRetryPendingPreservesTypedPendingReadFailures(t *testing.T) {
 	cat, _, journal, _ := fixture(t, &fakeConnector{})
 	base := memory.NewExecutions(8, 8)
-	if err := base.CommitBatch(queued("pending-read-error")); err != nil {
+	if err := base.CommitAdmission(c.AdmissionCommit{Changes: queued("pending-read-error"), Deliveries: nil}); err != nil {
 		t.Fatal(err)
 	}
 	call, err := base.Get(c.Ref{Namespace: "calls", ID: "pending-read-error"})
@@ -2005,7 +2469,7 @@ func TestPendingAuditWriteFailureIsNotMaskedByReportConflict(t *testing.T) {
 	}{{code: "conflict", wantAttempts: 8, wantRetryLimit: true}, {code: "storage_write", wantAttempts: 1}} {
 		t.Run(tc.code, func(t *testing.T) {
 			base := memory.NewExecutions(8, 8)
-			if err := base.CommitBatch(queued("pending-audit-priority")); err != nil {
+			if err := base.CommitAdmission(c.AdmissionCommit{Changes: queued("pending-audit-priority"), Deliveries: nil}); err != nil {
 				t.Fatal(err)
 			}
 			current, err := base.Get(c.Ref{Namespace: "calls", ID: "pending-audit-priority"})
@@ -2057,15 +2521,22 @@ func TestPendingAuditWriteFailureIsNotMaskedByReportConflict(t *testing.T) {
 
 func TestInspectPropagatesObservationReadAndAuditWriteFailures(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		result    c.State
-		readError bool
+		name           string
+		result         c.State
+		readError      bool
+		dispatchRead   bool
+		abort          bool
+		reconcilingCAS bool
 	}{
 		{name: "report-read", result: c.Unknown, readError: true},
 		{name: "pending-audit-write", result: c.Succeeded},
+		{name: "inspect-node-read", result: c.Unknown, dispatchRead: true},
+		{name: "abort-node-read", result: c.Unknown, dispatchRead: true, abort: true},
+		{name: "reconciling-inspect-cas", result: c.Unknown, reconcilingCAS: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var store *interceptExecutionStore
+			var remoteCalls atomic.Int32
 			readErr := c.Err("conflict", "injected observation read failure")
 			writeErr := c.Err("storage_write", "injected pending audit write failure")
 			f := &fakeConnector{
@@ -2074,6 +2545,7 @@ func TestInspectPropagatesObservationReadAndAuditWriteFailures(t *testing.T) {
 					return c.Result{CallID: call.ID, State: c.Unknown}
 				},
 				inspect: func(call c.Call) c.Result {
+					remoteCalls.Add(1)
 					if tc.readError {
 						store.mu.Lock()
 						store.getErr, store.getErrOnce = readErr, true
@@ -2085,10 +2557,15 @@ func TestInspectPropagatesObservationReadAndAuditWriteFailures(t *testing.T) {
 					}
 					return result
 				},
+				abort: func(c.Call) (c.AbortObservation, error) {
+					remoteCalls.Add(1)
+					return c.AbortObservation{Requested: true}, nil
+				},
 			}
 			root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
 			journal := newJournal(t, root, 100)
-			cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
+			nodes := &faultNodeStore{Store: root.Nodes()}
+			cat := catalog.New(nodes, map[string]c.Connector{"fake": f}, schema.New())
 			if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
 				t.Fatal(err)
 			}
@@ -2110,36 +2587,112 @@ func TestInspectPropagatesObservationReadAndAuditWriteFailures(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, state := range []c.State{c.Preparing, c.Dispatching} {
-				change, moveErr := lifecycle.Move(current, c.Transition{Subject: current.Subject, ExpectedRevision: current.Revision, From: current.Value.Lifecycle.State, To: state, Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}})
-				if moveErr != nil {
-					t.Fatal(moveErr)
-				}
-				current, err = base.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: []c.Change[c.Execution]{change}})
-				if err != nil {
-					t.Fatal(err)
-				}
+			preparing := lifecycle.Observe(current, c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Preparing})
+			current, err = base.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: preparing.Changes, Deliveries: preparing.Deliveries})
+			if err != nil {
+				t.Fatal(err)
+			}
+			node, err := root.Nodes().Get(c.Ref{Namespace: "nodes", ID: "node"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest, err := c.CanonicalJSONDigest(node.Value.Binding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dispatch, err := lifecycle.Dispatch(current, c.DispatchIdentity{NodeID: node.Value.ID, NodeRevision: node.Revision, ConnectorID: node.Value.ConnectorID, BindingDigest: digest, RemoteID: id})
+			if err != nil {
+				t.Fatal(err)
+			}
+			carrier := c.RevisionRef{Subject: node.Subject, Revision: node.Revision}
+			current, err = base.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: []c.Change[c.Execution]{dispatch}, NodeRevision: &carrier})
+			if err != nil {
+				t.Fatal(err)
 			}
 			running := lifecycle.Observe(current, c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id, ReportID: "initial-running", Confirmed: true}, State: c.Running})
 			if running.Err != nil {
 				t.Fatal(running.Err)
 			}
-			current, err = base.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: running.Changes, Deliveries: running.Deliveries})
-			if err != nil {
+			if _, err = base.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: running.Changes, Deliveries: running.Deliveries}); err != nil {
 				t.Fatal(err)
 			}
-			_, err = service.Inspect(context.Background(), id)
-			if tc.readError {
+			outboxBefore := 0
+			terminalDeliveryCount := 0
+			if tc.reconcilingCAS {
+				runningSnapshot, getErr := base.Get(current.Subject)
+				if getErr != nil {
+					t.Fatal(getErr)
+				}
+				reconciling := lifecycle.Observe(runningSnapshot, c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Reconciling})
+				if reconciling.Err != nil {
+					t.Fatal(reconciling.Err)
+				}
+				if _, err = base.Commit(c.ExecutionMutation{Subject: runningSnapshot.Subject, ExpectedRevision: runningSnapshot.Revision, Changes: reconciling.Changes, Deliveries: reconciling.Deliveries}); err != nil {
+					t.Fatal(err)
+				}
+				current, getErr = base.Get(runningSnapshot.Subject)
+				if getErr != nil {
+					t.Fatal(getErr)
+				}
+				outboxBefore, getErr = base.PendingDeliveryCount()
+				if getErr != nil {
+					t.Fatal(getErr)
+				}
+				store.conflictOnce = func(m c.ExecutionMutation) error {
+					if len(m.Changes) != 0 || len(m.Deliveries) != 0 || m.NodeRevision != nil || m.Subject != current.Subject || m.ExpectedRevision != current.Revision {
+						t.Errorf("already-Reconciling Inspect did not issue a no-op expected-revision CAS: %+v", m)
+					}
+					terminal := lifecycle.Observe(current, c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id, Confirmed: true}, Result: &c.Result{CallID: id, State: c.Succeeded, Output: c.Data{}}})
+					if terminal.Err != nil {
+						t.Errorf("prepare concurrent terminal winner: %v", terminal.Err)
+						return terminal.Err
+					}
+					terminalDeliveryCount = len(terminal.Deliveries)
+					if _, err := base.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: terminal.Changes, Deliveries: terminal.Deliveries}); err != nil {
+						t.Errorf("commit concurrent terminal winner: %v", err)
+						return err
+					}
+					_, commitErr := base.Commit(m)
+					return commitErr
+				}
+			}
+			if tc.dispatchRead {
+				nodes.getErr = readErr
+			}
+			if tc.abort {
+				_, err = service.Abort(context.Background(), id, "test", nil)
+			} else {
+				_, err = service.Inspect(context.Background(), id)
+			}
+			if tc.readError || tc.dispatchRead {
 				if err != readErr {
-					t.Fatalf("Inspect hid the original read error: %v", err)
+					t.Fatalf("remote control hid the original read error: %v", err)
+				}
+			} else if tc.reconcilingCAS {
+				if err == nil || c.AsFault(err).Code != "conflict" {
+					t.Fatalf("already-Reconciling Inspect did not return the winning terminal CAS conflict: %v", err)
 				}
 			} else if err != writeErr {
 				t.Fatalf("Inspect hid the pending-audit write error: %v", err)
 			}
 			latest, getErr := base.Get(c.Ref{Namespace: "calls", ID: id})
 			pending, pendingErr := root.Executions().PendingObservations()
-			if getErr != nil || latest.Value.Lifecycle.State != c.Reconciling || pendingErr != nil || len(pending) != 0 {
-				t.Fatalf("failed inspection changed report state or retained a failed audit: state=%s pending=%d errs=%v/%v", latest.Value.Lifecycle.State, len(pending), getErr, pendingErr)
+			outboxAfter, outboxErr := root.Executions().PendingDeliveryCount()
+			wantState := c.Reconciling
+			if tc.dispatchRead || tc.reconcilingCAS {
+				wantState = c.Running
+				if tc.reconcilingCAS {
+					wantState = c.Succeeded
+				}
+			}
+			if getErr != nil || latest.Value.Lifecycle.State != wantState || pendingErr != nil || len(pending) != 0 || outboxErr != nil {
+				t.Fatalf("failed remote control changed report state or retained a failed audit: state=%s want=%s pending=%d errs=%v/%v/%v", latest.Value.Lifecycle.State, wantState, len(pending), getErr, pendingErr, outboxErr)
+			}
+			if tc.reconcilingCAS && (latest.Revision != current.Revision+1 || outboxAfter != outboxBefore+terminalDeliveryCount) {
+				t.Fatalf("terminal winner was not the sole state/outbox mutation around failed no-op CAS: revision=%d want=%d outbox=%d want=%d", latest.Revision, current.Revision+1, outboxAfter, outboxBefore+terminalDeliveryCount)
+			}
+			if (tc.dispatchRead || tc.reconcilingCAS) && remoteCalls.Load() != 0 {
+				t.Fatalf("Node read failure reached remote connector %d times", remoteCalls.Load())
 			}
 		})
 	}
@@ -2147,7 +2700,7 @@ func TestInspectPropagatesObservationReadAndAuditWriteFailures(t *testing.T) {
 
 func TestRetryPendingConsumesRejectedReportAndNextRetryIsNoop(t *testing.T) {
 	base := memory.NewExecutions(8, 8)
-	if err := base.CommitBatch(queued("rejected-pending-retry")); err != nil {
+	if err := base.CommitAdmission(c.AdmissionCommit{Changes: queued("rejected-pending-retry"), Deliveries: nil}); err != nil {
 		t.Fatal(err)
 	}
 	ref := c.Ref{Namespace: "calls", ID: "rejected-pending-retry"}
@@ -2320,7 +2873,7 @@ func TestRejectedNewerObservationDoesNotConsumeOlderPendingInspection(t *testing
 
 func TestPendingRetryCASConflictThenConsumesOnce(t *testing.T) {
 	base := memory.NewExecutions(8, 8)
-	if err := base.CommitBatch(queued("pending-cas-once")); err != nil {
+	if err := base.CommitAdmission(c.AdmissionCommit{Changes: queued("pending-cas-once"), Deliveries: nil}); err != nil {
 		t.Fatal(err)
 	}
 	ref := c.Ref{Namespace: "calls", ID: "pending-cas-once"}
@@ -2392,7 +2945,7 @@ func TestCASRetryDoesNotLeakPriorObservationError(t *testing.T) {
 				}
 				next := current.Value
 				next.Observation = c.ObservationCursor{Reports: map[string]string{}, ReportOrder: []string{}}
-				change := lifecycle.Replace(current, next, "test_receipt_eviction")
+				change := lifecycle.Replace(current, next, "test_receipt_eviction", c.CopyExecution)
 				if _, err = store.ExecutionStore.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: []c.Change[c.Execution]{change}}); err != nil {
 					return err
 				}
@@ -2811,6 +3364,238 @@ func TestReconcilingInspectUsesOneRevisionIdentityAndAbortConflicts(t *testing.T
 	}
 }
 
+func TestDispatchRouteRejectsChangedNodeBeforeInspectOrAbort(t *testing.T) {
+	inspectStarted := make(chan struct{})
+	releaseInvoke := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseInvoke) })
+	var inspects, aborts atomic.Int32
+	f := &fakeConnector{
+		invoke: func(call c.Call, sink c.ReportSink) c.Result {
+			if err := sink(c.Report{State: c.Running, Evidence: c.Evidence{CallID: call.ID, RemoteID: call.ID, Confirmed: true}}); err != nil {
+				panic(err)
+			}
+			close(inspectStarted)
+			<-releaseInvoke
+			return c.Result{CallID: call.ID, State: c.Unknown}
+		},
+		inspect: func(call c.Call) c.Result {
+			inspects.Add(1)
+			return c.Result{CallID: call.ID, State: c.Unknown}
+		},
+		abort: func(c.Call) (c.AbortObservation, error) {
+			aborts.Add(1)
+			return c.AbortObservation{Requested: true}, nil
+		},
+	}
+	_, service, _, root := fixture(t, f)
+	const id = "dispatch-route-node-revision"
+	if _, err := service.SubmitBatch(directOrigin(), []c.Call{call(id)}); err != nil {
+		t.Fatal(err)
+	}
+	start(t, service)
+	waitState(t, service, id, c.Running)
+	<-inspectStarted
+	before, err := root.Nodes().Get(c.Ref{Namespace: "nodes", ID: "node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := before.Value
+	after.Binding = json.RawMessage(`{"secret":"rotated"}`)
+	change := c.Change[c.Node]{ID: "dispatch-route-node-rotation", Subject: before.Subject, BeforeRevision: before.Revision, AfterRevision: before.Revision + 1, Before: &before.Value, After: after, At: c.Now(), Reason: "test_rotation"}
+	if _, err := root.Nodes().Apply(change); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Inspect(context.Background(), id); err == nil || c.AsFault(err).Code != "conflict" {
+		t.Fatalf("Inspect routed through a changed Node snapshot: %v", err)
+	}
+	if _, err := service.Abort(context.Background(), id, "test", nil); err == nil || c.AsFault(err).Code != "conflict" {
+		t.Fatalf("Abort routed through a changed Node snapshot: %v", err)
+	}
+	current, err := service.Get(id)
+	if err != nil || current.Value.Lifecycle.State != c.Running || current.Value.Dispatch == nil || current.Value.Dispatch.NodeRevision != before.Revision {
+		t.Fatalf("mismatched remote control changed the Dispatch state: %+v err=%v", current, err)
+	}
+	if inspects.Load() != 0 || aborts.Load() != 0 {
+		t.Fatalf("Node mismatch reached connector: Inspect=%d Abort=%d", inspects.Load(), aborts.Load())
+	}
+	releaseOnce.Do(func() { close(releaseInvoke) })
+	if final := waitState(t, service, id, c.Unknown); final.Value.Dispatch == nil || final.Value.Dispatch.NodeRevision != before.Revision {
+		t.Fatalf("terminal report lost the captured Dispatch identity: %+v", final.Value.Dispatch)
+	}
+}
+
+func TestDispatchCommitRejectsInvalidCarrierAndImmutableExecutionChanges(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mutate   func(*memory.Root, *c.Change[c.Execution], *c.RevisionRef)
+		wantCode string
+	}{
+		{name: "missing carrier", mutate: func(_ *memory.Root, _ *c.Change[c.Execution], carrier *c.RevisionRef) { *carrier = c.RevisionRef{} }, wantCode: "invalid_input"},
+		{name: "wrong namespace", mutate: func(_ *memory.Root, _ *c.Change[c.Execution], carrier *c.RevisionRef) {
+			carrier.Subject.Namespace = "calls"
+		}, wantCode: "invalid_input"},
+		{name: "wrong carrier revision", mutate: func(_ *memory.Root, _ *c.Change[c.Execution], carrier *c.RevisionRef) { carrier.Revision++ }, wantCode: "invalid_input"},
+		{name: "wrong remote id", mutate: func(_ *memory.Root, ch *c.Change[c.Execution], _ *c.RevisionRef) {
+			ch.After.Dispatch.RemoteID = "foreign-call"
+		}, wantCode: "invalid_input"},
+		{name: "changed call id", mutate: func(_ *memory.Root, ch *c.Change[c.Execution], _ *c.RevisionRef) { ch.After.Call.ID = "foreign-call" }, wantCode: "invalid_input"},
+		{name: "changed call", mutate: func(_ *memory.Root, ch *c.Change[c.Execution], _ *c.RevisionRef) {
+			ch.After.Call.Target = c.Ref{Namespace: "nodes", ID: "other"}
+			ch.After.Call.Operation = "other"
+			ch.After.Call.Input = c.Data{"text": "changed"}
+			ch.After.Call.Deadline = ch.After.Call.Deadline.Add(time.Second)
+			ch.After.Call.CorrelationID = "other-correlation"
+			ch.After.Call.CausationID = "other-causation"
+			ch.After.Call.ConversationID = "other-conversation"
+		}, wantCode: "invalid_input"},
+		{name: "changed origin", mutate: func(_ *memory.Root, ch *c.Change[c.Execution], _ *c.RevisionRef) {
+			ch.After.Origin = sourceOrigin("other")
+		}, wantCode: "invalid_input"},
+		{name: "stale node revision", mutate: func(root *memory.Root, _ *c.Change[c.Execution], _ *c.RevisionRef) {
+			node, err := root.Nodes().Get(c.Ref{Namespace: "nodes", ID: "node"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			updated := node.Value
+			change := c.Change[c.Node]{ID: "stale-dispatch-node", Subject: node.Subject, BeforeRevision: node.Revision, AfterRevision: node.Revision + 1, Before: &node.Value, After: updated, At: c.Now(), Reason: "test_change"}
+			if _, err = root.Nodes().Apply(change); err != nil {
+				t.Fatal(err)
+			}
+		}, wantCode: "conflict"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+			f := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}}}
+			cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
+			if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{"binding":1}`)}); err != nil {
+				t.Fatal(err)
+			}
+			store := root.Executions()
+			caller := invocation.New(store, cat, nil, fixtureAuthority(t))
+			const id = "dispatch-invalid-carrier"
+			if _, err := caller.SubmitBatch(directOrigin(), []c.Call{call(id)}); err != nil {
+				t.Fatal(err)
+			}
+			current, err := store.Get(c.Ref{Namespace: "calls", ID: id})
+			if err != nil {
+				t.Fatal(err)
+			}
+			preparing := lifecycle.Observe(current, c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Preparing})
+			if preparing.Err != nil {
+				t.Fatal(preparing.Err)
+			}
+			current, err = store.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: preparing.Changes, Deliveries: preparing.Deliveries})
+			if err != nil {
+				t.Fatal(err)
+			}
+			node, err := root.Nodes().Get(c.Ref{Namespace: "nodes", ID: "node"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest, err := c.CanonicalJSONDigest(node.Value.Binding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dispatch, err := lifecycle.Dispatch(current, c.DispatchIdentity{NodeID: node.Value.ID, NodeRevision: node.Revision, ConnectorID: node.Value.ConnectorID, BindingDigest: digest, RemoteID: id})
+			if err != nil {
+				t.Fatal(err)
+			}
+			carrier := c.RevisionRef{Subject: node.Subject, Revision: node.Revision}
+			stateEvent := lifecycle.StateEvent(c.Change[c.Lifecycle]{ID: dispatch.ID, Subject: dispatch.Subject, BeforeRevision: dispatch.BeforeRevision, AfterRevision: dispatch.AfterRevision, After: dispatch.After.Lifecycle, Reason: dispatch.Reason, At: dispatch.At}, c.Event{CallID: id, CorrelationID: current.Value.Call.CorrelationID, ConversationID: current.Value.Call.ConversationID})
+			mutation := c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: []c.Change[c.Execution]{dispatch}, Deliveries: []c.Delivery{{ID: stateEvent.ID, Event: &stateEvent}}, NodeRevision: &carrier}
+			beforeCount, err := store.PendingDeliveryCount()
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(root, &mutation.Changes[0], &carrier)
+			if tc.name == "missing carrier" {
+				mutation.NodeRevision = nil
+			}
+			_, gotErr := store.Commit(mutation)
+			if gotErr == nil || c.AsFault(gotErr).Code != tc.wantCode {
+				t.Fatalf("malformed dispatch commit err=%v, want code %s", gotErr, tc.wantCode)
+			}
+			after, readErr := store.Get(current.Subject)
+			afterCount, countErr := store.PendingDeliveryCount()
+			if readErr != nil || countErr != nil || after.Revision != current.Revision || after.Value.Lifecycle.State != c.Preparing || after.Value.Dispatch != nil || afterCount != beforeCount {
+				t.Fatalf("rejected dispatch mutated Call/outbox: before=%+v after=%+v counts=%d/%d errs=%v/%v", current, after, beforeCount, afterCount, readErr, countErr)
+			}
+		})
+	}
+
+	t.Run("immutable after accepted dispatch", func(t *testing.T) {
+		root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+		f := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}}}
+		cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
+		if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{"binding":1}`)}); err != nil {
+			t.Fatal(err)
+		}
+		store := root.Executions()
+		caller := invocation.New(store, cat, nil, fixtureAuthority(t))
+		const id = "dispatch-immutable-after-accept"
+		if _, err := caller.SubmitBatch(directOrigin(), []c.Call{call(id)}); err != nil {
+			t.Fatal(err)
+		}
+		current, err := store.Get(c.Ref{Namespace: "calls", ID: id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		preparing := lifecycle.Observe(current, c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Preparing})
+		current, err = store.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: preparing.Changes, Deliveries: preparing.Deliveries})
+		if err != nil {
+			t.Fatal(err)
+		}
+		node, err := root.Nodes().Get(c.Ref{Namespace: "nodes", ID: "node"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		digest, err := c.CanonicalJSONDigest(node.Value.Binding)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dispatch, err := lifecycle.Dispatch(current, c.DispatchIdentity{NodeID: node.Value.ID, NodeRevision: node.Revision, ConnectorID: node.Value.ConnectorID, BindingDigest: digest, RemoteID: id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		carrier := c.RevisionRef{Subject: node.Subject, Revision: node.Revision}
+		current, err = store.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: []c.Change[c.Execution]{dispatch}, NodeRevision: &carrier})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct {
+			name   string
+			mutate func(*c.Execution)
+		}{
+			{name: "call id", mutate: func(value *c.Execution) { value.Call.ID = "other-call" }},
+			{name: "call", mutate: func(value *c.Execution) {
+				value.Call.Target = c.Ref{Namespace: "nodes", ID: "other"}
+				value.Call.Operation = "other"
+				value.Call.Input = c.Data{"text": "changed"}
+				value.Call.Deadline = value.Call.Deadline.Add(time.Second)
+				value.Call.CorrelationID = "other-correlation"
+				value.Call.CausationID = "other-causation"
+				value.Call.ConversationID = "other-conversation"
+			}},
+			{name: "origin", mutate: func(value *c.Execution) { value.Origin = sourceOrigin("other") }},
+			{name: "dispatch", mutate: func(value *c.Execution) { value.Dispatch.NodeRevision++ }},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				next := c.CopyExecution(current.Value)
+				tc.mutate(&next)
+				change := lifecycle.Replace(current, next, "attempt_immutable_change", c.CopyExecution)
+				if _, err := store.Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: []c.Change[c.Execution]{change}}); err == nil || c.AsFault(err).Code != "invalid_input" {
+					t.Fatalf("committed execution accepted immutable %s change: %v", tc.name, err)
+				}
+				stored, err := store.Get(current.Subject)
+				if err != nil || stored.Revision != current.Revision || stored.Value.Dispatch == nil || *stored.Value.Dispatch != *current.Value.Dispatch || stored.Value.Call.Operation != current.Value.Call.Operation || stored.Value.Origin != current.Value.Origin {
+					t.Fatalf("rejected immutable %s change mutated the accepted execution: %+v err=%v", tc.name, stored, err)
+				}
+			})
+		}
+	})
+}
+
 func TestConcurrentSameRevisionInspectCannotReplaceDifferentReceipt(t *testing.T) {
 	started := make(chan struct{}, 2)
 	firstRelease, secondRelease := make(chan struct{}), make(chan struct{})
@@ -3154,7 +3939,7 @@ func TestExecutionAdmissionRejectsMismatchedCallIdentityWithoutMutation(t *testi
 		t.Fatal("invalid identity partially wrote call or queue state")
 	}
 	valid := queued("actual-call")
-	if err := store.CommitBatch(valid); err != nil {
+	if err := store.CommitAdmission(c.AdmissionCommit{Changes: valid, Deliveries: nil}); err != nil {
 		t.Fatal(err)
 	}
 	old, err := store.Get(c.Ref{Namespace: "calls", ID: "actual-call"})

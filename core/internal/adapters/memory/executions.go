@@ -26,7 +26,7 @@ type deliveryReceipt struct {
 
 // Executions owns records, queue admission and delivery intent under the same locks.
 type Executions struct {
-	*Store[c.Execution]
+	records          *Store[c.Execution]
 	queue            *Queue
 	outboxMu         sync.Mutex
 	pending          []c.Delivery
@@ -42,7 +42,7 @@ type Executions struct {
 }
 
 func NewExecutions(records, queue int) *Executions {
-	return newExecutions(NewStore[c.Execution](records), queue, nil)
+	return newExecutions(newStore[c.Execution](records, c.CopyExecution), queue, nil)
 }
 func newExecutions(store *Store[c.Execution], queue int, root *Root) *Executions {
 	storeID, err := newStoreID()
@@ -52,7 +52,7 @@ func newExecutions(store *Store[c.Execution], queue int, root *Root) *Executions
 	return newExecutionsWithID(store, queue, root, storeID)
 }
 func newExecutionsWithID(store *Store[c.Execution], queue int, root *Root, storeID string) *Executions {
-	return &Executions{Store: store, queue: NewQueue(queue), pending: []c.Delivery{}, pendingSlots: map[string]c.PendingObservation{}, receipts: map[string]deliveryReceipt{}, terminalReceipts: map[string]deliveryReceipt{}, reserved: map[string]int{}, deliverySequence: map[string]uint64{}, storeID: storeID, root: root}
+	return &Executions{records: store, queue: NewQueue(queue), pending: []c.Delivery{}, pendingSlots: map[string]c.PendingObservation{}, receipts: map[string]deliveryReceipt{}, terminalReceipts: map[string]deliveryReceipt{}, reserved: map[string]int{}, deliverySequence: map[string]uint64{}, storeID: storeID, root: root}
 }
 func newStoreID() (string, error) {
 	var entropy [32]byte
@@ -63,9 +63,8 @@ func newStoreID() (string, error) {
 }
 func (s *Executions) Claim(ctx context.Context) (string, error) { return s.queue.Claim(ctx) }
 
-func (s *Executions) CommitBatch(changes []c.Change[c.Execution], deliveries ...c.Delivery) error {
-	return s.CommitAdmission(c.AdmissionCommit{Changes: changes, Deliveries: deliveries})
-}
+func (s *Executions) Get(ref c.Ref) (c.Snapshot[c.Execution], error) { return s.records.Get(ref) }
+func (s *Executions) List() ([]c.Snapshot[c.Execution], error)       { return s.records.List() }
 func (s *Executions) CommitAdmission(admission c.AdmissionCommit) error {
 	if admission.Effect != nil {
 		staged, err := copyAdmissionEffect(*admission.Effect)
@@ -83,8 +82,8 @@ func (s *Executions) CommitAdmission(admission c.AdmissionCommit) error {
 		}
 		allDeliveries[i] = staged
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.records.mu.Lock()
+	defer s.records.mu.Unlock()
 	s.queue.mu.Lock()
 	defer s.queue.mu.Unlock()
 	s.outboxMu.Lock()
@@ -95,15 +94,19 @@ func (s *Executions) CommitAdmission(admission c.AdmissionCommit) error {
 	for _, ch := range changes {
 		key := ch.Subject.Key()
 		old, stagedAlready := staged[key]
-		_, exists := s.entries[key]
+		_, exists := s.records.entries[key]
 		if ch.Subject.Namespace != "calls" || ch.Subject.ID != ch.After.Call.ID || !c.ValidID(ch.After.Call.ID) {
 			return c.Err("invalid_input", "Call change identity does not match its subject")
+		}
+		if ch.After.Dispatch != nil {
+			return c.Err("invalid_input", "New admissions cannot contain dispatch identity")
 		}
 		if exists || !ch.Subject.Valid() || ch.AfterRevision != ch.BeforeRevision+1 || (!stagedAlready && ch.BeforeRevision != 0) || stagedAlready && old.Revision != ch.BeforeRevision {
 			return c.Err("conflict", "Call ID already exists or batch revision is invalid")
 		}
 		if stagedAlready {
-			if ch.Before == nil || ch.After.Call.ID != old.Value.Call.ID || !reflect.DeepEqual(*ch.Before, old.Value) {
+			callSame, callErr := canonicalCallEqual(ch.After.Call, old.Value.Call)
+			if ch.Before == nil || callErr != nil || !callSame || ch.After.Origin != old.Value.Origin || !reflect.DeepEqual(ch.After.Dispatch, old.Value.Dispatch) || !reflect.DeepEqual(*ch.Before, old.Value) {
 				return c.Err("conflict", "Call batch before value is invalid")
 			}
 		} else if ch.Before != nil {
@@ -113,9 +116,9 @@ func (s *Executions) CommitAdmission(admission c.AdmissionCommit) error {
 			ids = append(ids, ch.After.Call.ID)
 			newCalls[ch.After.Call.ID] = true
 		}
-		staged[key] = c.Snapshot[c.Execution]{Subject: ch.Subject, Revision: ch.AfterRevision, Value: c.Clone(ch.After)}
+		staged[key] = c.Snapshot[c.Execution]{Subject: ch.Subject, Revision: ch.AfterRevision, Value: c.CopyExecution(ch.After)}
 	}
-	if len(s.entries)+len(staged) > s.capacity || len(ids) > cap(s.queue.pending)-len(s.queue.pending) {
+	if len(s.records.entries)+len(staged) > s.records.capacity || len(ids) > cap(s.queue.pending)-len(s.queue.pending) {
 		return c.Err("busy", "Call record or queue capacity exhausted")
 	}
 	for _, v := range staged {
@@ -124,10 +127,10 @@ func (s *Executions) CommitAdmission(admission c.AdmissionCommit) error {
 		}
 	}
 	if admission.Effect != nil {
-		if s.root == nil {
+		if s.records.root == nil {
 			return c.Err("internal", "Admission state is unavailable")
 		}
-		if err := s.root.validateEffectLocked(admission.Effect, newCalls); err != nil {
+		if err := s.records.root.validateEffectLocked(admission.Effect, newCalls); err != nil {
 			return err
 		}
 	}
@@ -135,14 +138,14 @@ func (s *Executions) CommitAdmission(admission c.AdmissionCommit) error {
 		return err
 	}
 	for k, v := range staged {
-		s.entries[k] = v
+		s.records.entries[k] = v
 	}
 	for id := range newCalls {
 		s.reserved[id] = terminalDeliveryReservation
 	}
 	s.appendDeliveriesLocked(allDeliveries, newCalls)
 	if admission.Effect != nil {
-		s.root.commitEffectLocked(admission.Effect)
+		s.records.root.commitEffectLocked(admission.Effect)
 	}
 	for _, id := range ids {
 		s.queue.pending <- id
@@ -167,14 +170,14 @@ func (s *Executions) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], err
 		}
 		deliveries[i] = staged
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.records.mu.Lock()
+	defer s.records.mu.Unlock()
 	s.outboxMu.Lock()
 	defer s.outboxMu.Unlock()
 	if m.Subject.Namespace != "calls" {
 		return c.Snapshot[c.Execution]{}, c.Err("invalid_input", "Execution subject must be a call")
 	}
-	old, exists := s.entries[m.Subject.Key()]
+	old, exists := s.records.entries[m.Subject.Key()]
 	if !exists || old.Revision != m.ExpectedRevision || old.Value.Call.ID != m.Subject.ID {
 		return c.Snapshot[c.Execution]{}, c.Err("conflict", "Execution revision conflict")
 	}
@@ -186,6 +189,9 @@ func (s *Executions) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], err
 			return c.Snapshot[c.Execution]{}, err
 		}
 	}
+	if len(m.Changes) == 0 && m.NodeRevision != nil {
+		return c.Snapshot[c.Execution]{}, c.Err("invalid_input", "Node revision requires a dispatch change")
+	}
 	if len(m.Changes) == 0 {
 		if err := s.checkDeliveriesLocked(deliveries, nil); err != nil {
 			return c.Snapshot[c.Execution]{}, err
@@ -194,9 +200,9 @@ func (s *Executions) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], err
 		if m.Pending != nil {
 			s.applyPendingLocked(*m.Pending)
 		}
-		return c.Clone(old), nil
+		return s.records.copy(old), nil
 	}
-	current := c.Clone(old)
+	current := s.records.copy(old)
 	for _, ch := range m.Changes {
 		if ch.Subject.Namespace != "calls" || ch.Subject.ID != m.Subject.ID || ch.After.Call.ID != m.Subject.ID {
 			return c.Snapshot[c.Execution]{}, c.Err("invalid_input", "Execution mutation changed Call identity")
@@ -204,17 +210,72 @@ func (s *Executions) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], err
 		if ch.BeforeRevision != current.Revision || ch.AfterRevision != ch.BeforeRevision+1 || ch.Before == nil || !reflect.DeepEqual(*ch.Before, current.Value) {
 			return c.Snapshot[c.Execution]{}, c.Err("conflict", "Execution mutation changes are not contiguous")
 		}
-		current = c.Snapshot[c.Execution]{Subject: ch.Subject, Revision: ch.AfterRevision, Value: c.Clone(ch.After)}
+		callSame, callErr := canonicalCallEqual(ch.After.Call, current.Value.Call)
+		if callErr != nil || !callSame || ch.After.Origin != current.Value.Origin {
+			return c.Snapshot[c.Execution]{}, c.Err("invalid_input", "Execution mutation changed immutable call or origin")
+		}
+		if !reflect.DeepEqual(ch.After.Dispatch, current.Value.Dispatch) {
+			if current.Value.Dispatch != nil || ch.After.Dispatch == nil || m.NodeRevision == nil || len(m.Changes) != 1 {
+				return c.Snapshot[c.Execution]{}, c.Err("invalid_input", "Execution mutation changed immutable dispatch identity")
+			}
+			if err := s.validateDispatchLocked(current.Value, ch.After, *m.NodeRevision); err != nil {
+				return c.Snapshot[c.Execution]{}, err
+			}
+		} else if m.NodeRevision != nil {
+			return c.Snapshot[c.Execution]{}, c.Err("invalid_input", "Node revision was provided without a new dispatch")
+		}
+		current = c.Snapshot[c.Execution]{Subject: ch.Subject, Revision: ch.AfterRevision, Value: c.CopyExecution(ch.After)}
 	}
 	if err := s.checkDeliveriesLocked(deliveries, nil); err != nil {
 		return c.Snapshot[c.Execution]{}, err
 	}
-	s.entries[m.Subject.Key()] = c.Clone(current)
+	s.records.entries[m.Subject.Key()] = s.records.copy(current)
 	s.appendDeliveriesLocked(deliveries, nil)
 	if m.Pending != nil {
 		s.applyPendingLocked(*m.Pending)
 	}
-	return c.Clone(current), nil
+	return s.records.copy(current), nil
+}
+
+func (s *Executions) validateDispatchLocked(before, after c.Execution, carrier c.RevisionRef) error {
+	dispatch := after.Dispatch
+	callSame, callErr := canonicalCallEqual(before.Call, after.Call)
+	if s.records.root == nil || dispatch == nil || before.Dispatch != nil || callErr != nil || !callSame || before.Origin != after.Origin {
+		return c.Err("invalid_input", "Dispatch identity is not a new immutable execution identity")
+	}
+	target := after.Call.Target
+	if carrier.Subject.Namespace != "nodes" || carrier.Subject != target || carrier.Subject.ID != dispatch.NodeID || dispatch.NodeRevision != carrier.Revision || dispatch.ConnectorID == "" || dispatch.BindingDigest == "" || dispatch.RemoteID != after.Call.ID {
+		return c.Err("invalid_input", "Dispatch identity references do not match the execution")
+	}
+	node, ok := s.records.root.nodes.entries[carrier.Subject.Key()]
+	if !ok || node.Revision != carrier.Revision || node.Value.ID != dispatch.NodeID || node.Value.ConnectorID != dispatch.ConnectorID {
+		return c.Err("conflict", "Dispatch node revision changed")
+	}
+	digest, err := c.CanonicalJSONDigest(node.Value.Binding)
+	if err != nil || digest != dispatch.BindingDigest {
+		return c.Err("conflict", "Dispatch node binding changed")
+	}
+	return nil
+}
+
+func canonicalCallEqual(a, b c.Call) (bool, error) {
+	aRaw, err := json.Marshal(a)
+	if err != nil {
+		return false, err
+	}
+	bRaw, err := json.Marshal(b)
+	if err != nil {
+		return false, err
+	}
+	aDigest, err := c.CanonicalJSONDigest(aRaw)
+	if err != nil {
+		return false, err
+	}
+	bDigest, err := c.CanonicalJSONDigest(bRaw)
+	if err != nil {
+		return false, err
+	}
+	return aDigest == bDigest, nil
 }
 
 func copyReport(r c.Report) (c.Report, error) {
@@ -250,8 +311,8 @@ func stagePendingMutation(m c.PendingMutation) (c.PendingMutation, error) {
 	return m, nil
 }
 func (s *Executions) PendingObservation(callID string) (c.PendingObservation, bool, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.records.mu.RLock()
+	defer s.records.mu.RUnlock()
 	p, ok := s.pendingSlots[callID]
 	if !ok {
 		return c.PendingObservation{}, false, nil
@@ -260,8 +321,8 @@ func (s *Executions) PendingObservation(callID string) (c.PendingObservation, bo
 	return out, true, err
 }
 func (s *Executions) PendingObservations() ([]c.PendingObservation, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.records.mu.RLock()
+	defer s.records.mu.RUnlock()
 	ids := make([]string, 0, len(s.pendingSlots))
 	for id := range s.pendingSlots {
 		ids = append(ids, id)
@@ -302,7 +363,7 @@ func (s *Executions) checkPendingLocked(m c.PendingMutation) error {
 	if after.Report.Evidence.CallID != m.CallID || after.Report.Result != nil && after.Report.Result.CallID != m.CallID {
 		return c.Err("invalid_input", "Pending observation report reference is invalid")
 	}
-	call, ok := s.entries[(c.Ref{Namespace: "calls", ID: m.CallID}).Key()]
+	call, ok := s.records.entries[(c.Ref{Namespace: "calls", ID: m.CallID}).Key()]
 	if !ok || after.Origin != call.Value.Origin {
 		return c.Err("conflict", "Pending observation provenance changed")
 	}
@@ -333,8 +394,8 @@ func (s *Executions) CommitPending(m c.PendingMutation) error {
 		deliveries[i] = copied
 	}
 	m.Deliveries = deliveries
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.records.mu.Lock()
+	defer s.records.mu.Unlock()
 	s.outboxMu.Lock()
 	defer s.outboxMu.Unlock()
 	if err := s.checkPendingLocked(m); err != nil {
@@ -361,13 +422,18 @@ func deliveryDigest(d c.Delivery) (string, error) {
 	}
 	d.Kind = kind
 	var emissions any
+	var dispatch *c.DispatchIdentity
 	if d.Execution != nil && d.Execution.Value.Result != nil {
 		emissions = d.Execution.Value.Result.Emissions
 	}
+	if d.Execution != nil {
+		dispatch = d.Execution.Value.Dispatch
+	}
 	canonicalBytes, err := json.Marshal(struct {
 		c.Delivery
-		PrivateEmissions any `json:"private_emissions"`
-	}{d, emissions})
+		PrivateEmissions any                 `json:"private_emissions"`
+		PrivateDispatch  *c.DispatchIdentity `json:"private_dispatch,omitempty"`
+	}{d, emissions, dispatch})
 	if err != nil {
 		return "", err
 	}
@@ -390,6 +456,10 @@ func copyDelivery(d c.Delivery) (c.Delivery, error) {
 		if err != nil {
 			return c.Delivery{}, err
 		}
+	}
+	if d.Execution != nil && d.Execution.Value.Dispatch != nil && out.Execution != nil {
+		copy := *d.Execution.Value.Dispatch
+		out.Execution.Value.Dispatch = &copy
 	}
 	return out, nil
 }
@@ -623,7 +693,7 @@ func (s *Executions) ScanPending(after c.OutboxCursor, limit int) ([]c.PendingDe
 	return out, c.OutboxCursor{}, nil
 }
 func (s *Executions) AckDelivery(id string, releaseEventIDs ...string) error {
-	if s.root == nil {
+	if s.records.root == nil {
 		if len(releaseEventIDs) != 0 {
 			return c.Err("invalid_input", "Journal releases require a shared Root")
 		}
@@ -631,7 +701,7 @@ func (s *Executions) AckDelivery(id string, releaseEventIDs ...string) error {
 		defer s.outboxMu.Unlock()
 		return s.ackLocked(id)
 	}
-	root := s.root
+	root := s.records.root
 	root.mu.Lock()
 	defer root.mu.Unlock()
 	s.outboxMu.Lock()
