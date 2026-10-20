@@ -11,6 +11,7 @@ import (
 // Root is the in-memory transaction boundary shared by every adapter view.
 type Root struct {
 	mu                      sync.RWMutex
+	storeID                 string
 	nodes                   *Store[c.Node]
 	subscriptions           *Store[c.Subscription]
 	conversations           *Store[c.Conversation]
@@ -29,13 +30,17 @@ type Root struct {
 type Limits struct{ Nodes, Subscriptions, Conversations, Calls, Queue int }
 
 func NewRoot(l Limits) *Root {
-	r := &Root{published: map[string]c.PublishedAdmission{}, messages: map[string]c.MessageAdmission{}, pending: map[string]c.PendingReply{}, replyReceipts: map[string]string{}, messageOrder: map[string][]string{}, reserved: map[string]int{}}
+	storeID, err := newStoreID()
+	if err != nil {
+		panic("generate memory store identity: " + err.Error())
+	}
+	r := &Root{storeID: storeID, published: map[string]c.PublishedAdmission{}, messages: map[string]c.MessageAdmission{}, pending: map[string]c.PendingReply{}, replyReceipts: map[string]string{}, messageOrder: map[string][]string{}, reserved: map[string]int{}}
 	r.journal = journalState{entries: []observation.Entry{}, receipts: map[string]observation.StoredReceipt{}, ownerIndex: map[string]map[string]bool{}}
 	r.journalStore = &JournalStore{root: r}
 	r.nodes = rootStore[c.Node](l.Nodes, r, nil)
 	r.subscriptions = rootStore[c.Subscription](l.Subscriptions, r, func(c.Change[c.Subscription]) { r.subscriptionSetRevision++ })
 	r.conversations = rootStore[c.Conversation](l.Conversations, r, nil)
-	r.executions = newExecutions(rootStore[c.Execution](l.Calls, r, nil), l.Queue, r)
+	r.executions = newExecutionsWithID(rootStore[c.Execution](l.Calls, r, nil), l.Queue, r, r.storeID)
 	return r
 }
 func rootStore[T any](capacity int, root *Root, applied func(c.Change[T])) *Store[T] {

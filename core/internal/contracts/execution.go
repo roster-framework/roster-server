@@ -58,6 +58,20 @@ type Report struct {
 	Result           *Result
 	ObservedRevision uint64
 }
+type PendingObservation struct {
+	CallID   string
+	Revision uint64
+	Identity string
+	Origin   AdmissionOrigin
+	Report   Report
+}
+type PendingMutation struct {
+	CallID           string
+	ExpectedRevision uint64
+	ExpectedIdentity string
+	After            *PendingObservation
+	Deliveries       []Delivery
+}
 type ReportSink func(Report) error
 
 type SourceEvent struct {
@@ -99,6 +113,9 @@ type ExecutionStore interface {
 	CommitBatch([]Change[Execution], ...Delivery) error
 	CommitAdmission(AdmissionCommit) error
 	Commit(ExecutionMutation) (Snapshot[Execution], error)
+	PendingObservation(callID string) (PendingObservation, bool, error)
+	PendingObservations() ([]PendingObservation, error)
+	CommitPending(PendingMutation) error
 	Outbox
 	Claim(Context) (string, error)
 }
@@ -171,9 +188,19 @@ type ExecutionMutation struct {
 	ExpectedRevision uint64
 	Changes          []Change[Execution]
 	Deliveries       []Delivery
+	Pending          *PendingMutation
+}
+type OutboxCursor struct {
+	StoreID        string
+	After, Through uint64
+}
+type PendingDelivery struct {
+	Delivery Delivery
+	Cursor   OutboxCursor
 }
 type Outbox interface {
 	PendingDeliveries(limit int) ([]Delivery, error)
+	ScanPending(after OutboxCursor, limit int) ([]PendingDelivery, OutboxCursor, error)
 	AckDelivery(id string, releaseEventIDs ...string) error
 	PendingDeliveryCount() (int, error)
 }

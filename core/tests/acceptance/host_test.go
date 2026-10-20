@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,7 @@ import (
 	"github.com/roster-framework/roster-server/core/internal/conversation"
 	"github.com/roster-framework/roster-server/core/internal/host"
 	"github.com/roster-framework/roster-server/core/internal/interfaces/cli"
+	"github.com/roster-framework/roster-server/core/internal/lifecycle"
 	"github.com/roster-framework/roster-server/core/internal/observation"
 )
 
@@ -116,17 +118,40 @@ func (d *sourceFailureConnector) Watch(c.Context, json.RawMessage, func(c.Source
 
 type faultExecutionStore struct {
 	c.ExecutionStore
-	mu           sync.Mutex
-	listErr      error
-	countErr     error
-	listErrOnce  bool
-	listFailures chan struct{}
+	mu                   sync.Mutex
+	listErr              error
+	countErr             error
+	countErrOnce         bool
+	countFailures        chan struct{}
+	listErrOnce          bool
+	listFailures         chan struct{}
+	pendingListErr       error
+	pendingListErrOnce   bool
+	pendingFailures      chan struct{}
+	pendingSuccesses     chan struct{}
+	pendingListSkip      int
+	pendingRecoveryArmed bool
+	pendingRecoverySkip  int
+	commitErrState       c.State
+	commitErr            error
+	commitErrOnce        bool
+	commitFailures       chan struct{}
+	getErr               error
+	getErrOnce           bool
+	getFailures          chan struct{}
+	rejectedBusy         chan struct{}
+	rejectedCommitted    chan string
+	pauseOnRejectedBusy  bool
+	pauseAfterCommit     bool
+	pendingListPaused    chan struct{}
+	resumePendingList    chan struct{}
 }
 
 func (s *faultExecutionStore) SetErrors(listErr, countErr error) {
 	s.mu.Lock()
 	s.listErr, s.countErr = listErr, countErr
 	s.listErrOnce = false
+	s.countErrOnce = false
 	s.mu.Unlock()
 }
 
@@ -134,6 +159,104 @@ func (s *faultExecutionStore) SetListErrorOnce(err error) {
 	s.mu.Lock()
 	s.listErr, s.listErrOnce = err, err != nil
 	s.mu.Unlock()
+}
+
+func (s *faultExecutionStore) SetGetErrorOnce(err error) {
+	s.mu.Lock()
+	s.getErr, s.getErrOnce = err, err != nil
+	s.mu.Unlock()
+}
+
+func (s *faultExecutionStore) Get(ref c.Ref) (c.Snapshot[c.Execution], error) {
+	s.mu.Lock()
+	err := s.getErr
+	if err != nil && s.getErrOnce {
+		s.getErr, s.getErrOnce = nil, false
+	}
+	s.mu.Unlock()
+	if err != nil {
+		select {
+		case s.getFailures <- struct{}{}:
+		default:
+		}
+		return c.Snapshot[c.Execution]{}, err
+	}
+	return s.ExecutionStore.Get(ref)
+}
+
+func (s *faultExecutionStore) SetPendingListErrorOnce(err error) {
+	s.mu.Lock()
+	s.pendingListErr, s.pendingListErrOnce = err, err != nil
+	s.mu.Unlock()
+}
+
+func (s *faultExecutionStore) SetPendingListError(err error) {
+	s.mu.Lock()
+	s.pendingListErr, s.pendingListErrOnce = err, false
+	s.mu.Unlock()
+}
+
+func (s *faultExecutionStore) PendingObservations() ([]c.PendingObservation, error) {
+	s.mu.Lock()
+	err := s.pendingListErr
+	pause := false
+	if s.pauseAfterCommit && s.pendingListSkip > 0 {
+		s.pendingListSkip--
+	} else if s.pauseAfterCommit {
+		pause = true
+		s.pauseAfterCommit = false
+	}
+	if err != nil && s.pendingListErrOnce {
+		s.pendingListErr, s.pendingListErrOnce = nil, false
+	}
+	if err != nil && s.pendingSuccesses != nil {
+		s.pendingRecoveryArmed = true
+		s.pendingRecoverySkip = 1
+		for {
+			select {
+			case <-s.pendingSuccesses:
+			default:
+				goto drainedRecoverySignals
+			}
+		}
+	drainedRecoverySignals:
+	}
+	s.mu.Unlock()
+	if err != nil {
+		select {
+		case s.pendingFailures <- struct{}{}:
+		default:
+		}
+		return nil, err
+	}
+	if pause {
+		select {
+		case s.pendingListPaused <- struct{}{}:
+		default:
+		}
+		<-s.resumePendingList
+	}
+	items, readErr := s.ExecutionStore.PendingObservations()
+	if readErr == nil && s.pendingSuccesses != nil {
+		s.mu.Lock()
+		signalRecovery := false
+		if s.pendingRecoveryArmed {
+			if s.pendingRecoverySkip > 0 {
+				s.pendingRecoverySkip--
+			} else {
+				s.pendingRecoveryArmed = false
+				signalRecovery = true
+			}
+		}
+		s.mu.Unlock()
+		if signalRecovery {
+			select {
+			case s.pendingSuccesses <- struct{}{}:
+			default:
+			}
+		}
+	}
+	return items, readErr
 }
 
 func (s *faultExecutionStore) List() ([]c.Snapshot[c.Execution], error) {
@@ -156,11 +279,86 @@ func (s *faultExecutionStore) List() ([]c.Snapshot[c.Execution], error) {
 func (s *faultExecutionStore) PendingDeliveryCount() (int, error) {
 	s.mu.Lock()
 	err := s.countErr
+	if err != nil && s.countErrOnce {
+		s.countErr, s.countErrOnce = nil, false
+	}
 	s.mu.Unlock()
 	if err != nil {
+		if s.countFailures != nil {
+			s.mu.Lock()
+			s.pauseAfterCommit = true
+			s.pendingListSkip = 1
+			s.mu.Unlock()
+			select {
+			case s.countFailures <- struct{}{}:
+			default:
+			}
+		}
 		return 0, err
 	}
 	return s.ExecutionStore.PendingDeliveryCount()
+}
+
+func (s *faultExecutionStore) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], error) {
+	state := c.State("")
+	for _, change := range m.Changes {
+		state = change.After.Lifecycle.State
+	}
+	s.mu.Lock()
+	err := s.commitErr
+	if err != nil && s.commitErrOnce && state == s.commitErrState {
+		s.commitErr, s.commitErrOnce = nil, false
+		s.pauseAfterCommit = true
+	} else if state != s.commitErrState {
+		err = nil
+	}
+	s.mu.Unlock()
+	if err != nil {
+		if s.commitFailures != nil {
+			select {
+			case s.commitFailures <- struct{}{}:
+			default:
+			}
+		}
+		return c.Snapshot[c.Execution]{}, err
+	}
+	snap, commitErr := s.ExecutionStore.Commit(m)
+	hasRejected := false
+	for _, delivery := range m.Deliveries {
+		if delivery.Event != nil && delivery.Event.Name == "report.rejected" {
+			hasRejected = true
+			break
+		}
+	}
+	if hasRejected && commitErr != nil && c.AsFault(commitErr).Code == "busy" {
+		s.mu.Lock()
+		pause := s.pauseOnRejectedBusy
+		s.pauseOnRejectedBusy = false
+		if pause {
+			s.pauseAfterCommit = true
+		}
+		s.mu.Unlock()
+		if pause && s.rejectedBusy != nil {
+			select {
+			case s.rejectedBusy <- struct{}{}:
+			default:
+			}
+		}
+	}
+	if hasRejected && commitErr == nil && s.rejectedCommitted != nil {
+		rejectedID := ""
+		for _, delivery := range m.Deliveries {
+			if delivery.Event != nil && delivery.Event.Name == "report.rejected" {
+				rejectedID = delivery.Event.ID
+				break
+			}
+		}
+		select {
+		case s.rejectedCommitted <- rejectedID:
+		default:
+		}
+	}
+	return snap, commitErr
 }
 
 func readStatus(t *testing.T, core *host.Core) host.Status {
@@ -170,6 +368,44 @@ func readStatus(t *testing.T, core *host.Core) host.Status {
 		t.Fatal(err)
 	}
 	return status
+}
+
+func prepareDispatchingCall(t *testing.T, store *memory.Root, id string) c.Snapshot[c.Execution] {
+	t.Helper()
+	ref := c.Ref{Namespace: "calls", ID: id}
+	value := c.Execution{Call: c.Call{ID: id}, Lifecycle: c.Lifecycle{State: c.Created}}
+	first := lifecycle.Create(ref, value, "received")
+	changes := []c.Change[c.Execution]{first}
+	current := c.Snapshot[c.Execution]{Subject: ref, Revision: first.AfterRevision, Value: first.After}
+	for _, state := range []c.State{c.Validating, c.Queued} {
+		change, err := lifecycle.Move(current, c.Transition{Subject: ref, ExpectedRevision: current.Revision, From: current.Value.Lifecycle.State, To: state, Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		changes = append(changes, change)
+		current = c.Snapshot[c.Execution]{Subject: ref, Revision: change.AfterRevision, Value: change.After}
+	}
+	if err := store.Executions().CommitBatch(changes); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Executions().Claim(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.Executions().Get(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []c.State{c.Preparing, c.Dispatching} {
+		change, moveErr := lifecycle.Move(current, c.Transition{Subject: ref, ExpectedRevision: current.Revision, From: current.Value.Lifecycle.State, To: state, Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}})
+		if moveErr != nil {
+			t.Fatal(moveErr)
+		}
+		current, err = store.Executions().Commit(c.ExecutionMutation{Subject: ref, ExpectedRevision: current.Revision, Changes: []c.Change[c.Execution]{change}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return current
 }
 
 func readCalls(t *testing.T, core *host.Core) []c.Snapshot[c.Execution] {
@@ -410,6 +646,328 @@ func TestStorageReadFailuresReachStatusReadyAndClose(t *testing.T) {
 	status := readStatus(t, core)
 	if status.Lifecycle.Value.State == c.Succeeded || !status.LocalStopped {
 		t.Fatalf("unreadable shutdown was marked successful: %+v", status)
+	}
+}
+
+func TestClosingPreservesBackgroundPendingReadFailureAfterRecovery(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	store := &faultExecutionStore{ExecutionStore: root.Executions(), pendingFailures: make(chan struct{}, 1), pendingSuccesses: make(chan struct{}, 1)}
+	core, err := host.New(context.Background(), host.Options{
+		Connectors: map[string]c.Connector{"fake": connector{}}, Workers: 1,
+		Storage: &host.Storage{Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: store, Admissions: root.Admissions(), Journal: root.Journal()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	core.BeginDrain()
+	readErr := c.Err("busy", "one-shot pending read failed during shutdown")
+	for {
+		select {
+		case <-store.pendingSuccesses:
+		default:
+			goto drainedPendingReads
+		}
+	}
+drainedPendingReads:
+	store.SetPendingListErrorOnce(readErr)
+	select {
+	case <-store.pendingFailures:
+	case <-time.After(time.Second):
+		t.Fatal("background delivery loop did not observe the pending read failure")
+	}
+	select {
+	case <-store.pendingSuccesses:
+	case <-time.After(time.Second):
+		t.Fatal("background delivery loop did not recover through a later successful pending read")
+	}
+	if _, err := core.Status(); err != readErr {
+		t.Fatalf("Status error=%v, want preserved original read error %v", err, readErr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := core.Close(ctx); err != readErr {
+		t.Fatalf("Close error=%v, want original background pending read error %v", err, readErr)
+	}
+}
+
+func TestPendingReadFailureStopsOutboxDrain(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	preloaded := c.Event{ID: "must-wait-for-pending-read", Name: "observation", Category: "observation", Payload: c.Data{}}
+	if err := root.Executions().CommitBatch(nil, c.Delivery{ID: "preloaded-journal", Kind: c.DeliveryJournal, Event: &preloaded}); err != nil {
+		t.Fatal(err)
+	}
+	store := &faultExecutionStore{ExecutionStore: root.Executions(), pendingFailures: make(chan struct{}, 1)}
+	readErr := c.Err("busy", "persistent pending read failure")
+	store.SetPendingListError(readErr)
+	core, err := host.New(context.Background(), host.Options{
+		Connectors: map[string]c.Connector{"fake": connector{}}, Workers: 1,
+		Storage: &host.Storage{Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: store, Admissions: root.Admissions(), Journal: root.Journal()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-store.pendingFailures:
+	case <-time.After(time.Second):
+		t.Fatal("delivery loop did not observe pending-list failure")
+	}
+	time.Sleep(150 * time.Millisecond)
+	pending, err := root.Executions().PendingDeliveries(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, delivery := range pending {
+		found = found || delivery.ID == "preloaded-journal"
+	}
+	if !found {
+		t.Fatal("outbox was drained after pending-list read failed")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := core.Close(ctx); err == nil || err != readErr {
+		t.Fatalf("Close error=%v, want persistent pending read error %v", err, readErr)
+	}
+}
+
+func TestTransientPendingBusyDrainsAndClosesAfterRetry(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	current := prepareDispatchingCall(t, root, "pending-busy-close")
+	report := c.Report{Evidence: c.Evidence{CallID: current.Value.Call.ID, RemoteID: current.Value.Call.ID, ReportID: "pending-failed-result", Confirmed: true}, State: c.Failed, Result: &c.Result{CallID: current.Value.Call.ID, State: c.Failed, Error: &c.Fault{Code: "remote_failed", Message: "injected terminal result"}}}
+	pending := c.PendingObservation{CallID: current.Value.Call.ID, Revision: 1, Identity: "pending-busy-close-slot", Origin: current.Value.Origin, Report: report}
+	if err := root.Executions().CommitPending(c.PendingMutation{CallID: pending.CallID, After: &pending}); err != nil {
+		t.Fatal(err)
+	}
+	filler := c.Event{ID: "independent-drain-before-retry", Source: c.Ref{Namespace: "calls", ID: current.Value.Call.ID}, CallID: current.Value.Call.ID, Name: "independent", Category: "observation", Payload: c.Data{}}
+	if err := root.Executions().CommitBatch(nil, c.Delivery{ID: filler.ID, Kind: c.DeliveryJournal, Event: &filler}); err != nil {
+		t.Fatal(err)
+	}
+	store := &faultExecutionStore{
+		ExecutionStore:    root.Executions(),
+		commitErrState:    c.Failed,
+		commitErr:         c.Err("busy", "one transient terminal commit failure"),
+		commitErrOnce:     true,
+		commitFailures:    make(chan struct{}, 1),
+		pendingListPaused: make(chan struct{}, 1),
+		resumePendingList: make(chan struct{}),
+	}
+	core, err := host.New(context.Background(), host.Options{
+		Connectors: map[string]c.Connector{"fake": connector{}}, Workers: 1,
+		Storage: &host.Storage{Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: store, Admissions: root.Admissions(), Journal: root.Journal()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-store.commitFailures:
+	case <-time.After(time.Second):
+		status, _ := core.Status()
+		items, _ := root.Executions().PendingObservations()
+		t.Fatalf("delivery loop did not observe the one-shot pending commit busy fault: status=%+v pending=%+v", status, items)
+	}
+	select {
+	case <-store.pendingListPaused:
+	case <-time.After(time.Second):
+		t.Fatal("delivery loop did not reach the post-Drain retry barrier")
+	}
+	if count, err := root.Executions().PendingDeliveryCount(); err != nil || count != 0 {
+		t.Fatalf("independent Drain did not ACK its delivery while pending retry was still held: count=%d err=%v", count, err)
+	}
+	if items, err := root.Executions().PendingObservations(); err != nil || len(items) != 1 {
+		t.Fatalf("pending report was consumed before the independent delivery drained: count=%d err=%v", len(items), err)
+	}
+	store.resumePendingList <- struct{}{}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := core.Close(ctx); err != nil {
+		t.Fatalf("transient pending busy prevented recovery and successful Close: %v", err)
+	}
+	if items, err := root.Executions().PendingObservations(); err != nil || len(items) != 0 {
+		t.Fatalf("successful retry did not consume pending work: count=%d err=%v", len(items), err)
+	}
+	if count, err := root.Executions().PendingDeliveryCount(); err != nil || count != 0 {
+		t.Fatalf("Close left pending deliveries after retry: count=%d err=%v", count, err)
+	}
+}
+
+func TestPendingRejectedAuditRecoversAfterRealOutboxCapacityBusy(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	current := prepareDispatchingCall(t, root, "capacity-rejected-pending")
+	prior := c.Report{Evidence: c.Evidence{CallID: current.Value.Call.ID, RemoteID: current.Value.Call.ID, ReportID: "duplicate-running-receipt", Confirmed: true}, State: c.Running, Payload: c.Data{"version": "accepted"}}
+	accepted := lifecycle.Observe(current, prior)
+	if accepted.Err != nil {
+		t.Fatal(accepted.Err)
+	}
+	current, err := root.Executions().Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: accepted.Changes, Deliveries: accepted.Deliveries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalResult := c.Result{CallID: current.Value.Call.ID, State: c.Failed, Error: &c.Fault{Code: "remote_failed", Message: "original terminal result"}}
+	terminal := lifecycle.Observe(current, c.Report{Evidence: c.Evidence{CallID: current.Value.Call.ID, RemoteID: current.Value.Call.ID, ReportID: "original-terminal", Confirmed: true}, Result: &terminalResult})
+	if terminal.Err != nil {
+		t.Fatal(terminal.Err)
+	}
+	current, err = root.Executions().Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: terminal.Changes, Deliveries: terminal.Deliveries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejected := prior
+	rejected.Payload = c.Data{"version": "conflicting"}
+	pending := c.PendingObservation{CallID: current.Value.Call.ID, Revision: 1, Identity: "capacity-pending-slot", Origin: current.Value.Origin, Report: rejected}
+	if err := root.Executions().CommitPending(c.PendingMutation{CallID: pending.CallID, After: &pending}); err != nil {
+		t.Fatal(err)
+	}
+	const generalLimit = 8192
+	count, err := root.Executions().PendingDeliveryCount()
+	if err != nil || count >= generalLimit {
+		t.Fatalf("unexpected prefill outbox count=%d err=%v", count, err)
+	}
+	filler := make([]c.Delivery, generalLimit-count)
+	for i := range filler {
+		ev := c.Event{ID: c.ID("capacity-fill", fmt.Sprint(i)), Source: c.Ref{Namespace: "calls", ID: current.Value.Call.ID}, CallID: current.Value.Call.ID, Name: "capacity_fill", Category: "observation", Payload: c.Data{}}
+		filler[i] = c.Delivery{ID: ev.ID, Kind: c.DeliveryJournal, Event: &ev}
+	}
+	if err := root.Executions().CommitBatch(nil, filler...); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := root.Executions().PendingDeliveryCount(); err != nil || count != generalLimit {
+		t.Fatalf("general outbox did not reach its actual capacity: count=%d err=%v", count, err)
+	}
+	store := &faultExecutionStore{
+		ExecutionStore: root.Executions(), pauseOnRejectedBusy: true,
+		rejectedBusy: make(chan struct{}, 1), rejectedCommitted: make(chan string, 1),
+		pendingListPaused: make(chan struct{}, 1), resumePendingList: make(chan struct{}),
+	}
+	core, err := host.New(context.Background(), host.Options{
+		Connectors: map[string]c.Connector{"fake": connector{}}, Workers: 1,
+		Storage: &host.Storage{Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: store, Admissions: root.Admissions(), Journal: root.Journal()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-store.rejectedBusy:
+	case <-time.After(10 * time.Second):
+		t.Fatal("pending rejection audit did not hit actual general outbox capacity")
+	}
+	select {
+	case <-store.pendingListPaused:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Drain did not make capacity before the next pending retry")
+	}
+	items, err := root.Executions().PendingObservations()
+	if err != nil || len(items) != 1 || items[0].Identity != pending.Identity {
+		t.Fatalf("capacity rejection did not retain its matching pending slot: %+v err=%v", items, err)
+	}
+	count, err = root.Executions().PendingDeliveryCount()
+	if err != nil || count >= generalLimit {
+		t.Fatalf("independent Drain did not free general capacity: count=%d err=%v", count, err)
+	}
+	for _, item := range mustPendingDeliveries(t, root.Executions()) {
+		if item.Event != nil && item.Event.Name == "report.rejected" {
+			t.Fatal("rejection audit committed before general capacity was freed")
+		}
+	}
+	store.resumePendingList <- struct{}{}
+	var auditID string
+	select {
+	case auditID = <-store.rejectedCommitted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("matching rejection audit did not commit after Drain freed capacity")
+	}
+	if auditID == "" {
+		t.Fatal("committed rejection audit has no stable event ID")
+	}
+	if items, err = root.Executions().PendingObservations(); err != nil || len(items) != 0 {
+		t.Fatalf("successful audit commit did not consume the matching pending slot: %+v err=%v", items, err)
+	}
+	if err := core.Calls.RetryPending(); err != nil {
+		t.Fatalf("retry after consumed capacity rejection should be a no-op: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := core.Close(ctx); err != nil {
+		t.Fatalf("actual capacity recovery did not permit Close: %v", err)
+	}
+	record, err := root.Journal().ReadRecord(auditID)
+	if err != nil || record.Receipt == nil {
+		t.Fatalf("rejection audit was not durably journaled after recovery: receipt=%+v err=%v", record.Receipt, err)
+	}
+}
+
+func mustPendingDeliveries(t *testing.T, outbox interface {
+	PendingDeliveries(int) ([]c.Delivery, error)
+}) []c.Delivery {
+	t.Helper()
+	items, err := outbox.PendingDeliveries(8192)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return items
+}
+
+func TestPostDrainCountFailureKeepsPriorAckAndPublicFaultBounded(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Nodes: 2, Subscriptions: 2, Conversations: 2, Calls: 2, Queue: 2})
+	event := c.Event{ID: "count-failure-after-ack", Source: c.Ref{Namespace: "calls", ID: "count-failure-call"}, CallID: "count-failure-call", Name: "count_check", Category: "observation", Payload: c.Data{}}
+	if err := root.Executions().CommitBatch(nil, c.Delivery{ID: event.ID, Kind: c.DeliveryJournal, Event: &event}); err != nil {
+		t.Fatal(err)
+	}
+	countErr := c.Err(strings.Repeat("x", 100), strings.Repeat("private detail ", 100))
+	store := &faultExecutionStore{ExecutionStore: root.Executions(), countErr: countErr, countErrOnce: true, countFailures: make(chan struct{}, 1), pendingListPaused: make(chan struct{}, 1), resumePendingList: make(chan struct{})}
+	core, err := host.New(context.Background(), host.Options{
+		Connectors: map[string]c.Connector{"fake": connector{}}, Workers: 1,
+		Storage: &host.Storage{Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: store, Admissions: root.Admissions(), Journal: root.Journal()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-store.countFailures:
+	case <-time.After(time.Second):
+		status, _ := core.Status()
+		t.Fatalf("delivery loop did not observe the one-shot post-Drain count failure: status=%+v", status)
+	}
+	select {
+	case <-store.pendingListPaused:
+	case <-time.After(time.Second):
+		t.Fatal("delivery loop did not reach the recovery-pass barrier after recording the count error")
+	}
+	if _, err := root.Journal().ReadRecord(event.ID); err != nil {
+		t.Fatalf("outbox ACK was rolled back after the later count read failed: %v", err)
+	}
+	if count, err := root.Executions().PendingDeliveryCount(); err != nil || count != 0 {
+		t.Fatalf("count failure restored an acknowledged delivery: count=%d err=%v", count, err)
+	}
+	status, statusErr := core.Status()
+	if statusErr != nil || status.LastDeliveryError == nil {
+		t.Fatalf("count error was not observable before recovery: status=%+v err=%v", status, statusErr)
+	}
+	store.resumePendingList <- struct{}{}
+	deadline := time.Now().Add(2 * time.Second)
+	seenFault, cleared := true, false
+	for time.Now().Before(deadline) {
+		status, statusErr := core.Status()
+		if statusErr != nil {
+			t.Fatal(statusErr)
+		}
+		if status.LastDeliveryError != nil {
+			seenFault = true
+			if len(status.LastDeliveryError.Code) > 64 || len(status.LastDeliveryError.Message) > 512 {
+				t.Fatalf("Status exposed an unbounded delivery fault: code=%d message=%d", len(status.LastDeliveryError.Code), len(status.LastDeliveryError.Message))
+			}
+		} else if seenFault {
+			cleared = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !seenFault || !cleared {
+		t.Fatalf("one-shot count fault was not surfaced then cleared after a healthy pass: seen=%v cleared=%v", seenFault, cleared)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := core.Close(ctx); err != nil {
+		t.Fatalf("healthy recovery did not permit Close after the count failure: %v", err)
 	}
 }
 
@@ -941,6 +1499,55 @@ func TestCloseIgnoresBestEffortUnsupportedAbortWhenInvokeCompletes(t *testing.T)
 		t.Fatalf("expected actual terminal success, got %+v %v", snap, err)
 	}
 }
+
+func TestClosePreservesBestEffortAbortStorageReadFailure(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 8, Queue: 8})
+	store := &faultExecutionStore{ExecutionStore: root.Executions(), getFailures: make(chan struct{}, 1)}
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseConnector := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseConnector()
+	d := &drainConnector{entered: make(chan struct{}), release: release}
+	core, err := host.New(context.Background(), host.Options{
+		Connectors: map[string]c.Connector{"fake": d}, Workers: 1, Authority: testAuthority(t, "A"),
+		Storage: &host.Storage{Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: store, Admissions: root.Admissions(), Journal: root.Journal()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.Catalog.Register(context.Background(), c.Registration{ID: "A", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	execute[c.Snapshot[c.Execution]](t, core, "calls.submit", c.Call{ID: "close-read-failure-active", Target: node("A"), Operation: "run", Input: c.Data{"text": "active"}})
+	select {
+	case <-d.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first call did not enter connector")
+	}
+	execute[c.Snapshot[c.Execution]](t, core, "calls.submit", c.Call{ID: "close-read-failure-queued", Target: node("A"), Operation: "run", Input: c.Data{"text": "queued"}})
+	readErr := c.Err("conflict", "injected shutdown abort read failure")
+	store.SetGetErrorOnce(readErr)
+	closeDone := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	go func() { closeDone <- core.Close(ctx) }()
+	select {
+	case <-store.getFailures:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not attempt to read the queued call for best-effort Abort")
+	}
+	select {
+	case err := <-closeDone:
+		releaseConnector()
+		if err != readErr {
+			t.Fatalf("Close returned %v, want original abort storage read error %v", err, readErr)
+		}
+	case <-time.After(2 * time.Second):
+		releaseConnector()
+		t.Fatal("Close did not finish after the queued call and connector completed")
+	}
+}
+
 func execute[T any](t *testing.T, core *host.Core, name string, input any) T {
 	t.Helper()
 	raw, err := json.Marshal(input)

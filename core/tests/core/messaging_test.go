@@ -13,6 +13,7 @@ import (
 
 	"github.com/roster-framework/roster-server/core/internal/adapters/memory"
 	"github.com/roster-framework/roster-server/core/internal/adapters/schema"
+	"github.com/roster-framework/roster-server/core/internal/authority"
 	"github.com/roster-framework/roster-server/core/internal/catalog"
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
 	"github.com/roster-framework/roster-server/core/internal/conversation"
@@ -82,6 +83,10 @@ func TestPrivateDeliveryDigestPreservesAndProtectsEmissions(t *testing.T) {
 type orderedOutbox struct {
 	deliveries []c.Delivery
 	acked      []string
+	ackErrors  map[string]error
+	storeID    string
+	nextSeq    uint64
+	sequences  map[string]uint64
 }
 
 func (o *orderedOutbox) PendingDeliveries(limit int) ([]c.Delivery, error) {
@@ -91,6 +96,9 @@ func (o *orderedOutbox) PendingDeliveries(limit int) ([]c.Delivery, error) {
 	return c.Clone(o.deliveries[:limit]), nil
 }
 func (o *orderedOutbox) AckDelivery(id string, _ ...string) error {
+	if err := o.ackErrors[id]; err != nil {
+		return err
+	}
 	o.acked = append(o.acked, id)
 	for i, d := range o.deliveries {
 		if d.ID == id {
@@ -101,9 +109,51 @@ func (o *orderedOutbox) AckDelivery(id string, _ ...string) error {
 	return c.Err("not_found", "delivery missing")
 }
 func (o *orderedOutbox) PendingDeliveryCount() (int, error) { return len(o.deliveries), nil }
+func (o *orderedOutbox) ScanPending(after c.OutboxCursor, limit int) ([]c.PendingDelivery, c.OutboxCursor, error) {
+	if limit < 1 || limit > 64 {
+		return nil, c.OutboxCursor{}, c.Err("invalid_input", "bad scan limit")
+	}
+	if o.storeID == "" {
+		o.storeID = "ordered-test-store"
+		o.sequences = map[string]uint64{}
+		for _, d := range o.deliveries {
+			o.nextSeq++
+			o.sequences[d.ID] = o.nextSeq
+		}
+	}
+	if after == (c.OutboxCursor{}) {
+		after = c.OutboxCursor{StoreID: o.storeID, Through: o.nextSeq}
+	} else if after.StoreID != o.storeID || after.After > after.Through || after.Through > o.nextSeq {
+		return nil, c.OutboxCursor{}, c.Err("invalid_input", "bad cursor")
+	}
+	items := []c.PendingDelivery{}
+	for _, d := range o.deliveries {
+		seq := o.sequences[d.ID]
+		if seq > after.After && seq <= after.Through {
+			items = append(items, c.PendingDelivery{Delivery: c.Clone(d), Cursor: c.OutboxCursor{StoreID: o.storeID, After: seq, Through: after.Through}})
+			if len(items) == limit {
+				break
+			}
+		}
+	}
+	if len(items) == 0 {
+		return items, c.OutboxCursor{}, nil
+	}
+	last := items[len(items)-1].Cursor
+	for _, d := range o.deliveries {
+		seq := o.sequences[d.ID]
+		if seq > last.After && seq <= after.Through {
+			return items, last, nil
+		}
+	}
+	return items, c.OutboxCursor{}, nil
+}
 
 func (o *flakyAckOutbox) PendingDeliveries(limit int) ([]c.Delivery, error) {
 	return o.inner.PendingDeliveries(limit)
+}
+func (o *flakyAckOutbox) ScanPending(after c.OutboxCursor, limit int) ([]c.PendingDelivery, c.OutboxCursor, error) {
+	return o.inner.ScanPending(after, limit)
 }
 func (o *flakyAckOutbox) AckDelivery(id string, releaseEventIDs ...string) error {
 	if !o.failed {
@@ -115,6 +165,228 @@ func (o *flakyAckOutbox) AckDelivery(id string, releaseEventIDs ...string) error
 func (o *flakyAckOutbox) PendingDeliveryCount() (int, error) {
 	return o.inner.PendingDeliveryCount()
 }
+
+type controlledRecorder struct {
+	failures map[string]error
+	recorded []string
+}
+
+func (r *controlledRecorder) Record(e c.Event, _ string) error {
+	r.recorded = append(r.recorded, e.ID)
+	if err := r.failures[e.ID]; err != nil {
+		delete(r.failures, e.ID)
+		return err
+	}
+	return nil
+}
+func (*controlledRecorder) Release(string) error { return nil }
+
+func journalDelivery(id string) c.Delivery {
+	e := c.Event{ID: id, Source: c.Ref{Namespace: "nodes", ID: "source"}, Name: "entry", Category: "observation", OccurredAt: c.Now(), Payload: c.Data{}}
+	return c.Delivery{ID: id, Kind: c.DeliveryJournal, Event: &e}
+}
+func terminalDelivery(id string) c.Delivery {
+	snap := execution(c.Succeeded)
+	snap.Value.Call.ID = id
+	snap.Value.Result = &c.Result{CallID: id, State: c.Succeeded}
+	return c.Delivery{ID: id, Kind: c.DeliveryCompletion, Execution: &snap}
+}
+
+func TestDrainBusyItemsAdvanceAndPreserveIndependentProgress(t *testing.T) {
+	t.Run("record busy continues to terminal", func(t *testing.T) {
+		outbox := &orderedOutbox{deliveries: []c.Delivery{journalDelivery("record-busy"), terminalDelivery("terminal-after-record")}}
+		recorder := &controlledRecorder{failures: map[string]error{"record-busy": c.Err("busy", "journal capacity")}}
+		completed := 0
+		drain := event.New(nil, nil, nil, nil)
+		err := drain.Drain(outbox, recorder, func(c.Delivery) error { completed++; return nil })
+		if c.AsFault(err).Code != "busy" || completed != 1 || mustPendingCount(t, outbox) != 1 {
+			t.Fatalf("busy Record blocked independent terminal: err=%v completed=%d pending=%d", err, completed, mustPendingCount(t, outbox))
+		}
+		if err = drain.Drain(outbox, recorder, func(c.Delivery) error { completed++; return nil }); err != nil || mustPendingCount(t, outbox) != 0 {
+			t.Fatalf("Record retry failed: %v", err)
+		}
+	})
+	t.Run("completion busy continues to journal", func(t *testing.T) {
+		outbox := &orderedOutbox{deliveries: []c.Delivery{terminalDelivery("busy-completion"), journalDelivery("journal-after-completion")}}
+		recorder := &controlledRecorder{failures: map[string]error{}}
+		completed := 0
+		drain := event.New(nil, nil, nil, nil)
+		err := drain.Drain(outbox, recorder, func(c.Delivery) error { completed++; return c.Err("busy", "reply capacity") })
+		if c.AsFault(err).Code != "busy" || completed != 1 || mustPendingCount(t, outbox) != 1 || len(outbox.acked) != 1 || outbox.acked[0] != "journal-after-completion" {
+			t.Fatalf("busy completion blocked journal: err=%v completed=%d acked=%v", err, completed, outbox.acked)
+		}
+	})
+	t.Run("ack busy continues to independent item", func(t *testing.T) {
+		outbox := &orderedOutbox{deliveries: []c.Delivery{journalDelivery("ack-busy"), terminalDelivery("terminal-after-ack")}, ackErrors: map[string]error{"ack-busy": c.Err("busy", "ack capacity")}}
+		completed := 0
+		drain := event.New(nil, nil, nil, nil)
+		err := drain.Drain(outbox, &controlledRecorder{failures: map[string]error{}}, func(c.Delivery) error { completed++; return nil })
+		if c.AsFault(err).Code != "busy" || completed != 1 || mustPendingCount(t, outbox) != 1 {
+			t.Fatalf("busy ACK blocked independent terminal: err=%v completed=%d pending=%d", err, completed, mustPendingCount(t, outbox))
+		}
+	})
+	t.Run("I/O error stops after earlier acknowledgments", func(t *testing.T) {
+		ioErr := errors.New("journal I/O failure")
+		outbox := &orderedOutbox{deliveries: []c.Delivery{journalDelivery("journal-ok"), journalDelivery("journal-io-fail"), terminalDelivery("must-not-run")}}
+		recorder := &controlledRecorder{failures: map[string]error{"journal-io-fail": ioErr}}
+		completed := 0
+		drain := event.New(nil, nil, nil, nil)
+		err := drain.Drain(outbox, recorder, func(c.Delivery) error { completed++; return nil })
+		if err != ioErr || completed != 0 || len(outbox.acked) != 1 || outbox.acked[0] != "journal-ok" || mustPendingCount(t, outbox) != 2 {
+			t.Fatalf("I/O failure did not stop at item: err=%v acked=%v completed=%d pending=%d", err, outbox.acked, completed, mustPendingCount(t, outbox))
+		}
+	})
+}
+
+func TestBusyPublishBlocksOnlyItsSourceForTheCurrentPass(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Calls: 4, Queue: 1})
+	fake := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{"complete": json.RawMessage(`{"type":"object"}`)}}}
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": fake}, schema.New())
+	for _, id := range []string{"source-a", "source-b", "target"} {
+		if _, err := cat.Register(context.Background(), c.Registration{ID: id, ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := root.Executions().CommitBatch(queued("queue-occupant")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := root.Subscriptions().Apply(c.Change[c.Subscription]{ID: "sub-create", Subject: c.Ref{Namespace: "subscriptions", ID: "sub"}, AfterRevision: 1, After: c.Subscription{ID: "sub", Source: c.Ref{Namespace: "nodes", ID: "source-a"}, Event: "complete", Target: c.Ref{Namespace: "nodes", ID: "target"}, Operation: "run", Input: c.InputTemplate{}}}); err != nil {
+		t.Fatal(err)
+	}
+	makeEvent := func(id, source string) c.Event {
+		return c.Event{ID: id, Source: c.Ref{Namespace: "nodes", ID: source}, Name: "complete", Category: "published", OccurredAt: c.Now(), Payload: c.Data{}}
+	}
+	otherSource := makeEvent("independent-b", "source-b")
+	journal := c.Event{ID: "journal-between", Source: c.Ref{Namespace: "nodes", ID: "source-a"}, Name: "log", Category: "observation", OccurredAt: c.Now(), Payload: c.Data{}}
+	complete := terminalDelivery("completion-between")
+	deliveries := make([]c.Delivery, 0, 68)
+	for i := 0; i < 64; i++ {
+		id := fmt.Sprintf("busy-a-%02d", i)
+		published := makeEvent(id, "source-a")
+		deliveries = append(deliveries, c.Delivery{ID: fmt.Sprintf("publish-a-%02d", i), Kind: c.DeliveryPublish, Event: &published, Origin: ptrOrigin(sourceOrigin("source-a"))})
+	}
+	deliveries = append(deliveries, c.Delivery{ID: "journal-between", Kind: c.DeliveryJournal, Event: &journal}, complete, c.Delivery{ID: "publish-b", Kind: c.DeliveryPublish, Event: &otherSource, Origin: ptrOrigin(sourceOrigin("source-b"))})
+	if err := root.Executions().CommitBatch(nil, deliveries...); err != nil {
+		t.Fatal(err)
+	}
+	journalStore := newJournal(t, root, 32)
+	policy, err := authority.New([]authority.Grant{{Principal: authority.Principal{Namespace: "nodes", ID: "source-a"}, Action: "invoke", Target: authority.Principal{Namespace: "nodes", ID: "target"}, Operations: []string{"run"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := invocation.New(root.Executions(), cat, journalStore, policy)
+	drainer := event.New(root.Subscriptions(), cat, calls, root.Admissions())
+	completed := 0
+	err = drainer.Drain(root.Executions(), journalStore, func(c.Delivery) error { completed++; return nil })
+	if c.AsFault(err).Code != "busy" || completed != 1 {
+		t.Fatalf("capacity-busy source did not preserve independent progress: err=%v completed=%d", err, completed)
+	}
+	for i := 0; i < 64; i++ {
+		id := fmt.Sprintf("busy-a-%02d", i)
+		if _, ok, e := root.Admissions().ReadPublished(id); e != nil || ok {
+			t.Fatalf("blocked source event %s was admitted: ok=%v err=%v", id, ok, e)
+		}
+	}
+	if _, ok, e := root.Admissions().ReadPublished("independent-b"); e != nil || !ok {
+		t.Fatalf("independent source was not admitted: ok=%v err=%v", ok, e)
+	}
+	remaining, scanErr := root.Executions().PendingDeliveries(128)
+	if scanErr != nil {
+		t.Fatal(scanErr)
+	}
+	remainingIDs := map[string]bool{}
+	for _, delivery := range remaining {
+		remainingIDs[delivery.ID] = true
+	}
+	if len(remaining) != 65 {
+		t.Fatalf("busy source publishes were not retained through fixed Through: count=%d ids=%+v", len(remaining), remainingIDs)
+	}
+	for i := 0; i < 64; i++ {
+		if !remainingIDs[fmt.Sprintf("publish-a-%02d", i)] {
+			t.Fatalf("busy published delivery %d was skipped", i)
+		}
+	}
+	if err = drainer.Drain(root.Executions(), journalStore, func(c.Delivery) error { completed++; return nil }); c.AsFault(err).Code != "busy" || completed != 1 {
+		t.Fatalf("subsequent pass failed to resume source-blocked work: err=%v completed=%d", err, completed)
+	}
+}
+
+func TestOutboxScanUsesFixedThroughAndResumesAcrossAckHoles(t *testing.T) {
+	store := memory.NewExecutions(2, 2)
+	deliveries := make([]c.Delivery, 70)
+	for i := range deliveries {
+		id := fmt.Sprintf("scan-%02d", i)
+		ev := c.Event{ID: id, Name: "log", Category: "observation", OccurredAt: c.Now(), Payload: c.Data{}}
+		deliveries[i] = c.Delivery{ID: id, Kind: c.DeliveryJournal, Event: &ev}
+	}
+	if err := store.CommitBatch(nil, deliveries...); err != nil {
+		t.Fatal(err)
+	}
+	first, next, err := store.ScanPending(c.OutboxCursor{}, 64)
+	if err != nil || len(first) != 64 || next.After != 64 || next.Through != 70 {
+		t.Fatalf("first scan did not preserve fixed window: len=%d next=%+v err=%v", len(first), next, err)
+	}
+	if err := store.AckDelivery(first[0].Delivery.ID); err != nil {
+		t.Fatal(err)
+	}
+	newEvent := c.Event{ID: "scan-new", Name: "log", Category: "observation", OccurredAt: c.Now(), Payload: c.Data{}}
+	if err := store.CommitBatch(nil, c.Delivery{ID: newEvent.ID, Kind: c.DeliveryJournal, Event: &newEvent}); err != nil {
+		t.Fatal(err)
+	}
+	second, done, err := store.ScanPending(next, 64)
+	if err != nil || len(second) != 6 || done != (c.OutboxCursor{}) {
+		t.Fatalf("fixed window did not finish over an ACK hole: len=%d next=%+v err=%v", len(second), done, err)
+	}
+	for _, item := range second {
+		if item.Cursor.Through != 70 || item.Delivery.ID == newEvent.ID {
+			t.Fatalf("scan included post-Through arrival or changed boundary: %+v", item)
+		}
+	}
+	all, more, err := store.ScanPending(c.OutboxCursor{}, 64)
+	if err != nil || len(all) != 64 {
+		t.Fatalf("new pass did not revisit head and include arrival: len=%d err=%v", len(all), err)
+	}
+	for _, item := range all {
+		if item.Delivery.ID == deliveries[0].ID {
+			t.Fatal("ACKed sequence hole was returned")
+		}
+	}
+	last, done, err := store.ScanPending(more, 64)
+	if err != nil || len(last) != 6 || done != (c.OutboxCursor{}) || last[len(last)-1].Delivery.ID != newEvent.ID {
+		t.Fatalf("new arrival was not found on the next pass tail: len=%d cursor=%+v err=%v", len(last), done, err)
+	}
+	if _, _, err = store.ScanPending(c.OutboxCursor{StoreID: "other-store", Through: 70}, 1); err == nil {
+		t.Fatal("foreign store cursor was accepted")
+	}
+}
+
+func TestDrainBudgetResumesActualTailAndReentrantDrainIsNonblocking(t *testing.T) {
+	deliveries := make([]c.Delivery, 32)
+	for i := range deliveries {
+		deliveries[i] = terminalDelivery(fmt.Sprintf("budget-%02d", i))
+	}
+	outbox := &orderedOutbox{deliveries: deliveries}
+	drainer := event.New(nil, nil, nil, nil)
+	nestedCode := ""
+	err := drainer.Drain(outbox, &controlledRecorder{failures: map[string]error{}}, func(c.Delivery) error {
+		nested := drainer.Drain(outbox, &controlledRecorder{failures: map[string]error{}}, nil)
+		nestedCode = c.AsFault(nested).Code
+		time.Sleep(2 * time.Millisecond)
+		return nil
+	})
+	if err != nil || nestedCode != "busy" {
+		t.Fatalf("reentrant drain blocked or outer pass failed: nested=%s err=%v", nestedCode, err)
+	}
+	firstPending := mustPendingCount(t, outbox)
+	if firstPending == 0 || firstPending >= len(deliveries) {
+		t.Fatalf("soft-budget pass did not stop with a resumable tail: pending=%d", firstPending)
+	}
+	if err = drainer.Drain(outbox, &controlledRecorder{failures: map[string]error{}}, func(c.Delivery) error { return nil }); err != nil || mustPendingCount(t, outbox) != 0 {
+		t.Fatalf("resumed tail was skipped: pending=%d err=%v", mustPendingCount(t, outbox), err)
+	}
+}
+
+func ptrOrigin(origin c.AdmissionOrigin) *c.AdmissionOrigin { return &origin }
 
 func TestDrainReplayAfterAckLossAndJournalRingEviction(t *testing.T) {
 	root := memory.NewRoot(memory.Limits{Calls: 2, Queue: 2})
@@ -245,6 +517,11 @@ func TestJournalFacadeProducersSerializeWithDrainAndChangedPublishRetry(t *testi
 	close(producerErrors)
 	for err := range producerErrors {
 		t.Errorf("concurrent Journal producer failed: %v", err)
+	}
+	// The first Drain has a fixed Through boundary. Finish deliveries appended
+	// by the concurrent producers on the following pass.
+	if err := drainer.Drain(outbox, drainJournal, nil); err != nil {
+		t.Fatalf("follow-up pass for arrivals beyond Through failed: %v", err)
 	}
 	if pending := mustPendingCount(t, outbox); pending != 0 {
 		t.Fatalf("single Drain left deliveries pending: %d", pending)

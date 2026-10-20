@@ -2,7 +2,10 @@ package invocation
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"github.com/roster-framework/roster-server/core/internal/catalog"
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
 	"github.com/roster-framework/roster-server/core/internal/lifecycle"
@@ -26,13 +29,51 @@ type Service struct {
 	workersDone chan struct{}
 	OnResult    func(c.Delivery) error
 	OnCommit    func()
-	pending     map[string]c.Report
+}
+
+type pendingReadFailure struct{ cause error }
+
+func (e pendingReadFailure) Error() string { return e.cause.Error() }
+func (e pendingReadFailure) Unwrap() error { return e.cause }
+func IsPendingReadFailure(err error) bool {
+	var target pendingReadFailure
+	return errors.As(err, &target)
+}
+func PendingReadCause(err error) error {
+	var target pendingReadFailure
+	if errors.As(err, &target) {
+		return target.cause
+	}
+	return nil
+}
+
+type pendingPersistenceFailure struct{ cause error }
+
+func (e pendingPersistenceFailure) Error() string { return e.cause.Error() }
+func (e pendingPersistenceFailure) Unwrap() error { return e.cause }
+func IsPendingPersistenceFailure(err error) bool {
+	var target pendingPersistenceFailure
+	return errors.As(err, &target)
+}
+func PendingPersistenceCause(err error) error {
+	var target pendingPersistenceFailure
+	if errors.As(err, &target) {
+		return target.cause
+	}
+	return nil
+}
+
+func pendingPersistenceError(err error) error {
+	if err == nil || c.AsFault(err).Code == "busy" {
+		return err
+	}
+	return pendingPersistenceFailure{cause: err}
 }
 
 var _ c.Caller = (*Service)(nil)
 
 func New(store c.ExecutionStore, cat *catalog.Service, j c.Journal, auth c.Authority) *Service {
-	s := &Service{store: store, catalog: cat, authority: auth, journal: j, pending: map[string]c.Report{}}
+	s := &Service{store: store, catalog: cat, authority: auth, journal: j}
 	if auth != nil {
 		s.shutdown = auth.ShutdownCapability(s)
 	}
@@ -203,9 +244,11 @@ func (s *Service) localMove(old c.Snapshot[c.Execution], next c.State) (c.Snapsh
 }
 func (s *Service) Outbox() c.Outbox { return s.store }
 func (s *Service) PendingObservationCount() (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.pending), nil
+	items, err := s.store.PendingObservations()
+	if err != nil {
+		return 0, err
+	}
+	return len(items), nil
 }
 func (s *Service) run(id string) {
 	defer func() {
@@ -297,10 +340,13 @@ func (s *Service) normalizeResult(id string, result c.Result, allowProgress bool
 	if result.State == c.Succeeded {
 		old, e := s.store.Get(ref(id))
 		if e != nil {
-			return c.Result{}, e
+			return c.Result{}, pendingReadFailure{cause: e}
 		}
 		n, e := s.catalog.Get(old.Value.Call.Target.ID)
-		if e != nil || s.catalog.ValidateOutput(n.Operations[old.Value.Call.Operation], result.Output) != nil {
+		if e != nil {
+			return c.Result{}, pendingReadFailure{cause: e}
+		}
+		if s.catalog.ValidateOutput(n.Operations[old.Value.Call.Operation], result.Output) != nil {
 			return invalid("Remote result violated the declared boundary"), nil
 		}
 	}
@@ -328,27 +374,29 @@ func (s *Service) applyReportAt(r c.Report, expectedRevision *uint64) error {
 		}
 	}
 	if r.Evidence.ReportID != "" {
-		s.mu.Lock()
-		pending, ok := s.pending[id]
-		conflictingPending := ok && pending.Evidence.ReportID == r.Evidence.ReportID && pendingSlotIdentity(pending) != pendingSlotIdentity(r)
-		s.mu.Unlock()
-		if conflictingPending {
-			err := c.Err("conflict", "Pending report ID reused with different lineage or content")
-			s.recordPendingAudit(r)
-			return err
+		pending, ok, err := s.store.PendingObservation(id)
+		if err != nil {
+			return pendingReadFailure{cause: err}
+		}
+		if ok && pending.Report.Evidence.ReportID == r.Evidence.ReportID && pendingSlotIdentity(pending.Report) != pendingSlotIdentity(r) {
+			auditErr := s.savePending(r)
+			if auditErr != nil {
+				return auditErr
+			}
+			return c.Err("conflict", "Pending report ID reused with different lineage or content")
 		}
 	}
 	var wake func()
-	var resultErr error
 	for attempt := 0; attempt < 8; attempt++ {
 		old, err := s.store.Get(ref(id))
 		if err != nil {
-			return err
+			return pendingReadFailure{cause: err}
 		}
 		if expectedRevision != nil && old.Revision != *expectedRevision {
 			return c.Err("conflict", "Execution revision conflict")
 		}
 		obs := lifecycle.Observe(old, r)
+		resultErr := obs.Err
 		terminalCompletion := false
 		for _, d := range obs.Deliveries {
 			if d.Execution != nil && d.Execution.Value.Lifecycle.State.Terminal() {
@@ -376,24 +424,18 @@ func (s *Service) applyReportAt(r c.Report, expectedRevision *uint64) error {
 				delivery.ReservationCallID = id
 			}
 		}
-		if obs.Err != nil {
-			resultErr = obs.Err
+		rejectedAudit := hasRejectedAudit(obs.Deliveries)
+		staleAudit := hasStaleAudit(obs.Deliveries)
+		acceptedAny := resultErr == nil && !staleAudit
+		pendingMutation, err := s.pendingConsumption(r, resultErr == nil || rejectedAudit, acceptedAny, resultErr != nil && rejectedAudit && !staleAudit)
+		if err != nil {
+			return err
 		}
-		if len(obs.Changes) == 0 && len(obs.Deliveries) == 0 {
-			if resultErr == nil {
-				s.clearPendingAfterTerminal(r, true)
-				s.clearPendingAfterAccepted(r)
-			}
+		if len(obs.Changes) == 0 && len(obs.Deliveries) == 0 && pendingMutation == nil {
 			return resultErr
 		}
-		_, err = s.store.Commit(c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: old.Revision, Changes: obs.Changes, Deliveries: obs.Deliveries})
+		_, err = s.store.Commit(c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: old.Revision, Changes: obs.Changes, Deliveries: obs.Deliveries, Pending: pendingMutation})
 		if err == nil {
-			if resultErr == nil || hasRejectedAudit(obs.Deliveries) {
-				s.clearPendingAfterTerminal(r, resultErr == nil)
-				if resultErr == nil && !hasStaleAudit(obs.Deliveries) {
-					s.clearPendingAfterAccepted(r)
-				}
-			}
 			s.mu.Lock()
 			wake = s.OnCommit
 			s.mu.Unlock()
@@ -404,17 +446,20 @@ func (s *Service) applyReportAt(r c.Report, expectedRevision *uint64) error {
 		}
 		if c.AsFault(err).Code != "conflict" {
 			if r.Result != nil && (r.State.Terminal() || r.State == c.Waiting || r.State == c.Unknown) {
-				s.savePending(r)
+				if saveErr := s.savePending(r); saveErr != nil {
+					return saveErr
+				}
 			}
-			return err
+			return pendingPersistenceError(err)
 		}
 		if expectedRevision != nil {
 			return c.Err("conflict", "Execution revision conflict")
 		}
-		resultErr = err
 	}
 	if r.Result != nil && (r.State.Terminal() || r.State == c.Waiting || r.State == c.Unknown) {
-		s.savePending(r)
+		if err := s.savePending(r); err != nil {
+			return err
+		}
 	}
 	return c.Err("conflict", "Execution observation exceeded CAS retry limit")
 }
@@ -469,139 +514,155 @@ func hasStaleAudit(deliveries []c.Delivery) bool {
 	}
 	return false
 }
-func (s *Service) clearPendingAfterTerminal(r c.Report, accepted bool) {
-	if r.Result == nil || !r.Result.State.Terminal() {
-		return
+func shouldConsumePending(r c.Report, pending c.Report, acceptedTerminal, acceptedAny, rejectedMatch bool) bool {
+	if r.Result != nil && r.Result.State.Terminal() {
+		return acceptedTerminal && (pendingSlotIdentity(pending) == pendingSlotIdentity(r) || acceptedAny && (pending.Result == nil || !pending.Result.State.Terminal()))
 	}
-	id := r.Evidence.CallID
-	identity := pendingSlotIdentity(r)
-	s.mu.Lock()
-	if pending, ok := s.pending[id]; ok {
-		if pendingSlotIdentity(pending) == identity || accepted && (pending.Result == nil || !pending.Result.State.Terminal()) {
-			delete(s.pending, id)
-		}
+	if (!acceptedAny && !rejectedMatch) || pending.Result != nil && pending.Result.State.Terminal() {
+		return false
 	}
-	s.mu.Unlock()
+	return pendingSlotIdentity(pending) == pendingSlotIdentity(r) || acceptedAny && isInspectionQueryReport(r) && isInspectionQueryReport(pending) && r.ObservedRevision > pending.ObservedRevision
 }
-func (s *Service) clearPendingAfterAccepted(r c.Report) {
-	if r.Result == nil || r.Result.State.Terminal() {
-		return
+func (s *Service) pendingConsumption(r c.Report, acceptedTerminal, acceptedAny, rejectedMatch bool) (*c.PendingMutation, error) {
+	pending, ok, err := s.store.PendingObservation(r.Evidence.CallID)
+	if err != nil {
+		return nil, pendingReadFailure{cause: err}
 	}
-	id := r.Evidence.CallID
-	identity := pendingSlotIdentity(r)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	pending, ok := s.pending[id]
-	if !ok || pending.Result != nil && pending.Result.State.Terminal() {
-		return
+	if !ok || !shouldConsumePending(r, pending.Report, acceptedTerminal, acceptedAny, rejectedMatch) {
+		return nil, nil
 	}
-	if pendingSlotIdentity(pending) == identity || isInspectionQueryReport(r) && isInspectionQueryReport(pending) && r.ObservedRevision > pending.ObservedRevision {
-		delete(s.pending, id)
-	}
+	return &c.PendingMutation{CallID: r.Evidence.CallID, ExpectedRevision: pending.Revision, ExpectedIdentity: pending.Identity}, nil
 }
-func (s *Service) savePending(r c.Report) {
-	id := r.Evidence.CallID
-	s.mu.Lock()
-	if existing, ok := s.pending[id]; ok {
-		if pendingSlotIdentity(existing) == pendingSlotIdentity(r) {
-			s.mu.Unlock()
-			return
-		}
-		if existing.Result != nil && existing.Result.State.Terminal() {
-			s.mu.Unlock()
-			s.recordPendingAudit(r)
-			return
-		}
-		if r.Result != nil && r.Result.State.Terminal() {
-			s.pending[id] = r
-			s.mu.Unlock()
-			return
-		}
-		if existing.Evidence.ReportID != "" && existing.Evidence.ReportID == r.Evidence.ReportID {
-			s.mu.Unlock()
-			s.recordPendingAudit(r)
-			return
-		}
-		if isInspectionQueryReport(existing) && isInspectionQueryReport(r) {
-			if r.ObservedRevision > existing.ObservedRevision {
-				s.pending[id] = r
-				s.mu.Unlock()
-				s.recordPendingAudit(existing)
-				return
-			}
-			if existing.ObservedRevision > r.ObservedRevision {
-				s.mu.Unlock()
-				s.recordPendingAudit(r)
-				return
-			}
-		}
-		if existing.Result != nil && existing.Result.State == c.Unknown && r.Result != nil && r.Result.State == c.Waiting && r.Evidence.Confirmed {
-			s.pending[id] = r
-			s.mu.Unlock()
-			s.recordPendingAudit(existing)
-			return
-		}
-		if existing.Result != nil && r.Result != nil {
-			s.mu.Unlock()
-			s.recordPendingAudit(r)
-			return
-		}
-		if existing.Result != nil {
-			s.mu.Unlock()
-			s.recordPendingAudit(r)
-			return
-		}
-		if existing.State == c.Waiting && r.State == c.Unknown && !r.Evidence.Confirmed {
-			s.mu.Unlock()
-			return
-		}
-		if existing.State == c.Unknown && r.State == c.Waiting && r.Evidence.Confirmed {
-			s.pending[id] = r
-			s.mu.Unlock()
-			s.recordPendingAudit(existing)
-			return
-		}
-		s.mu.Unlock()
-		s.recordPendingAudit(r)
-		return
+func newPendingIdentity(r c.Report, revision uint64, prior string) (string, error) {
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", c.Err("internal", "Pending observation identity unavailable")
 	}
-	s.pending[id] = r
-	s.mu.Unlock()
+	return c.ID("pending/1", r.Evidence.CallID, strconv.FormatUint(revision, 10), prior, pendingSlotIdentity(r), hex.EncodeToString(nonce[:])), nil
 }
-func (s *Service) recordPendingAudit(r c.Report) {
+func (s *Service) savePending(r c.Report) error {
 	id := r.Evidence.CallID
-	digest := pendingReportDigest(r)
-	for i := 0; i < 8; i++ {
+	for attempt := 0; attempt < 8; attempt++ {
 		old, err := s.store.Get(ref(id))
 		if err != nil {
-			return
+			return pendingReadFailure{cause: err}
 		}
-		ev := c.Event{ID: c.ID(id, "report.rejected", r.Evidence.ReportID, digest), Source: old.Subject, Name: "report.rejected", Category: "observation", CallID: id, CorrelationID: old.Value.Call.CorrelationID, ConversationID: old.Value.Call.ConversationID, Payload: c.Data{"report_id": r.Evidence.ReportID, "digest": digest, "code": "conflict"}}
-		_, err = s.store.Commit(c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: old.Revision, Deliveries: []c.Delivery{{ID: ev.ID, Event: &ev}}})
-		if err == nil {
-			s.mu.Lock()
-			wake := s.OnCommit
-			s.mu.Unlock()
-			if wake != nil {
-				wake()
+		existing, exists, err := s.store.PendingObservation(id)
+		if err != nil {
+			return pendingReadFailure{cause: err}
+		}
+		var prior c.Report
+		if exists {
+			prior = existing.Report
+		}
+		var replaced, rejected bool
+		if exists {
+			switch {
+			case pendingSlotIdentity(prior) == pendingSlotIdentity(r):
+				return nil
+			case prior.Result != nil && prior.Result.State.Terminal():
+				rejected = true
+			case r.Result != nil && r.Result.State.Terminal():
+				replaced = true
+			case prior.Evidence.ReportID != "" && prior.Evidence.ReportID == r.Evidence.ReportID:
+				rejected = true
+			case isInspectionQueryReport(prior) && isInspectionQueryReport(r) && r.ObservedRevision > prior.ObservedRevision:
+				replaced = true
+			case isInspectionQueryReport(prior) && isInspectionQueryReport(r) && prior.ObservedRevision > r.ObservedRevision:
+				rejected = true
+			case prior.Result != nil && prior.Result.State == c.Unknown && r.Result != nil && r.Result.State == c.Waiting && r.Evidence.Confirmed:
+				replaced = true
+			case prior.Result != nil && r.Result != nil:
+				rejected = true
+			case prior.Result != nil:
+				rejected = true
+			case prior.State == c.Waiting && r.State == c.Unknown && !r.Evidence.Confirmed:
+				return nil
+			case prior.State == c.Unknown && r.State == c.Waiting && r.Evidence.Confirmed:
+				replaced = true
+			default:
+				rejected = true
 			}
-			return
+		}
+		mutation := c.PendingMutation{CallID: id}
+		if exists {
+			mutation.ExpectedRevision, mutation.ExpectedIdentity = existing.Revision, existing.Identity
+		}
+		var audit c.Report
+		if replaced {
+			audit = prior
+		}
+		if rejected {
+			audit = r
+		}
+		if !rejected || exists {
+			nextReport := r
+			if rejected {
+				nextReport = prior
+			}
+			revision := mutation.ExpectedRevision + 1
+			identity, identityErr := newPendingIdentity(nextReport, revision, mutation.ExpectedIdentity)
+			if identityErr != nil {
+				return identityErr
+			}
+			mutation.After = &c.PendingObservation{CallID: id, Revision: revision, Identity: identity, Origin: old.Value.Origin, Report: nextReport}
+		}
+		if rejected || replaced {
+			delivery, buildErr := pendingAuditDelivery(old, audit)
+			if buildErr != nil {
+				return buildErr
+			}
+			mutation.Deliveries = []c.Delivery{delivery}
+		}
+		err = s.store.CommitPending(mutation)
+		if err == nil {
+			if len(mutation.Deliveries) > 0 {
+				s.wakeCommit()
+			}
+			return nil
 		}
 		if c.AsFault(err).Code != "conflict" {
-			return
+			return pendingPersistenceError(err)
 		}
 	}
+	return pendingPersistenceFailure{cause: c.Err("conflict", "Pending observation exceeded CAS retry limit")}
 }
-func (s *Service) RetryPending() {
+func pendingAuditDelivery(old c.Snapshot[c.Execution], r c.Report) (c.Delivery, error) {
+	id := r.Evidence.CallID
+	digest := pendingReportDigest(r)
+	ev := c.Event{ID: c.ID(id, "report.rejected", r.Evidence.ReportID, digest), Source: old.Subject, Name: "report.rejected", Category: "observation", CallID: id, CorrelationID: old.Value.Call.CorrelationID, ConversationID: old.Value.Call.ConversationID, Payload: c.Data{"report_id": r.Evidence.ReportID, "digest": digest, "code": "conflict"}}
+	return c.Delivery{ID: ev.ID, Event: &ev}, nil
+}
+func (s *Service) wakeCommit() {
 	s.mu.Lock()
-	items := make([]c.Report, 0, len(s.pending))
-	for _, r := range s.pending {
-		items = append(items, r)
-	}
+	wake := s.OnCommit
 	s.mu.Unlock()
-	for _, r := range items {
-		_ = s.applyReport(r)
+	if wake != nil {
+		wake()
 	}
+}
+func (s *Service) RetryPending() error {
+	items, err := s.store.PendingObservations()
+	if err != nil {
+		return pendingReadFailure{cause: err}
+	}
+	var transient error
+	for _, item := range items {
+		if err := s.applyReport(item.Report); err != nil {
+			if IsPendingReadFailure(err) {
+				return err
+			}
+			code := c.AsFault(err).Code
+			if code == "busy" || code == "conflict" {
+				if transient == nil {
+					transient = err
+				}
+				continue
+			}
+			return err
+		}
+	}
+	return transient
 }
 
 func (s *Service) failPanic(id string) {
@@ -631,7 +692,11 @@ func (s *Service) failPanic(id string) {
 	s.finish(id, c.Result{CallID: id, State: c.Unknown, Error: &c.Fault{Code: "connector_panic", Message: "Connector execution interrupted"}})
 }
 func (s *Service) Abort(ctx context.Context, id, reason string, expectedRevision *uint64) (c.Snapshot[c.Execution], error) {
-	return s.abort(ctx, id, reason, expectedRevision, false)
+	snap, err := s.abort(ctx, id, reason, expectedRevision, false)
+	if cause := pendingControlFailureCause(err); cause != nil {
+		return snap, cause
+	}
+	return snap, err
 }
 
 func (s *Service) abort(ctx context.Context, id, reason string, expectedRevision *uint64, hostShutdown bool) (c.Snapshot[c.Execution], error) {
@@ -643,7 +708,7 @@ func (s *Service) abort(ctx context.Context, id, reason string, expectedRevision
 	}
 	old, err := s.store.Get(ref(id))
 	if err != nil {
-		return old, err
+		return old, pendingReadFailure{cause: err}
 	}
 	local := c.Ref{Namespace: "operators", ID: "local"}
 	origin := c.AdmissionOrigin{Root: local, Actor: local, Kind: c.OriginDirect}
@@ -681,32 +746,53 @@ func (s *Service) abort(ctx context.Context, id, reason string, expectedRevision
 	if state == c.Created || state == c.Validating || state == c.Queued || state == c.Preparing {
 		err = s.applyReportAt(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Cancelled, Payload: c.Data{"reason": reason}}, &old.Revision)
 		if err != nil {
+			if pendingControlFailureCause(err) != nil {
+				return old, err
+			}
 			if expectedRevision == nil {
-				if current, getErr := s.Get(id); getErr == nil && (current.Value.Lifecycle.State.Terminal() || current.Value.Lifecycle.State == c.Cancelling) {
-					return current, nil
+				if current, getErr := s.Get(id); getErr == nil {
+					if current.Value.Lifecycle.State.Terminal() || current.Value.Lifecycle.State == c.Cancelling {
+						return current, nil
+					}
+				} else {
+					return old, pendingReadFailure{cause: getErr}
 				}
 			}
 			return old, err
 		}
-		return s.Get(id)
+		current, getErr := s.Get(id)
+		if getErr != nil {
+			return current, pendingReadFailure{cause: getErr}
+		}
+		return current, nil
 	}
-	n, _ := s.catalog.Get(old.Value.Call.Target.ID)
+	n, err := s.catalog.Get(old.Value.Call.Target.ID)
+	if err != nil {
+		return old, pendingReadFailure{cause: err}
+	}
 	op := n.Operations[old.Value.Call.Operation]
 	if !op.Capabilities.Abort {
 		return old, c.Err("unsupported", "Node does not support remote cancellation")
 	}
 	err = s.applyReportAt(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Cancelling, Payload: c.Data{"reason": reason}}, &old.Revision)
 	if err != nil {
+		if pendingControlFailureCause(err) != nil {
+			return old, err
+		}
 		if expectedRevision == nil {
-			if current, getErr := s.Get(id); getErr == nil && (current.Value.Lifecycle.State.Terminal() || current.Value.Lifecycle.State == c.Cancelling) {
-				return current, nil
+			if current, getErr := s.Get(id); getErr == nil {
+				if current.Value.Lifecycle.State.Terminal() || current.Value.Lifecycle.State == c.Cancelling {
+					return current, nil
+				}
+			} else {
+				return old, pendingReadFailure{cause: getErr}
 			}
 		}
 		return old, err
 	}
 	old, err = s.Get(id)
 	if err != nil {
-		return old, err
+		return old, pendingReadFailure{cause: err}
 	}
 	if old.Value.Lifecycle.State.Terminal() || old.Value.Lifecycle.State != c.Cancelling {
 		return old, nil
@@ -714,15 +800,25 @@ func (s *Service) abort(ctx context.Context, id, reason string, expectedRevision
 	obs, e := safeAbort(ctx, s.catalog.Connector(n.ConnectorID), n, old.Value.Call)
 	if e != nil {
 		result := c.Result{CallID: id, State: c.Unknown, Error: c.AsFault(e)}
-		_ = s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id}, Result: &result})
+		if reportErr := s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id}, Result: &result}); pendingControlFailureCause(reportErr) != nil {
+			return old, reportErr
+		}
 	} else if obs.Result != nil {
 		result := *obs.Result
-		_ = s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id, Confirmed: true}, Result: &result})
+		if reportErr := s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id, Confirmed: true}, Result: &result}); pendingControlFailureCause(reportErr) != nil {
+			return old, reportErr
+		}
 	} else if !obs.Requested {
 		result := c.Result{CallID: id, State: c.Unknown, Error: &c.Fault{Code: "abort_unconfirmed", Message: "Remote cancellation was not confirmed"}}
-		_ = s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id}, Result: &result})
+		if reportErr := s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id}, Result: &result}); pendingControlFailureCause(reportErr) != nil {
+			return old, reportErr
+		}
 	}
-	return s.Get(id)
+	latest, err := s.Get(id)
+	if err != nil {
+		return latest, pendingReadFailure{cause: err}
+	}
+	return latest, nil
 }
 func (s *Service) Inspect(ctx context.Context, id string) (c.Snapshot[c.Execution], error) {
 	old, err := s.store.Get(ref(id))
@@ -732,7 +828,10 @@ func (s *Service) Inspect(ctx context.Context, id string) (c.Snapshot[c.Executio
 	if old.Value.Lifecycle.State.Terminal() {
 		return old, nil
 	}
-	n, _ := s.catalog.Get(old.Value.Call.Target.ID)
+	n, err := s.catalog.Get(old.Value.Call.Target.ID)
+	if err != nil {
+		return old, err
+	}
 	if !n.Operations[old.Value.Call.Operation].Capabilities.Inspect {
 		return old, c.Err("unsupported", "Node does not support receipt lookup")
 	}
@@ -743,6 +842,9 @@ func (s *Service) Inspect(ctx context.Context, id string) (c.Snapshot[c.Executio
 	if state != c.Reconciling {
 		err = s.applyReportAt(c.Report{Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}, State: c.Reconciling, Payload: c.Data{"reason": "inspect_reconciling"}}, &old.Revision)
 		if err != nil {
+			if cause := pendingControlFailureCause(err); cause != nil {
+				return c.Snapshot[c.Execution]{}, cause
+			}
 			latest, getErr := s.Get(id)
 			if getErr != nil {
 				return latest, getErr
@@ -772,18 +874,21 @@ func (s *Service) Inspect(ctx context.Context, id string) (c.Snapshot[c.Executio
 	if r.CallID != id {
 		r = c.Result{CallID: id, State: c.Unknown, Error: &c.Fault{Code: "foreign_result", Message: "Receipt does not belong to requested execution"}}
 	}
-	if r.State == c.Succeeded {
-		n, _, _ := s.catalog.Validate(old.Value.Call.Target, old.Value.Call.Operation, old.Value.Call.Input)
-		b, e := json.Marshal(r.Output)
-		if e != nil || len(b) > 65536 || s.catalog.ValidateOutput(n.Operations[old.Value.Call.Operation], r.Output) != nil {
-			r = c.Result{CallID: id, State: c.Unknown, Error: &c.Fault{Code: "invalid_result", Message: "Remote result violated the declared boundary"}}
-		}
-	}
 	err = s.applyReport(c.Report{Evidence: c.Evidence{CallID: id, RemoteID: id, Confirmed: true, ReportID: c.ID(id, "inspect", strconv.FormatUint(observedRevision, 10))}, Result: &r, ObservedRevision: observedRevision})
 	if err != nil {
+		if cause := pendingControlFailureCause(err); cause != nil {
+			return c.Snapshot[c.Execution]{}, cause
+		}
 		return s.Get(id)
 	}
 	return s.Get(id)
+}
+
+func pendingControlFailureCause(err error) error {
+	if cause := PendingReadCause(err); cause != nil {
+		return cause
+	}
+	return PendingPersistenceCause(err)
 }
 
 func (s *Service) Resume(_ context.Context, id string, _ c.Data) (c.Snapshot[c.Execution], error) {
@@ -819,7 +924,10 @@ func (s *Service) Close(ctx context.Context, observeFirstError func(error)) (clo
 		for _, snap := range initial {
 			state := snap.Value.Lifecycle.State
 			if state == c.Created || state == c.Validating || state == c.Queued || state == c.Preparing {
-				_, _ = s.abort(ctx, snap.Value.Call.ID, "host_shutdown", nil, true)
+				_, abortErr := s.abort(ctx, snap.Value.Call.ID, "host_shutdown", nil, true)
+				if cause := pendingControlFailureCause(abortErr); cause != nil {
+					recordQueryError(cause)
+				}
 			}
 		}
 	}
@@ -860,7 +968,10 @@ draining:
 		for _, snap := range remaining {
 			state := snap.Value.Lifecycle.State
 			if !state.Terminal() && state != c.Waiting && state != c.Unknown {
-				_, _ = s.abort(ctx, snap.Value.Call.ID, "host_shutdown", nil, true)
+				_, abortErr := s.abort(ctx, snap.Value.Call.ID, "host_shutdown", nil, true)
+				if cause := pendingControlFailureCause(abortErr); cause != nil {
+					recordQueryError(cause)
+				}
 			}
 		}
 	}
