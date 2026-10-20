@@ -16,28 +16,17 @@ type View struct {
 	Messages     []c.Message                `json:"messages"`
 	Next         int                        `json:"next_cursor"`
 }
-type receipt struct {
-	digest  string
-	message c.Message
-}
-type pendingReply struct {
-	conversationID, messageID string
-	author                    c.Ref
-}
 type Service struct {
-	mu       sync.Mutex
-	store    c.Store[c.Conversation]
-	catalog  *catalog.Service
-	caller   c.Caller
-	journal  c.Journal
-	messages map[string][]c.Message
-	receipts map[string]receipt
-	pending  map[string]pendingReply
-	reserved map[string]int
+	mu      sync.Mutex
+	store   c.Store[c.Conversation]
+	catalog *catalog.Service
+	caller  c.Caller
+	journal c.Journal
+	state   c.AdmissionState
 }
 
-func New(store c.Store[c.Conversation], cat *catalog.Service, caller c.Caller, j c.Journal) *Service {
-	return &Service{store: store, catalog: cat, caller: caller, journal: j, messages: map[string][]c.Message{}, receipts: map[string]receipt{}, pending: map[string]pendingReply{}, reserved: map[string]int{}}
+func New(store c.Store[c.Conversation], cat *catalog.Service, caller c.Caller, j c.Journal, state c.AdmissionState) *Service {
+	return &Service{store: store, catalog: cat, caller: caller, journal: j, state: state}
 }
 func participant(conv c.Conversation, ref c.Ref) (c.Participant, bool) {
 	for _, p := range conv.Participants {
@@ -74,12 +63,7 @@ func (s *Service) Create(conv c.Conversation) (c.Snapshot[c.Conversation], error
 		}
 	}
 	ch := lifecycle.Create(c.Ref{Namespace: "conversations", ID: conv.ID}, conv, "conversation.created")
-	out, err := lifecycle.Commit(s.store, ch, s.journal)
-	if err == nil {
-		s.messages[conv.ID] = []c.Message{}
-
-	}
-	return out, err
+	return lifecycle.Commit(s.store, ch, s.journal)
 }
 func (s *Service) Get(id string, after, limit int) (View, error) {
 	s.mu.Lock()
@@ -91,7 +75,10 @@ func (s *Service) Get(id string, after, limit int) (View, error) {
 	if limit == 0 {
 		limit = 100
 	}
-	messages := s.messages[id]
+	messages, err := s.state.Messages(id, 0, 500)
+	if err != nil {
+		return View{}, err
+	}
 	if after < 0 || after > len(messages) || limit < 1 || limit > 500 {
 		return View{}, c.Err("invalid_input", "Invalid message page")
 	}
@@ -111,13 +98,17 @@ func (s *Service) Send(req c.SendMessage, origin c.AdmissionOrigin) (c.Message, 
 	if err != nil || len(b) > 65536 {
 		return c.Message{}, c.Err("invalid_input", "Message exceeds size limit")
 	}
-	key := req.ID + "/" + req.MessageID
 	digest := c.ID(string(b))
-	if old, ok := s.receipts[key]; ok {
-		if old.digest != digest {
+	if s.state == nil {
+		return c.Message{}, c.Err("internal", "Admission state is unavailable")
+	}
+	if old, ok, readErr := s.state.ReadMessage(req.ID, req.MessageID); readErr != nil {
+		return c.Message{}, readErr
+	} else if ok {
+		if old.Digest != digest {
 			return c.Message{}, c.Err("conflict", "Message ID reused with different content")
 		}
-		return c.Clone(old.message), nil
+		return c.Clone(old.Message), nil
 	}
 	snap, err := s.store.Get(c.Ref{Namespace: "conversations", ID: req.ID})
 	if err != nil {
@@ -132,7 +123,11 @@ func (s *Service) Send(req c.SendMessage, origin c.AdmissionOrigin) (c.Message, 
 	}
 	if req.ReplyTo != "" {
 		found := false
-		for _, m := range s.messages[req.ID] {
+		messages, readErr := s.state.Messages(req.ID, 0, 500)
+		if readErr != nil {
+			return c.Message{}, readErr
+		}
+		for _, m := range messages {
 			if m.ID == req.ReplyTo {
 				found = true
 			}
@@ -146,7 +141,10 @@ func (s *Service) Send(req c.SendMessage, origin c.AdmissionOrigin) (c.Message, 
 			return c.Message{}, c.Err("invalid_input", "Invalid attachment reference")
 		}
 	}
-	recent := s.messages[req.ID]
+	recent, err := s.state.Messages(req.ID, 0, 500)
+	if err != nil {
+		return c.Message{}, err
+	}
 	if len(recent) > 20 {
 		recent = recent[len(recent)-20:]
 	}
@@ -154,8 +152,8 @@ func (s *Service) Send(req c.SendMessage, origin c.AdmissionOrigin) (c.Message, 
 	payload = c.Clone(payload)
 	calls := []c.Call{}
 	seen := map[string]bool{}
-	pending := map[string]pendingReply{}
 	ids := []string{}
+	pendingReplies := []c.PendingReply{}
 	for _, recipient := range req.Recipients {
 		p, ok := participant(conv, recipient)
 		if !ok || seen[recipient.Key()] || recipient == req.Author {
@@ -173,61 +171,81 @@ func (s *Service) Send(req c.SendMessage, origin c.AdmissionOrigin) (c.Message, 
 		id := c.ID(req.ID, req.MessageID, recipient.Key())
 		ids = append(ids, id)
 		calls = append(calls, c.Call{ID: id, Target: r.Target, Operation: r.Operation, Input: mapped, CorrelationID: c.ID(req.ID, req.MessageID), CausationID: req.MessageID, ConversationID: req.ID})
-		pending[id] = pendingReply{req.ID, req.MessageID, p.Ref}
+		pendingReplies = append(pendingReplies, c.PendingReply{CallID: id, ConversationID: req.ID, MessageID: req.MessageID, Author: p.Ref})
 	}
-	if len(s.messages[req.ID])+s.reserved[req.ID]+1+len(calls) > 500 {
+	reserved, err := s.state.ReservedReplies(req.ID)
+	if err != nil {
+		return c.Message{}, err
+	}
+	messageCount, err := s.state.Messages(req.ID, 0, 500)
+	if err != nil {
+		return c.Message{}, err
+	}
+	if len(messageCount)+reserved+1+len(calls) > 500 {
 		return c.Message{}, c.Err("busy", "Conversation message capacity exhausted")
 	}
 	conversationOrigin := origin
 	conversationOrigin.Kind = c.OriginConversation
 	conversationOrigin.ParentCallID = ""
 	conversationOrigin.ParentEventID = req.MessageID
-	if _, err = s.caller.SubmitBatch(conversationOrigin, calls); err != nil {
+	m := c.Message{ID: req.MessageID, Author: req.Author, Recipients: c.Clone(req.Recipients), Text: req.Text, Attachments: c.Clone(req.Attachments), ReplyTo: req.ReplyTo, CallIDs: ids, At: c.Now()}
+	messageEvent := c.Event{ID: c.ID(req.ID, m.ID, "journal"), Source: c.Ref{Namespace: "conversations", ID: req.ID}, Name: "message", Category: "observation", CallID: "", ConversationID: req.ID, Payload: c.Data{"message_id": m.ID, "author": m.Author, "reply_to": m.ReplyTo, "call_ids": m.CallIDs}}
+	effect := c.AdmissionEffect{Message: &c.MessageAdmission{Conversation: c.RevisionRef{Subject: snap.Subject, Revision: snap.Revision}, Message: m, Digest: digest, PendingReplies: pendingReplies, Reserved: len(pendingReplies)}, Deliveries: []c.Delivery{{ID: messageEvent.ID, Kind: c.DeliveryJournal, Event: &messageEvent}}}
+	if _, err = s.caller.SubmitBatch(conversationOrigin, calls, effect); err != nil {
+		old, ok, readErr := s.state.ReadMessage(req.ID, req.MessageID)
+		if readErr != nil {
+			return c.Message{}, readErr
+		}
+		if ok {
+			if old.Digest != digest {
+				return c.Message{}, c.Err("conflict", "Message ID reused with different content")
+			}
+			return c.Clone(old.Message), nil
+		}
 		return c.Message{}, err
 	}
-	m := c.Message{ID: req.MessageID, Author: req.Author, Recipients: c.Clone(req.Recipients), Text: req.Text, Attachments: c.Clone(req.Attachments), ReplyTo: req.ReplyTo, CallIDs: ids, At: c.Now()}
-	s.messages[req.ID] = append(s.messages[req.ID], m)
-	s.receipts[key] = receipt{digest, m}
-	for id, p := range pending {
-		s.pending[id] = p
-		s.reserved[req.ID]++
-	}
-	s.record(req.ID, m)
 	return c.Clone(m), nil
 }
-func (s *Service) Complete(snap c.Snapshot[c.Execution]) {
-	if !snap.Value.Lifecycle.State.Terminal() {
-		return
+func (s *Service) Complete(delivery c.Delivery) error {
+	if delivery.Execution == nil || !delivery.Execution.Value.Lifecycle.State.Terminal() {
+		return c.Err("invalid_input", "Completion delivery is not terminal")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p, ok := s.pending[snap.Value.Call.ID]
-	if !ok {
-		return
+	snap := *delivery.Execution
+	if s.state == nil {
+		return c.Err("internal", "Admission state is unavailable")
 	}
-	delete(s.pending, snap.Value.Call.ID)
-	s.reserved[p.conversationID]--
-	result := snap.Value.Result
-	if result == nil {
-		result = &c.Result{CallID: snap.Value.Call.ID, State: snap.Value.Lifecycle.State}
+	p, ok, err := s.state.ReadPendingReply(snap.Value.Call.ID)
+	if err != nil {
+		return err
 	}
-	text := ""
-	if result.Output != nil {
-		b, _ := json.Marshal(result.Output)
-		text = string(b)
+	var pending *c.PendingReply
+	var message *c.Message
+	var deliveries []c.Delivery
+	if ok {
+		pending = &p
+		result := snap.Value.Result
+		if result == nil {
+			result = &c.Result{CallID: snap.Value.Call.ID, State: snap.Value.Lifecycle.State}
+		}
+		text := ""
+		if result.Output != nil {
+			b, _ := json.Marshal(result.Output)
+			text = string(b)
+		}
+		if result.Error != nil {
+			text = result.Error.Message
+		}
+		if text == "" {
+			text = string(result.State)
+		}
+		m := c.Message{ID: c.ID(snap.Value.Call.ID, "reply"), Author: p.Author, Text: text, ReplyTo: p.MessageID, CallIDs: []string{snap.Value.Call.ID}, At: c.Now(), Result: result}
+		message = &m
+		ev := c.Event{ID: c.ID(p.ConversationID, m.ID, "journal"), Source: c.Ref{Namespace: "conversations", ID: p.ConversationID}, Name: "message", Category: "observation", CallID: snap.Value.Call.ID, CausationID: snap.Value.Call.ID, ConversationID: p.ConversationID, Payload: c.Data{"message_id": m.ID, "author": m.Author, "reply_to": m.ReplyTo, "call_ids": m.CallIDs, "result": m.Result}}
+		deliveries = []c.Delivery{{ID: ev.ID, Kind: c.DeliveryJournal, ReservationCallID: snap.Value.Call.ID, Event: &ev}}
 	}
-	if result.Error != nil {
-		text = result.Error.Message
-	}
-	if text == "" {
-		text = string(result.State)
-	}
-	m := c.Message{ID: c.ID(snap.Value.Call.ID, "reply"), Author: p.author, Text: text, ReplyTo: p.messageID, CallIDs: []string{snap.Value.Call.ID}, At: c.Now(), Result: result}
-	s.messages[p.conversationID] = append(s.messages[p.conversationID], c.Clone(m))
-	s.record(p.conversationID, m)
-}
-func (s *Service) record(id string, m c.Message) {
-	s.journal.Append(c.Event{Source: c.Ref{Namespace: "conversations", ID: id}, Name: "message", Category: "observation", ConversationID: id, Payload: c.Data{"message_id": m.ID, "author": m.Author, "reply_to": m.ReplyTo, "call_ids": m.CallIDs}})
+	return s.state.CommitReply(c.ReplyCommit{Delivery: delivery, Pending: pending, Message: message, Deliveries: deliveries})
 }
 func (s *Service) Close(id string, revision uint64) (c.Change[c.Conversation], error) {
 	s.mu.Lock()

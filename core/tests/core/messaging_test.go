@@ -1,14 +1,22 @@
 package core_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/roster-framework/roster-server/core/internal/adapters/memory"
+	"github.com/roster-framework/roster-server/core/internal/adapters/schema"
+	"github.com/roster-framework/roster-server/core/internal/catalog"
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
 	"github.com/roster-framework/roster-server/core/internal/conversation"
 	"github.com/roster-framework/roster-server/core/internal/event"
+	"github.com/roster-framework/roster-server/core/internal/invocation"
 	"github.com/roster-framework/roster-server/core/internal/observation"
 )
 
@@ -16,6 +24,59 @@ type flakyAckOutbox struct {
 	delivery c.Delivery
 	failed   bool
 	acked    bool
+}
+
+func TestPrivateDeliveryDigestPreservesAndProtectsEmissions(t *testing.T) {
+	store := memory.NewExecutions(2, 2)
+	if err := store.CommitBatch(queued("emission-copy")); err != nil {
+		t.Fatal(err)
+	}
+	old, err := store.Get(c.Ref{Namespace: "calls", ID: "emission-copy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal := c.Clone(old)
+	terminal.Revision++
+	terminal.Value.Lifecycle.State = c.Succeeded
+	terminal.Value.Result = &c.Result{CallID: "emission-copy", State: c.Succeeded, Emissions: []c.Emission{{Name: "one", Payload: c.Data{"value": 1, "label": "x"}}}}
+	lifecycle := terminal.Value.Lifecycle
+	delivery := c.Delivery{ID: "stable-emission-terminal", Kind: c.DeliveryCompletion, ReservationCallID: "emission-copy", Execution: &terminal}
+	if _, err = store.Commit(c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: old.Revision, Deliveries: []c.Delivery{delivery}}); err != nil {
+		t.Fatal(err)
+	}
+	terminal.Value.Result.Emissions[0].Payload["label"] = "mutated source"
+	first, err := store.PendingDeliveries(1)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("pending envelope missing: %v", err)
+	}
+	if first[0].Execution.Value.Result.Emissions[0].Payload["label"] != "x" {
+		t.Fatal("outbox aliased the caller's private emissions")
+	}
+	first[0].Execution.Value.Result.Emissions[0].Payload["label"] = "mutated return"
+	second, err := store.PendingDeliveries(1)
+	if err != nil || second[0].Execution.Value.Result.Emissions[0].Payload["label"] != "x" {
+		t.Fatal("outbox return was not deeply copied")
+	}
+
+	changed := c.Delivery{ID: delivery.ID, Kind: c.DeliveryCompletion, ReservationCallID: "emission-copy", Execution: &c.Snapshot[c.Execution]{Subject: terminal.Subject, Revision: terminal.Revision, Value: c.Execution{Call: old.Value.Call, Lifecycle: lifecycle, Result: &c.Result{CallID: "emission-copy", State: c.Succeeded, Emissions: []c.Emission{{Name: "one", Payload: c.Data{"value": 1, "label": "changed"}}}}}}}
+	if _, err = store.Commit(c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: old.Revision, Deliveries: []c.Delivery{changed}}); err == nil || c.AsFault(err).Code != "conflict" {
+		t.Fatalf("pending emissions change was not a conflict: %v", err)
+	}
+	if err = store.AckDelivery(delivery.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Commit(c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: old.Revision, Deliveries: []c.Delivery{changed}}); err == nil || c.AsFault(err).Code != "conflict" {
+		t.Fatalf("ACKed emissions change was not a conflict: %v", err)
+	}
+
+	equivalent := c.Delivery{ID: delivery.ID, Kind: c.DeliveryCompletion, ReservationCallID: "emission-copy", Execution: &c.Snapshot[c.Execution]{Subject: terminal.Subject, Revision: terminal.Revision, Value: c.Execution{Call: old.Value.Call, Lifecycle: lifecycle, Result: &c.Result{CallID: "emission-copy", State: c.Succeeded, Emissions: []c.Emission{{Name: "one", Payload: c.Data{"label": "x", "value": float64(1)}}}}}}}
+	if _, err = store.Commit(c.ExecutionMutation{Subject: old.Subject, ExpectedRevision: old.Revision, Deliveries: []c.Delivery{equivalent}}); err != nil {
+		t.Fatalf("normalized JSON-equivalent emissions conflicted: %v", err)
+	}
+	public, err := json.Marshal(equivalent.Execution.Value)
+	if err != nil || bytes.Contains(public, []byte("emissions")) {
+		t.Fatalf("private emissions leaked into public JSON: %s %v", public, err)
+	}
 }
 
 type orderedOutbox struct {
@@ -66,7 +127,7 @@ func TestDrainReplayAfterAckLossAndJournalRingEviction(t *testing.T) {
 	j := observation.New(1)
 	ev := c.Event{ID: "stable-log", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "log", Category: "observation", Payload: c.Data{"text": "same"}}
 	outbox := &flakyAckOutbox{delivery: c.Delivery{ID: ev.ID, Event: &ev}}
-	drain := event.New(nil, nil, nil, j)
+	drain := event.New(nil, nil, nil, j, nil)
 	if err := drain.Drain(outbox, j, nil); err == nil || outbox.PendingDeliveryCount() != 1 {
 		t.Fatal("simulated ACK loss did not retain delivery")
 	}
@@ -80,9 +141,253 @@ func TestDrainReplayAfterAckLossAndJournalRingEviction(t *testing.T) {
 	}
 }
 
+func TestTerminalCallbackErrorRetainsOriginalEnvelopeForRetry(t *testing.T) {
+	j := observation.New(10)
+	terminal := execution(c.Succeeded)
+	d := c.Delivery{ID: "terminal-callback-error", Kind: c.DeliveryCompletion, Execution: &terminal}
+	outbox := &orderedOutbox{deliveries: []c.Delivery{d}}
+	drain := event.New(nil, nil, nil, j, nil)
+	callbackErr := errors.New("reply commit failed")
+	if err := drain.Drain(outbox, j, func(c.Delivery) error { return callbackErr }); err != callbackErr || len(outbox.acked) != 0 || outbox.PendingDeliveryCount() != 1 {
+		t.Fatalf("callback failure ACKed terminal delivery: err=%v acked=%v", err, outbox.acked)
+	}
+	if err := drain.Drain(outbox, j, func(got c.Delivery) error {
+		if got.ID != d.ID {
+			return c.Err("conflict", "envelope changed")
+		}
+		return nil
+	}); err != nil || len(outbox.acked) != 1 || outbox.PendingDeliveryCount() != 0 {
+		t.Fatalf("terminal callback retry failed: err=%v acked=%v", err, outbox.acked)
+	}
+}
+
+func TestTwentyEmissionsAndReplyDrainWhenGeneralOutboxIsFull(t *testing.T) {
+	f := &fakeConnector{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	f.descriptor = c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`), Capabilities: c.Capabilities{Inspect: true}}}, Events: map[string]c.Schema{}}
+	for i := 0; i < 20; i++ {
+		f.descriptor.Events[fmt.Sprintf("emit-%02d", i)] = json.RawMessage(`{"type":"object"}`)
+	}
+	f.invoke = func(call c.Call, report c.ReportSink) c.Result {
+		if call.ConversationID == "" {
+			return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{}}
+		}
+		if err := report(c.Report{Evidence: c.Evidence{CallID: call.ID, RemoteID: call.ID, Confirmed: true, ReportID: "parked-running"}, State: c.Running}); err != nil {
+			return c.Result{CallID: call.ID, State: c.Failed, Error: c.AsFault(err)}
+		}
+		close(entered)
+		<-release
+		emissions := make([]c.Emission, 20)
+		for i := range emissions {
+			emissions[i] = c.Emission{Name: fmt.Sprintf("emit-%02d", i), Payload: c.Data{"index": i}}
+		}
+		return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{}, Emissions: emissions}
+	}
+	f.inspect = func(call c.Call) c.Result { return c.Result{CallID: call.ID, State: c.Running} }
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	j := observation.New(10000)
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New(), j)
+	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	calls := invocation.New(root.Executions(), cat, j, fixtureAuthority(t))
+	events := event.New(root.Subscriptions(), cat, calls, j, root.Admissions())
+	sessions := conversation.New(root.Conversations(), cat, calls, j, root.Admissions())
+	ownerCall := call("reservation-owner")
+	if _, err := calls.SubmitBatch(directOrigin(), []c.Call{ownerCall}); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := calls.Get(ownerCall.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	author := c.Ref{Namespace: "users", ID: "author"}
+	node := c.Ref{Namespace: "nodes", ID: "node"}
+	conv := c.Conversation{ID: "full-outbox", Title: "full", Participants: []c.Participant{{Ref: author}, {Ref: node, Receiver: &c.Receiver{Target: node, Operation: "run", Input: c.InputTemplate{Values: c.Data{}}}}}}
+	if _, err = sessions.Create(conv); err != nil {
+		t.Fatal(err)
+	}
+	message, err := sessions.Send(c.SendMessage{ID: conv.ID, MessageID: "first", Author: author, Recipients: []c.Ref{node}, Text: "go"}, directOrigin())
+	if err != nil || len(message.CallIDs) != 1 {
+		t.Fatalf("conversation admission failed: %+v %v", message, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls.Start(ctx, 1)
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("conversation invocation did not park")
+	}
+	for i := 0; i < 8; i++ {
+		inspected, inspectErr := calls.Inspect(ctx, message.CallIDs[0])
+		if inspectErr != nil || inspected.Value.Lifecycle.State != c.Running {
+			t.Fatalf("running inspection %d: state=%s err=%v", i, inspected.Value.Lifecycle.State, inspectErr)
+		}
+	}
+
+	pending, err := calls.Outbox().PendingDeliveries(10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err = calls.Get(ownerCall.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generalCount := 0
+	for _, d := range pending {
+		if d.ReservationCallID == "" && d.Execution == nil {
+			generalCount++
+		}
+	}
+	if generalCount >= 8192 {
+		t.Fatalf("precondition already used general capacity: %d", generalCount)
+	}
+	filler := make([]c.Delivery, 8192-generalCount)
+	for i := range filler {
+		ev := c.Event{ID: c.ID("general-fill", fmt.Sprint(i)), Name: "fill", Category: "observation", Payload: c.Data{}}
+		filler[i] = c.Delivery{ID: ev.ID, Event: &ev}
+	}
+	if _, err = root.Executions().Commit(c.ExecutionMutation{Subject: owner.Subject, ExpectedRevision: owner.Revision, Deliveries: filler}); err != nil {
+		t.Fatalf("fill general outbox: %v", err)
+	}
+	generalCount, err = countGeneralDeliveries(calls.Outbox())
+	if err != nil || generalCount != 8192 {
+		t.Fatalf("general outbox capacity=%d err=%v", generalCount, err)
+	}
+
+	close(release)
+	deadline := time.Now().Add(10 * time.Second)
+	var terminal c.Delivery
+	var routed []c.Delivery
+	for time.Now().Before(deadline) {
+		pending, err = calls.Outbox().PendingDeliveries(10000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		terminal = c.Delivery{}
+		routed = routed[:0]
+		for _, d := range pending {
+			if d.Execution != nil && d.Execution.Value.Call.ID == message.CallIDs[0] && d.Execution.Value.Lifecycle.State.Terminal() {
+				terminal = d
+			}
+			if d.Event != nil && d.Event.Category == "published" && d.Event.CallID == message.CallIDs[0] {
+				routed = append(routed, d)
+			}
+		}
+		if terminal.Execution != nil && len(routed) == 20 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if terminal.Execution == nil || len(routed) != 20 {
+		t.Fatalf("invocation effects not enqueued: terminal=%v routed=%d", terminal.Execution != nil, len(routed))
+	}
+	for i, d := range routed {
+		if d.Origin == nil {
+			t.Fatalf("routed emission %d has no origin", i)
+		}
+		if _, err := events.Publish(*d.Event, *d.Origin); err != nil {
+			t.Fatalf("reserved publish %d while general outbox is full: %v", i, err)
+		}
+	}
+	if err := sessions.Complete(terminal); err != nil {
+		t.Fatalf("reserved reply while general outbox is full: %v", err)
+	}
+	if err := sessions.Complete(terminal); err != nil {
+		t.Fatalf("replay terminal completion: %v", err)
+	}
+	if generalCount, err = countGeneralDeliveries(calls.Outbox()); err != nil || generalCount != 8192 {
+		t.Fatalf("general capacity changed before drain: count=%d err=%v", generalCount, err)
+	}
+	view, err := sessions.Get(conv.ID, 0, 100)
+	if err != nil || len(view.Messages) != 2 {
+		t.Fatalf("reply admission was not idempotent: messages=%d err=%v", len(view.Messages), err)
+	}
+
+	calls.OnResult = sessions.Complete
+	stopDrain := make(chan struct{})
+	drainErr := make(chan error, 1)
+	go func() {
+		tick := time.NewTicker(time.Millisecond)
+		defer tick.Stop()
+		for {
+			if err := events.Drain(calls.Outbox(), j, calls.OnResult); err != nil {
+				select {
+				case drainErr <- err:
+				default:
+				}
+				return
+			}
+			select {
+			case <-stopDrain:
+				return
+			case <-tick.C:
+			}
+		}
+	}()
+	deadline = time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-drainErr:
+			t.Fatal(err)
+		default:
+		}
+		view, e := sessions.Get(conv.ID, 0, 100)
+		if e == nil && len(view.Messages) == 2 && root.Executions().PendingDeliveryCount() == 0 {
+			close(stopDrain)
+			page, queryErr := j.Query(observation.Filter{ConversationID: conv.ID, Limit: 100})
+			if queryErr != nil {
+				t.Fatal(queryErr)
+			}
+			emitted := map[string]int{}
+			rejected := 0
+			replyJournal := 0
+			for _, entry := range page.Entries {
+				switch {
+				case entry.Event.Category == "published" && strings.HasPrefix(entry.Event.Name, "emit-"):
+					emitted[entry.Event.Name]++
+				case entry.Event.Name == "event.rejected":
+					rejected++
+				case entry.Event.Name == "message" && entry.Event.Payload["message_id"] == c.ID(message.CallIDs[0], "reply"):
+					replyJournal++
+				}
+			}
+			if len(emitted) != 20 || rejected != 0 || replyJournal != 1 {
+				t.Fatalf("drained effects mismatch: emitted=%d rejected=%d reply journals=%d", len(emitted), rejected, replyJournal)
+			}
+			for name, n := range emitted {
+				if n != 1 {
+					t.Fatalf("published fact %s recorded %d times", name, n)
+				}
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(stopDrain)
+	view, _ = sessions.Get(conv.ID, 0, 100)
+	t.Fatalf("reserved emission/reply intents did not drain: messages=%d pending=%d", len(view.Messages), root.Executions().PendingDeliveryCount())
+}
+
+func countGeneralDeliveries(outbox c.Outbox) (int, error) {
+	deliveries, err := outbox.PendingDeliveries(10000)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, d := range deliveries {
+		if d.ReservationCallID == "" && d.Execution == nil {
+			n++
+		}
+	}
+	return n, nil
+}
+
 func TestDrainRejectsFanoutDuringShutdownBeforeTerminalReply(t *testing.T) {
-	cat, calls, j := fixture(t, &fakeConnector{})
-	events := event.New(memory.NewStore[c.Subscription](4), cat, calls, j)
+	cat, calls, j, root := fixture(t, &fakeConnector{})
+	events := event.New(root.Subscriptions(), cat, calls, j, root.Admissions())
 	sub := c.Subscription{ID: "drain-sub", Source: c.Ref{Namespace: "nodes", ID: "node"}, Event: "complete", Target: c.Ref{Namespace: "nodes", ID: "node"}, Operation: "run", Input: c.InputTemplate{Values: c.Data{}, Pointers: map[string]string{"text": "/summary"}}}
 	if _, err := events.Create(sub); err != nil {
 		t.Fatal(err)
@@ -93,7 +398,7 @@ func TestDrainRejectsFanoutDuringShutdownBeforeTerminalReply(t *testing.T) {
 	origin := &c.AdmissionOrigin{Root: sub.Source, Actor: sub.Source, Kind: c.OriginResult, ParentCallID: "origin"}
 	outbox := &orderedOutbox{deliveries: []c.Delivery{{ID: published.ID, Event: &published, Origin: origin}, {ID: "terminal-reply", Execution: &terminal}}}
 	var replied int
-	if err := events.Drain(outbox, j, func(c.Snapshot[c.Execution]) error { replied++; return nil }); err != nil {
+	if err := events.Drain(outbox, j, func(c.Delivery) error { replied++; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if replied != 1 || outbox.PendingDeliveryCount() != 0 || len(outbox.acked) != 2 || outbox.acked[0] != published.ID || outbox.acked[1] != "terminal-reply" {
@@ -110,7 +415,7 @@ func TestDrainRejectsFanoutDuringShutdownBeforeTerminalReply(t *testing.T) {
 
 func TestDrainRejectsPublishedDeliveryWithoutServerOrigin(t *testing.T) {
 	j := observation.New(10)
-	events := event.New(nil, nil, nil, j)
+	events := event.New(nil, nil, nil, j, nil)
 	published := c.Event{ID: "missing-origin", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "complete", Category: "published", OccurredAt: c.Now(), Payload: c.Data{}}
 	outbox := &orderedOutbox{deliveries: []c.Delivery{{ID: published.ID, Event: &published}}}
 	if err := events.Drain(outbox, j, nil); err != nil {
@@ -123,8 +428,8 @@ func TestDrainRejectsPublishedDeliveryWithoutServerOrigin(t *testing.T) {
 }
 
 func TestEventAtomicFanoutAndIdempotentSnapshot(t *testing.T) {
-	cat, calls, j := fixture(t, &fakeConnector{})
-	events := event.New(memory.NewStore[c.Subscription](10), cat, calls, j)
+	cat, calls, j, root := fixture(t, &fakeConnector{})
+	events := event.New(root.Subscriptions(), cat, calls, j, root.Admissions())
 	sub := c.Subscription{ID: "sub", Source: c.Ref{Namespace: "nodes", ID: "node"}, Event: "complete", Target: c.Ref{Namespace: "nodes", ID: "node"}, Operation: "run", Input: c.InputTemplate{Pointers: map[string]string{"text": "/summary"}}}
 	snap, err := events.Create(sub)
 	if err != nil {
@@ -191,8 +496,8 @@ func TestEventAtomicFanoutAndIdempotentSnapshot(t *testing.T) {
 }
 
 func TestConversationScopeRetryAndLateReply(t *testing.T) {
-	cat, calls, j := fixture(t, &fakeConnector{})
-	sessions := conversation.New(memory.NewStore[c.Conversation](8), cat, calls, j)
+	cat, calls, j, root := fixture(t, &fakeConnector{})
+	sessions := conversation.New(root.Conversations(), cat, calls, j, root.Admissions())
 	author := c.Ref{Namespace: "users", ID: "author"}
 	recipient := c.Ref{Namespace: "nodes", ID: "node"}
 	conv := c.Conversation{ID: "session", Title: "Review", Participants: []c.Participant{{Ref: author}, {Ref: recipient, Receiver: &c.Receiver{Target: recipient, Operation: "run", Input: c.InputTemplate{Pointers: map[string]string{"text": "/text"}}}}}}
@@ -239,15 +544,33 @@ func TestConversationScopeRetryAndLateReply(t *testing.T) {
 		t.Fatalf("conversation fanout provenance was not preserved: %+v", pending.Value.Origin)
 	}
 	pending.Value.Lifecycle.State = c.Unknown
-	sessions.Complete(pending)
+	if err = sessions.Complete(c.Delivery{ID: "unknown-terminal", Kind: c.DeliveryCompletion, Execution: &pending}); err == nil {
+		t.Fatal("nonterminal envelope was accepted")
+	}
 	view, _ := sessions.Get(conv.ID, 0, 100)
 	if len(view.Messages) != 1 {
 		t.Fatal("unknown result fabricated a reply")
 	}
-	pending.Value.Lifecycle.State = c.Succeeded
-	pending.Value.Result = &c.Result{CallID: pending.Value.Call.ID, State: c.Succeeded, Output: c.Data{"answer": "done"}}
-	sessions.Complete(pending)
-	sessions.Complete(pending)
+	pending, err = calls.Get(message.CallIDs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := c.Clone(pending)
+	final.Revision++
+	final.Value.Lifecycle.State = c.Succeeded
+	final.Value.Result = &c.Result{CallID: final.Value.Call.ID, State: c.Succeeded, Output: c.Data{"answer": "done"}}
+	change := c.Change[c.Execution]{ID: final.Value.Call.ID, Subject: final.Subject, BeforeRevision: pending.Revision, AfterRevision: final.Revision, Before: &pending.Value, After: final.Value}
+	terminal := c.Delivery{ID: c.ID(final.Value.Call.ID, "test-terminal"), Kind: c.DeliveryCompletion, Execution: &final}
+	_, err = root.Executions().Commit(c.ExecutionMutation{Subject: pending.Subject, ExpectedRevision: pending.Revision, Changes: []c.Change[c.Execution]{change}, Deliveries: []c.Delivery{terminal}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = sessions.Complete(terminal); err != nil {
+		t.Fatal(err)
+	}
+	if err = sessions.Complete(terminal); err != nil {
+		t.Fatal(err)
+	}
 	view, err = sessions.Get(conv.ID, 0, 100)
 	if err != nil || len(view.Messages) != 2 {
 		t.Fatalf("late reply missing/duplicated %+v %v", view, err)

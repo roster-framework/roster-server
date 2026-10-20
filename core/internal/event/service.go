@@ -17,18 +17,18 @@ type receipt struct {
 	ids    []string
 }
 type Service struct {
-	mu       sync.Mutex
-	store    c.Store[c.Subscription]
-	catalog  *catalog.Service
-	caller   c.Caller
-	journal  c.Journal
-	receipts map[string]receipt
+	mu      sync.Mutex
+	store   c.Store[c.Subscription]
+	catalog *catalog.Service
+	caller  c.Caller
+	journal c.Journal
+	state   c.AdmissionState
 }
 
 var _ c.Publisher = (*Service)(nil)
 
-func New(store c.Store[c.Subscription], cat *catalog.Service, caller c.Caller, j c.Journal) *Service {
-	return &Service{store: store, catalog: cat, caller: caller, journal: j, receipts: map[string]receipt{}}
+func New(store c.Store[c.Subscription], cat *catalog.Service, caller c.Caller, j c.Journal, state c.AdmissionState) *Service {
+	return &Service{store: store, catalog: cat, caller: caller, journal: j, state: state}
 }
 func (s *Service) Create(sub c.Subscription) (c.Snapshot[c.Subscription], error) {
 	s.mu.Lock()
@@ -122,21 +122,32 @@ func (s *Service) Publish(e c.Event, origin c.AdmissionOrigin) ([]string, error)
 		return nil, c.Err("invalid_input", "Invalid event provenance")
 	}
 	digest := c.ID(string(b), string(originBytes))
-	if old, ok := s.receipts[e.ID]; ok {
-		if old.digest != digest {
+	if s.state == nil {
+		return nil, c.Err("internal", "Admission state is unavailable")
+	}
+	if old, ok, readErr := s.state.ReadPublished(e.ID); readErr != nil {
+		return nil, readErr
+	} else if ok {
+		if old.Digest != digest {
 			return nil, c.Err("conflict", "Event ID reused with different content")
 		}
-		return c.Clone(old.ids), nil
-	}
-	if len(s.receipts) >= 1000 {
-		return nil, c.Err("busy", "Event record capacity exhausted")
+		return c.Clone(old.CallIDs), nil
 	}
 	if err = s.catalog.ValidateEvent(e); err != nil {
 		return nil, err
 	}
 	calls := []c.Call{}
 	ids := []string{}
-	for _, snap := range s.listLocked() {
+	subscriptions, setRevision, err := s.state.ReadSubscriptions()
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(subscriptions, func(i, j int) bool { return subscriptions[i].Value.ID < subscriptions[j].Value.ID })
+	subscriptionRevisions := []c.RevisionRef{}
+	for _, snap := range subscriptions {
+		if snap.Value.Removed {
+			continue
+		}
 		sub := snap.Value
 		if sub.Source != e.Source || sub.Event != e.Name {
 			continue
@@ -147,22 +158,38 @@ func (s *Service) Publish(e c.Event, origin c.AdmissionOrigin) ([]string, error)
 		}
 		id := c.ID(e.ID, sub.ID)
 		ids = append(ids, id)
+		subscriptionRevisions = append(subscriptionRevisions, c.RevisionRef{Subject: snap.Subject, Revision: snap.Revision})
 		calls = append(calls, c.Call{ID: id, Target: sub.Target, Operation: sub.Operation, Input: mapped, CorrelationID: e.CorrelationID, CausationID: e.ID, ConversationID: e.ConversationID})
 	}
 	subscriptionOrigin := origin
 	subscriptionOrigin.Kind = c.OriginSubscription
 	subscriptionOrigin.ParentCallID = ""
 	subscriptionOrigin.ParentEventID = e.ID
-	if _, err = s.caller.SubmitBatch(subscriptionOrigin, calls); err != nil {
+	journalEvent := c.Clone(e)
+	reservationCallID := ""
+	if origin.Kind == c.OriginResult && origin.ParentCallID != "" && origin.ParentCallID == e.CallID {
+		reservationCallID = origin.ParentCallID
+	}
+	effect := c.AdmissionEffect{Published: &c.PublishedAdmission{Event: e, Digest: digest, Origin: origin, SubscriptionSetRevision: setRevision, SubscriptionRevisions: subscriptionRevisions, CallIDs: ids}, Deliveries: []c.Delivery{{ID: c.ID(e.ID, "journal"), Kind: c.DeliveryJournal, ReservationCallID: reservationCallID, Event: &journalEvent}}}
+	if _, err = s.caller.SubmitBatch(subscriptionOrigin, calls, effect); err != nil {
+		// A concurrent identical admission can win after our pre-read. Re-read once; never resubmit.
+		old, ok, readErr := s.state.ReadPublished(e.ID)
+		if readErr != nil {
+			return nil, readErr
+		}
+		if ok {
+			if old.Digest != digest {
+				return nil, c.Err("conflict", "Event ID reused with different content")
+			}
+			return c.Clone(old.CallIDs), nil
+		}
 		return nil, err
 	}
-	s.receipts[e.ID] = receipt{digest, ids}
-	s.journal.Append(e)
 	return c.Clone(ids), nil
 }
 
 // Drain delivers the shared execution outbox in FIFO order, releasing journal pins only after ACK.
-func (s *Service) Drain(outbox c.Outbox, recorder c.EventRecorder, complete func(c.Snapshot[c.Execution]) error) error {
+func (s *Service) Drain(outbox c.Outbox, recorder c.EventRecorder, complete func(c.Delivery) error) error {
 	for {
 		batch, err := outbox.PendingDeliveries(64)
 		if err != nil {
@@ -173,13 +200,29 @@ func (s *Service) Drain(outbox c.Outbox, recorder c.EventRecorder, complete func
 		}
 		for _, d := range batch {
 			var releaseID string
-			switch {
-			case d.Event != nil && d.Event.Category == "observation":
-				if err = observation.Project(recorder, *d.Event); err != nil {
+			kind := d.Kind
+			if kind == "" {
+				if d.Execution != nil {
+					kind = c.DeliveryCompletion
+				} else if d.Event != nil && d.Event.Category == "published" {
+					kind = c.DeliveryPublish
+				} else if d.Event != nil {
+					kind = c.DeliveryJournal
+				}
+			}
+			switch kind {
+			case c.DeliveryJournal:
+				if d.Event == nil {
+					return c.Err("invalid_input", "Journal delivery has no event")
+				}
+				if err = recorder.Record(*d.Event); err != nil {
 					return err
 				}
 				releaseID = d.Event.ID
-			case d.Event != nil && d.Event.Category == "published":
+			case c.DeliveryPublish:
+				if d.Event == nil || d.Event.Category != "published" {
+					return c.Err("invalid_input", "Publish delivery has invalid payload")
+				}
 				if d.Origin == nil {
 					err = c.Err("forbidden", "Admission provenance is missing")
 				} else {
@@ -200,11 +243,14 @@ func (s *Service) Drain(outbox c.Outbox, recorder c.EventRecorder, complete func
 					releaseID = rejected.ID
 					err = nil
 				}
-			case d.Execution != nil:
+			case c.DeliveryCompletion:
+				if d.Execution == nil {
+					return c.Err("invalid_input", "Completion delivery has no execution")
+				}
 				if complete == nil {
 					return c.Err("internal", "Terminal delivery sink is not configured")
 				}
-				if err = safeComplete(complete, *d.Execution); err != nil {
+				if err = safeComplete(complete, d); err != nil {
 					return err
 				}
 			default:
@@ -220,7 +266,7 @@ func (s *Service) Drain(outbox c.Outbox, recorder c.EventRecorder, complete func
 	}
 }
 
-func safeComplete(fn func(c.Snapshot[c.Execution]) error, s c.Snapshot[c.Execution]) (err error) {
+func safeComplete(fn func(c.Delivery) error, s c.Delivery) (err error) {
 	defer func() {
 		if recover() != nil {
 			err = c.Err("internal", "Terminal delivery callback panicked")
