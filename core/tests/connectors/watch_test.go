@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,7 +36,7 @@ func TestResourceWatchOptInAndAckOrder(t *testing.T) {
 				t.Error("page limit missing")
 			}
 			consumer = r.URL.Query().Get("consumer")
-			fmt.Fprint(w, `[{"id":"change-1","resource_id":"other","collection":"docs","version":1,"type":"resource.created","at":"2026-10-12T00:00:00Z"},{"id":"change-2","resource_id":"target","collection":"docs","version":2,"type":"resource.updated","at":"2026-10-12T00:00:01Z"}]`)
+			fmt.Fprint(w, `[{"id":"change-1","resource_id":"other","collection":"docs","version":1.0,"type":"resource.created","at":"2026-10-12T00:00:00Z"},{"id":"change-2","resource_id":"target","collection":"docs","version":2e0,"type":"resource.updated","at":"2026-10-12T00:00:01Z"}]`)
 		case "/v1/changes/change-1/ack", "/v1/changes/change-2/ack":
 			var body struct {
 				Consumer string `json:"consumer"`
@@ -62,7 +63,7 @@ func TestResourceWatchOptInAndAckOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := connector.Watch(ctx, watchBinding(server.URL), func(event c.SourceEvent) error {
-		if event.ID != "change-2" || event.Name != "resource.updated" || event.At.IsZero() || event.Payload["resource_id"] != "target" || event.Payload["version"] != float64(2) {
+		if event.ID != "change-2" || event.Name != "resource.updated" || event.At.IsZero() || event.Payload["resource_id"] != "target" || event.Payload["version"] != json.Number("2e0") {
 			t.Errorf("bad event %+v", event)
 		}
 		mu.Lock()
@@ -80,6 +81,29 @@ func TestResourceWatchOptInAndAckOrder(t *testing.T) {
 	defer mu.Unlock()
 	if len(order) != 3 || order[0] != "ack:/v1/changes/change-1/ack" || order[1] != "sink" || order[2] != "ack:/v1/changes/change-2/ack" {
 		t.Fatalf("ACK before acceptance: %v", order)
+	}
+}
+
+func TestResourceWatchRejectsVersionOverflowAndFraction(t *testing.T) {
+	for _, version := range []string{"9223372036854775808", "1.5", "0.9"} {
+		t.Run(version, func(t *testing.T) {
+			var acknowledgements atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/changes" {
+					fmt.Fprintf(w, `[{"id":"change-1","resource_id":"target","collection":"docs","version":%s,"type":"resource.created","at":"2026-10-12T00:00:00Z"}]`, version)
+					return
+				}
+				acknowledgements.Add(1)
+				fmt.Fprint(w, `{"acknowledged":true}`)
+			}))
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+			defer cancel()
+			err := resource.New(server.Client(), func(string) string { return "token" }).Watch(ctx, watchBinding(server.URL), func(c.SourceEvent) error { return nil })
+			if err == nil || c.AsFault(err).Code != "wire" || acknowledgements.Load() != 0 {
+				t.Fatalf("invalid resource version %s accepted: err=%v acknowledgements=%d", version, err, acknowledgements.Load())
+			}
+		})
 	}
 }
 func TestResourceWatchSinkFailureDoesNotAck(t *testing.T) {

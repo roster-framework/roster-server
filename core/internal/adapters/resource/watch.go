@@ -2,8 +2,10 @@ package resource
 
 import (
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	h "github.com/roster-framework/roster-server/core/internal/adapters/httpclient"
@@ -38,9 +40,10 @@ func (r *Connector) Watch(ctx c.Context, raw json.RawMessage, sink func(c.Source
 				name, _ := event["type"].(string)
 				at, _ := event["at"].(string)
 				occurred, parseErr := time.Parse(time.RFC3339Nano, at)
-				version, versionOK := event["version"].(float64)
+				version, versionOK := event["version"].(json.Number)
+				versionValue, versionErr := positiveInt64JSON(version)
 				collection, collectionOK := event["collection"].(string)
-				if !c.ValidID(id) || !c.ValidID(target) || (name != "resource.created" && name != "resource.updated") || parseErr != nil || !versionOK || version < 1 || version != float64(int64(version)) || !collectionOK {
+				if !c.ValidID(id) || !c.ValidID(target) || (name != "resource.created" && name != "resource.updated") || parseErr != nil || !versionOK || versionErr != nil || versionValue < 1 || !collectionOK {
 					return c.Err("wire", "Invalid resource change feed")
 				}
 				if target == b.TargetID {
@@ -63,6 +66,14 @@ func (r *Connector) Watch(ctx c.Context, raw json.RawMessage, sink func(c.Source
 		case <-timer.C:
 		}
 	}
+}
+
+func positiveInt64JSON(number json.Number) (int64, error) {
+	value, ok := new(big.Rat).SetString(number.String())
+	if !ok || value.Sign() <= 0 || !value.IsInt() || !value.Num().IsInt64() {
+		return 0, strconv.ErrRange
+	}
+	return value.Num().Int64(), nil
 }
 
 func (r *Connector) changes(ctx c.Context, b h.Binding, consumer string) ([]map[string]any, error) {

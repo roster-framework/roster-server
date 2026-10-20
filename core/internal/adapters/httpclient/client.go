@@ -46,6 +46,9 @@ var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 func Parse(raw json.RawMessage) (Binding, error) {
 	var b Binding
+	if len(raw) > MaxBody || c.CheckJSONNumbers(raw) != nil {
+		return b, c.Err("binding", "Invalid private HTTP binding")
+	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if dec.Decode(&b) != nil {
@@ -90,7 +93,7 @@ func (h *Client) Do(ctx context.Context, b Binding, method, path string, body an
 	var reader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
-		if err != nil || len(data) > MaxBody {
+		if err != nil || len(data) > MaxBody || c.CheckJSONNumbers(data) != nil {
 			return nil, c.Err("request_prepare", "Unable to serialize the remote request")
 		}
 		reader = bytes.NewReader(data)
@@ -134,11 +137,24 @@ func PreSendFailure(call c.Call, err error) (c.Result, bool) {
 }
 func Decode(reader io.Reader, out any) error {
 	raw, err := io.ReadAll(io.LimitReader(reader, MaxBody+1))
-	if err != nil || len(raw) > MaxBody || !json.Valid(raw) {
+	if err != nil || len(raw) > MaxBody || !json.Valid(raw) || c.CheckJSONNumbers(raw) != nil {
 		return c.Err("wire", "Invalid or oversized remote JSON")
 	}
-	if json.Unmarshal(raw, out) != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if dec.Decode(out) != nil || requireEOF(dec) != nil {
 		return c.Err("wire", "Unexpected remote JSON")
+	}
+	return nil
+}
+
+func requireEOF(dec *json.Decoder) error {
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return c.Err("wire", "Trailing remote JSON")
+		}
+		return err
 	}
 	return nil
 }

@@ -95,11 +95,10 @@ func (r *Connector) Invoke(ctx c.Context, raw json.RawMessage, call c.Call, _ c.
 			}
 			data, _ := json.Marshal(v)
 			var number json.Number
-			if json.Unmarshal(data, &number) != nil {
+			if c.CheckJSONNumbers(data) != nil || json.Unmarshal(data, &number) != nil {
 				return h.Failure(call, c.Rejected, "input")
 			}
-			n, err := number.Int64()
-			if err != nil || n < 1 {
+			if _, err := positiveInt64JSON(number); err != nil {
 				return h.Failure(call, c.Rejected, "input")
 			}
 		default:

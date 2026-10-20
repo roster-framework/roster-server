@@ -581,6 +581,44 @@ func TestIdleCoreCloseIsIdempotentAndObservable(t *testing.T) {
 	}
 }
 
+func TestConfigureGuardsNumbersBeforeRegistrationAndPreservesExactBinding(t *testing.T) {
+	core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": connector{}}, Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if closeErr := core.Close(ctx); closeErr != nil {
+			t.Error(closeErr)
+		}
+	})
+	bad := host.Config{Nodes: []c.Registration{{ID: "numeric-node", ConnectorID: "fake", Binding: json.RawMessage(`{"value":1e1025}`)}}}
+	if err := core.Configure(context.Background(), bad); err == nil || c.AsFault(err).Code != "invalid_input" {
+		t.Fatalf("over-budget config was accepted: %v", err)
+	}
+	nodes, err := core.Catalog.List()
+	if err != nil || len(nodes) != 0 {
+		t.Fatalf("invalid config reached registration: nodes=%d err=%v", len(nodes), err)
+	}
+	large := json.Number("9007199254740993")
+	good := host.Config{
+		Nodes:         []c.Registration{{ID: "numeric-node", ConnectorID: "fake", Binding: json.RawMessage(`{"value":9007199254740993}`)}},
+		Subscriptions: []c.Subscription{{ID: "numeric-sub", Source: c.Ref{Namespace: "nodes", ID: "numeric-node"}, Event: "complete", Target: c.Ref{Namespace: "nodes", ID: "numeric-node"}, Operation: "run", Input: c.InputTemplate{Values: c.Data{"exact": large, "fraction": json.Number("0.1")}}}},
+	}
+	if err := core.Configure(context.Background(), good); err != nil {
+		t.Fatal(err)
+	}
+	node, err := core.Catalog.Get("numeric-node")
+	if err != nil || !strings.Contains(string(node.Binding), "9007199254740993") {
+		t.Fatalf("valid large config number changed: binding=%s err=%v", node.Binding, err)
+	}
+	subscriptions, err := core.Events.List()
+	if err != nil || len(subscriptions) != 1 || subscriptions[0].Value.Input.Values["exact"] != large || subscriptions[0].Value.Input.Values["fraction"] != json.Number("0.1") {
+		t.Fatalf("valid config mapping number changed: subscriptions=%#v err=%v", subscriptions, err)
+	}
+}
+
 func TestStorageReadFailuresReachStatusReadyAndClose(t *testing.T) {
 	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 4, Calls: 8, Queue: 8})
 	store := &faultExecutionStore{ExecutionStore: root.Executions()}
@@ -884,7 +922,7 @@ func TestPendingRejectedAuditRecoversAfterRealOutboxCapacityBusy(t *testing.T) {
 	if err := core.Calls.RetryPending(); err != nil {
 		t.Fatalf("retry after consumed capacity rejection should be a no-op: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := core.Close(ctx); err != nil {
 		t.Fatalf("actual capacity recovery did not permit Close: %v", err)

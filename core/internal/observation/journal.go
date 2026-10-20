@@ -233,7 +233,7 @@ func planRecord(view RecordView, event c.Event, owner string, pin bool, capacity
 		original.OccurredAt = time.Time{}
 	}
 	originalBytes, err := json.Marshal(original)
-	if err != nil {
+	if err != nil || c.CheckJSONNumbers(originalBytes) != nil {
 		return JournalMutation{}, false, c.Err("invalid_input", "Event cannot be stored")
 	}
 	originalDigest := digestBytes(originalBytes)

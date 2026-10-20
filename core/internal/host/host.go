@@ -3,6 +3,7 @@ package host
 
 import (
 	"context"
+	"encoding/json"
 	"github.com/roster-framework/roster-server/core/internal/adapters/memory"
 	resourceadapter "github.com/roster-framework/roster-server/core/internal/adapters/resource"
 	runtimeadapter "github.com/roster-framework/roster-server/core/internal/adapters/runtime"
@@ -96,7 +97,8 @@ func New(ctx context.Context, opts Options) (*Core, error) {
 		cancel()
 		return nil, err
 	}
-	cat := catalog.New(storage.Nodes, connectors, schema.New())
+	validator := schema.New()
+	cat := catalog.New(storage.Nodes, connectors, validator)
 	auth := opts.Authority
 	if auth == nil {
 		auth = authority.Empty()
@@ -105,7 +107,7 @@ func New(ctx context.Context, opts Options) (*Core, error) {
 	events := event.New(storage.Subscriptions, cat, calls, storage.Admissions)
 	conv := conversation.New(storage.Conversations, cat, calls, storage.Admissions)
 	instanceID := c.ID(strconv.FormatInt(time.Now().UnixNano(), 10), "core")
-	core := &Core{Catalog: cat, Calls: calls, Events: events, Conversations: conv, Journal: j, Commands: command.New(), cancel: cancel, cancelSources: cancel, sourceContext: sourceContext, instanceID: instanceID, hostDone: make(chan struct{}), parentWatchDone: make(chan struct{})}
+	core := &Core{Catalog: cat, Calls: calls, Events: events, Conversations: conv, Journal: j, Commands: command.New(validator), cancel: cancel, cancelSources: cancel, sourceContext: sourceContext, instanceID: instanceID, hostDone: make(chan struct{}), parentWatchDone: make(chan struct{})}
 	core.lifecycle = c.Snapshot[c.Lifecycle]{Subject: c.Ref{Namespace: "cores", ID: instanceID}, Revision: 1, Value: c.Lifecycle{State: c.Created, Reason: "host_created", UpdatedAt: c.Now()}}
 	core.ingressZero = make(chan struct{})
 	close(core.ingressZero)
@@ -302,6 +304,10 @@ type Config struct {
 }
 
 func (s *Core) Configure(ctx context.Context, config Config) error {
+	encoded, err := json.Marshal(config)
+	if err != nil || c.CheckJSONNumbers(encoded) != nil {
+		return c.Err("invalid_input", "Configuration contains invalid JSON numbers")
+	}
 	release, enterErr := s.admitCommand("host.configure")
 	if enterErr != nil {
 		return enterErr
