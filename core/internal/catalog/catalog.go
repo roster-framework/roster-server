@@ -4,7 +4,6 @@ import (
 	"context"
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
 	"github.com/roster-framework/roster-server/core/internal/lifecycle"
-
 	"sort"
 )
 
@@ -12,12 +11,11 @@ type Service struct {
 	store        c.Store[c.Node]
 	connectors   map[string]c.Connector
 	validator    c.Validator
-	journal      c.Journal
 	OnRegistered func(c.Node)
 }
 
-func New(store c.Store[c.Node], connectors map[string]c.Connector, v c.Validator, j c.Journal) *Service {
-	return &Service{store: store, connectors: connectors, validator: v, journal: j}
+func New(store c.Store[c.Node], connectors map[string]c.Connector, v c.Validator) *Service {
+	return &Service{store: store, connectors: connectors, validator: v}
 }
 func (s *Service) Register(ctx context.Context, r c.Registration) (c.Node, error) {
 	if !c.ValidID(r.ID) {
@@ -49,7 +47,7 @@ func (s *Service) Register(ctx context.Context, r c.Registration) (c.Node, error
 	}
 	n := c.Node{ID: r.ID, ConnectorID: r.ConnectorID, Binding: c.Clone(r.Binding), Descriptor: d}
 	ch := lifecycle.Create(c.Ref{Namespace: "nodes", ID: r.ID}, n, "registered")
-	if _, err = lifecycle.Commit(s.store, ch, s.journal); err != nil {
+	if _, err = lifecycle.Commit(s.store, ch); err != nil {
 		return c.Node{}, err
 	}
 

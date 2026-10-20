@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"sort"
 	"sync"
 
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
+	"github.com/roster-framework/roster-server/core/internal/observation"
 )
 
 const (
@@ -427,9 +429,91 @@ func (s *Executions) PendingDeliveries(limit int) ([]c.Delivery, error) {
 	}
 	return out, nil
 }
-func (s *Executions) AckDelivery(id string) error {
+func (s *Executions) AckDelivery(id string, releaseEventIDs ...string) error {
+	if s.root == nil {
+		if len(releaseEventIDs) != 0 {
+			return c.Err("invalid_input", "Journal releases require a shared Root")
+		}
+		s.outboxMu.Lock()
+		defer s.outboxMu.Unlock()
+		return s.ackLocked(id)
+	}
+	root := s.root
+	root.mu.Lock()
+	defer root.mu.Unlock()
 	s.outboxMu.Lock()
 	defer s.outboxMu.Unlock()
+	r, ok := s.receipts[id]
+	terminal := false
+	if !ok {
+		r, ok = s.terminalReceipts[id]
+		terminal = ok
+	}
+	if !ok {
+		return c.Err("not_found", "Delivery receipt not found")
+	}
+	if r.acked {
+		return nil
+	}
+	pendingIndex := -1
+	for i, d := range s.pending {
+		if d.ID == id {
+			pendingIndex = i
+			break
+		}
+	}
+	if pendingIndex < 0 {
+		return c.Err("conflict", "Pending delivery is missing")
+	}
+	seen := map[string]bool{}
+	for _, eventID := range releaseEventIDs {
+		if eventID == "" || seen[eventID] {
+			return c.Err("invalid_input", "Journal release IDs must be unique and non-empty")
+		}
+		seen[eventID] = true
+		if _, exists := root.journal.ownerIndex[id][eventID]; !exists {
+			return c.Err("conflict", "Journal release does not belong to this delivery")
+		}
+	}
+	journalMutation := observation.JournalMutation{ExpectedRevision: root.journal.revision, Identity: root.journal.identity, Sequence: root.journal.sequence}
+	ownerEvents := make([]string, 0, len(root.journal.ownerIndex[id]))
+	for eventID := range root.journal.ownerIndex[id] {
+		ownerEvents = append(ownerEvents, eventID)
+	}
+	sort.Strings(ownerEvents)
+	for _, eventID := range ownerEvents {
+		view := journalRecordViewLocked(root, eventID)
+		mutation, err := observation.PlanRelease(eventID, id, view)
+		if err != nil {
+			return err
+		}
+		if mutation.ExpectedRevision != 0 {
+			journalMutation.PutReceipts = append(journalMutation.PutReceipts, mutation.PutReceipts...)
+			journalMutation.DeleteReceiptIDs = append(journalMutation.DeleteReceiptIDs, mutation.DeleteReceiptIDs...)
+		}
+	}
+	if len(journalMutation.PutReceipts) > 0 || len(journalMutation.DeleteReceiptIDs) > 0 {
+		if err := validateJournalMutationLocked(root, journalMutation); err != nil {
+			return err
+		}
+	}
+	r.acked = true
+	if terminal {
+		s.terminalReceipts[id] = r
+	} else {
+		s.receipts[id] = r
+	}
+	s.pending = append(s.pending[:pendingIndex], s.pending[pendingIndex+1:]...)
+	if !terminal {
+		s.ackOrder = append(s.ackOrder, id)
+	}
+	if len(journalMutation.PutReceipts) > 0 || len(journalMutation.DeleteReceiptIDs) > 0 {
+		applyJournalMutationLocked(root, journalMutation)
+	}
+	return nil
+}
+
+func (s *Executions) ackLocked(id string) error {
 	r, ok := s.receipts[id]
 	terminal := false
 	if !ok {

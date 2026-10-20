@@ -503,15 +503,15 @@ func fixture(t *testing.T, f *fakeConnector) (*catalog.Service, *invocation.Serv
 	if f.descriptor.Operations == nil {
 		f.descriptor = c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}`), OutputSchema: json.RawMessage(`{"type":"object"}`), Capabilities: c.Capabilities{Abort: true, Inspect: true}}}, Events: map[string]c.Schema{"complete": json.RawMessage(`{"type":"object"}`)}}
 	}
-	j := observation.New(1000)
 	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 32, Conversations: 16, Calls: 32, Queue: 32})
-	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New(), j)
+	j := newJournal(t, root, 1000)
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{"secret":"private"}`)}); err != nil {
 		t.Fatal(err)
 	}
 	auth := fixtureAuthority(t)
 	calls := invocation.New(root.Executions(), cat, j, auth)
-	drainer := event.New(root.Subscriptions(), cat, calls, j, root.Admissions())
+	drainer := event.New(root.Subscriptions(), cat, calls, root.Admissions())
 	drainCtx, stopDrain := context.WithCancel(context.Background())
 	wake := make(chan struct{}, 1)
 	calls.OnCommit = func() {
@@ -541,6 +541,439 @@ func fixture(t *testing.T, f *fakeConnector) (*catalog.Service, *invocation.Serv
 	t.Cleanup(stopDrain)
 	return cat, calls, j, root
 }
+func newJournal(t *testing.T, root *memory.Root, capacity int) *observation.Journal {
+	t.Helper()
+	journal, err := observation.NewWithStore(root.Journal(), capacity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return journal
+}
+
+type journalProbeStore struct {
+	inner      observation.Store
+	loads      int
+	readRecord int
+	pageLimits []int
+}
+
+func (s *journalProbeStore) Load() (observation.StoredState, error) {
+	s.loads++
+	return s.inner.Load()
+}
+func (s *journalProbeStore) ReadRecord(id string) (observation.RecordView, error) {
+	s.readRecord++
+	return s.inner.ReadRecord(id)
+}
+func (s *journalProbeStore) ReadPage(revision, after uint64, limit int) (observation.EntryPage, error) {
+	s.pageLimits = append(s.pageLimits, limit)
+	return s.inner.ReadPage(revision, after, limit)
+}
+func (s *journalProbeStore) Commit(mutation observation.JournalMutation) error {
+	return s.inner.Commit(mutation)
+}
+
+func TestJournalRuntimeReadsStayBoundedAndDoNotReload(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Calls: 2, Queue: 2})
+	probe := &journalProbeStore{inner: root.Journal()}
+	journal, err := observation.NewWithStore(probe, 600)
+	if err != nil || probe.loads != 1 {
+		t.Fatalf("Journal startup did not load exactly once: loads=%d err=%v", probe.loads, err)
+	}
+	for i := 0; i < 501; i++ {
+		event := c.Event{ID: c.ID("page", fmt.Sprint(i)), Name: "page", Category: "observation", Payload: c.Data{}}
+		if err = journal.Append(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err := journal.Query(observation.Filter{Limit: 500})
+	if err != nil || len(page.Entries) != 500 || page.NextCursor == "" {
+		t.Fatalf("bounded first page failed: entries=%d cursor=%q err=%v", len(page.Entries), page.NextCursor, err)
+	}
+	if _, err = journal.Query(observation.Filter{Limit: 500, After: page.NextCursor}); err != nil {
+		t.Fatal(err)
+	}
+	if probe.loads != 1 || probe.readRecord == 0 || len(probe.pageLimits) < 2 {
+		t.Fatalf("runtime access reloaded or skipped bounded pages: loads=%d recordReads=%d pages=%v", probe.loads, probe.readRecord, probe.pageLimits)
+	}
+	for _, limit := range probe.pageLimits {
+		if limit < 1 || limit > 500 {
+			t.Fatalf("runtime page exceeded the Store bound: %v", probe.pageLimits)
+		}
+	}
+}
+
+func TestJournalPinOwnershipAndAppendSemantics(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Calls: 4, Queue: 4})
+	journal := newJournal(t, root, 2)
+	direct := c.Event{ID: "direct-record", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "direct", Category: "observation", Payload: c.Data{}}
+	if err := journal.Record(direct, ""); err != nil {
+		t.Fatal(err)
+	}
+	state, err := root.Journal().Load()
+	if err != nil || len(state.Receipts) != 1 || !state.Receipts[0].Pinned {
+		t.Fatalf("direct Record did not pin: %+v %v", state.Receipts, err)
+	}
+	if err := journal.Release(direct.ID); err != nil {
+		t.Fatal(err)
+	}
+	state, err = root.Journal().Load()
+	if err != nil || state.Receipts[0].Pinned {
+		t.Fatalf("direct Release did not clear its pin: %+v %v", state.Receipts, err)
+	}
+
+	appended := c.Event{ID: "explicit-append-id", Source: direct.Source, Name: "append", Category: "observation", Payload: c.Data{}}
+	if err = journal.Append(appended); err != nil {
+		t.Fatal(err)
+	}
+	state, err = root.Journal().Load()
+	appendedPinned := true
+	for _, receipt := range state.Receipts {
+		if receipt.ID == appended.ID {
+			appendedPinned = receipt.Pinned
+		}
+	}
+	if err != nil || state.Entries[len(state.Entries)-1].Event.ID != appended.ID || appendedPinned {
+		t.Fatalf("Append did not preserve its ID and remain unpinned: %+v %v", state, err)
+	}
+	appendRevision, appendSequence := state.Revision, state.Sequence
+	if err = journal.Append(appended); err != nil {
+		t.Fatal(err)
+	}
+	state, err = root.Journal().Load()
+	if err != nil || state.Revision != appendRevision || state.Sequence != appendSequence {
+		t.Fatalf("same-content unpinned Append replay changed Journal state: revision=%d/%d sequence=%d/%d err=%v", state.Revision, appendRevision, state.Sequence, appendSequence, err)
+	}
+
+	pinnedAppendReplay := c.Event{ID: "pinned-append-replay", Source: direct.Source, Name: "pinned", Category: "observation", Payload: c.Data{}}
+	if err = journal.Record(pinnedAppendReplay, ""); err != nil {
+		t.Fatal(err)
+	}
+	state, err = root.Journal().Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedAppendSequence := state.Sequence
+	if err = journal.Append(pinnedAppendReplay); err != nil {
+		t.Fatal(err)
+	}
+	state, err = root.Journal().Load()
+	pinnedAppendReceiptFound := false
+	for _, receipt := range state.Receipts {
+		if receipt.ID == pinnedAppendReplay.ID {
+			pinnedAppendReceiptFound = true
+			if receipt.Pinned {
+				t.Fatal("same-content Append replay did not release the direct-owner pin")
+			}
+		}
+	}
+	if err != nil || !pinnedAppendReceiptFound || state.Sequence != pinnedAppendSequence {
+		t.Fatalf("pinned Append replay did not unpin in place: state=%+v err=%v", state, err)
+	}
+
+	owned := c.Event{ID: "owned-record", Source: direct.Source, Name: "owned", Category: "observation", Payload: c.Data{}}
+	delivery := c.Delivery{ID: "owned-delivery", Kind: c.DeliveryJournal, Event: &owned}
+	if err = root.Executions().CommitBatch(nil, delivery); err != nil {
+		t.Fatal(err)
+	}
+	if err = journal.Record(owned, delivery.ID); err != nil {
+		t.Fatal(err)
+	}
+	state, err = root.Journal().Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned := false
+	for _, receipt := range state.Receipts {
+		if receipt.ID == owned.ID {
+			pinned = receipt.Pinned
+		}
+	}
+	if !pinned {
+		t.Fatal("owned Record did not pin")
+	}
+	if err = root.Executions().AckDelivery(delivery.ID, owned.ID); err != nil {
+		t.Fatal(err)
+	}
+	state, err = root.Journal().Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, receipt := range state.Receipts {
+		if receipt.ID == owned.ID && receipt.Pinned {
+			t.Fatal("owned ACK retained its projection pin")
+		}
+	}
+	oldPinned := c.Event{ID: "old-pinned-direct", Source: direct.Source, Name: "old", Category: "observation", Payload: c.Data{}}
+	if err = journal.Record(oldPinned, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"evict-a", "evict-b"} {
+		if err = journal.Append(c.Event{ID: id, Name: "evict", Category: "observation", Payload: c.Data{}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = journal.Release(oldPinned.ID); err != nil {
+		t.Fatal(err)
+	}
+	state, err = root.Journal().Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, receipt := range state.Receipts {
+		if receipt.ID == oldPinned.ID {
+			t.Fatal("Release retained a pinned receipt outside the ring window")
+		}
+	}
+
+	for _, tc := range []struct {
+		name          string
+		storedOwner   string
+		replayOwner   string
+		changeContent bool
+	}{
+		{name: "direct_to_owned", storedOwner: "", replayOwner: "owner-a"},
+		{name: "owned_to_direct", storedOwner: "owner-a", replayOwner: ""},
+		{name: "owned_to_different_owner", storedOwner: "owner-a", replayOwner: "owner-b"},
+		{name: "same_owner_different_content", storedOwner: "owner-a", replayOwner: "owner-a", changeContent: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			caseRoot := memory.NewRoot(memory.Limits{Calls: 4, Queue: 8})
+			caseJournal := newJournal(t, caseRoot, 8)
+			event := c.Event{ID: c.ID("owner-guard", tc.name), Source: direct.Source, Name: "owner-guard", Category: "observation", Payload: c.Data{"value": "same"}}
+			if tc.storedOwner != "" {
+				storedDelivery := c.Delivery{ID: tc.storedOwner, Kind: c.DeliveryJournal, Event: &event}
+				if err := caseRoot.Executions().CommitBatch(nil, storedDelivery); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := caseJournal.Record(event, tc.storedOwner); err != nil {
+				t.Fatal(err)
+			}
+			if tc.replayOwner != "" && tc.replayOwner != tc.storedOwner {
+				replayDelivery := c.Delivery{ID: tc.replayOwner, Kind: c.DeliveryJournal, Event: &event}
+				if err := caseRoot.Executions().CommitBatch(nil, replayDelivery); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := caseRoot.Journal().ReadRecord(event.ID)
+			if err != nil || before.Receipt == nil {
+				t.Fatalf("stored receipt unavailable: %+v %v", before, err)
+			}
+			replay := c.Clone(event)
+			if tc.changeContent {
+				replay.Payload["value"] = "changed"
+			}
+			if err = caseJournal.Record(replay, tc.replayOwner); err == nil || c.AsFault(err).Code != "conflict" {
+				t.Fatalf("owner/content change was not rejected: %v", err)
+			}
+			after, readErr := caseRoot.Journal().ReadRecord(event.ID)
+			if readErr != nil || after.Head != before.Head || after.Receipt == nil || *after.Receipt != *before.Receipt || after.Retained != before.Retained {
+				t.Fatalf("rejected replay changed receipt, pin, sequence, or revision: before=%+v after=%+v err=%v", before, after, readErr)
+			}
+		})
+	}
+}
+
+func TestJournalAppendRejectsNonJSONEventWithoutMutation(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Calls: 4, Queue: 4})
+	journal := newJournal(t, root, 2)
+	before, err := root.Journal().Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = journal.Append(c.Event{Name: "invalid", Payload: c.Data{"bad": make(chan int)}}); err == nil {
+		t.Fatal("non-JSON Event was accepted")
+	}
+	after, err := root.Journal().Load()
+	if err != nil || len(after.Entries) != len(before.Entries) || len(after.Receipts) != len(before.Receipts) || after.Revision != before.Revision {
+		t.Fatalf("invalid Append mutated Journal: before=%+v after=%+v err=%v", before, after, err)
+	}
+}
+
+func TestJournalStoreRejectsReceiptLineageMetadataTampering(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Calls: 2, Queue: 2})
+	newJournal(t, root, 4)
+	before, err := root.Journal().Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := c.Event{ID: "lineage-event", Source: c.Ref{Namespace: "nodes", ID: "source"}, Name: "observed", Category: "observation", CallID: "call-a", ConversationID: "conversation-a", Payload: c.Data{}}
+	receipt := observation.StoredReceipt{ID: event.ID, Digest: "normalized", OriginalDigest: "original", Sequence: 1, Source: c.Ref{Namespace: "nodes", ID: "spoofed"}, CallID: event.CallID, ConversationID: event.ConversationID}
+	err = root.Journal().Commit(observation.JournalMutation{ExpectedRevision: before.Revision, Identity: before.Identity, Sequence: 1, Append: []observation.Entry{{Sequence: 1, Event: event}}, PutReceipts: []observation.StoredReceipt{receipt}})
+	if err == nil || c.AsFault(err).Code != "invalid_input" {
+		t.Fatalf("tampered receipt lineage was accepted: %v", err)
+	}
+	after, readErr := root.Journal().Load()
+	if readErr != nil || after.Revision != before.Revision || len(after.Entries) != 0 || len(after.Receipts) != 0 {
+		t.Fatalf("invalid typed delta partially applied: before=%+v after=%+v err=%v", before, after, readErr)
+	}
+}
+
+func TestAckWithoutExplicitReleaseIDsReleasesAllOwnedProjections(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Calls: 2, Queue: 2})
+	journal := newJournal(t, root, 8)
+	original := c.Event{ID: "published-original", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "source-event", Category: "published", CallID: "origin-call", ConversationID: "origin-conversation", Payload: c.Data{}}
+	delivery := c.Delivery{ID: "publish-owner", Kind: c.DeliveryPublish, Event: &original}
+	if err := root.Executions().CommitBatch(nil, delivery); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"rejection-one", "rejection-two"} {
+		projection := c.Event{ID: id, Source: original.Source, Name: "event.rejected", Category: "observation", CausationID: original.ID, CallID: original.CallID, ConversationID: original.ConversationID, Payload: c.Data{"code": "forbidden"}}
+		if err := journal.Record(projection, delivery.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	view, err := root.Journal().ReadRecord("rejection-one")
+	if err != nil || view.Head.PinnedCount != 2 {
+		t.Fatalf("both owned projections were not pinned: %+v %v", view.Head, err)
+	}
+	if err = root.Executions().AckDelivery(delivery.ID); err != nil {
+		t.Fatal(err)
+	}
+	view, err = root.Journal().ReadRecord("rejection-one")
+	if err != nil || view.Head.PinnedCount != 0 {
+		t.Fatalf("ACK without explicit IDs did not release all owner pins: %+v %v", view.Head, err)
+	}
+	if err = journal.Record(c.Event{ID: "rejection-one", Source: original.Source, Name: "event.rejected", Category: "observation", CausationID: original.ID, CallID: original.CallID, ConversationID: original.ConversationID, Payload: c.Data{"code": "forbidden"}}, delivery.ID); err != nil {
+		t.Fatal(err)
+	}
+	view, err = root.Journal().ReadRecord("rejection-one")
+	if err != nil || view.Head.PinnedCount != 0 {
+		t.Fatalf("ACK replay repinned a projection: %+v %v", view.Head, err)
+	}
+}
+
+func TestFailedRejectionAckKeepsPinsUntilChangedDispositionRetry(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Calls: 2, Queue: 2})
+	firstJournal := newJournal(t, root, 8)
+	original := c.Event{ID: "replay-published", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "event", Category: "published", Payload: c.Data{}}
+	delivery := c.Delivery{ID: "replay-owner", Kind: c.DeliveryPublish, Event: &original}
+	if err := root.Executions().CommitBatch(nil, delivery); err != nil {
+		t.Fatal(err)
+	}
+	firstRejection := c.Event{ID: "rejected-forbidden", Source: original.Source, Name: "event.rejected", Category: "observation", CausationID: original.ID, Payload: c.Data{"code": "forbidden"}}
+	if err := firstJournal.Record(firstRejection, delivery.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Executions().AckDelivery(delivery.ID, "wrong-owner-event"); err == nil || c.AsFault(err).Code != "conflict" {
+		t.Fatalf("invalid ACK release did not fail: %v", err)
+	}
+	count, err := root.Executions().PendingDeliveryCount()
+	view, readErr := root.Journal().ReadRecord(firstRejection.ID)
+	if err != nil || readErr != nil || count != 1 || view.Receipt == nil || !view.Receipt.Pinned || view.Head.PinnedCount != 1 {
+		t.Fatalf("failed ACK changed pending state or rejection pin: count=%d view=%+v errors=%v %v", count, view, err, readErr)
+	}
+
+	// Reconstructing the façade models a retry after a new startup decision.
+	retryJournal := newJournal(t, root, 8)
+	newRejection := c.Event{ID: "rejected-invalid-schema", Source: original.Source, Name: "event.rejected", Category: "observation", CausationID: original.ID, Payload: c.Data{"code": "invalid_schema"}}
+	if err = retryJournal.Record(newRejection, delivery.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = root.Executions().AckDelivery(delivery.ID, newRejection.ID); err != nil {
+		t.Fatal(err)
+	}
+	view, readErr = root.Journal().ReadRecord(firstRejection.ID)
+	count, err = root.Executions().PendingDeliveryCount()
+	if err != nil || readErr != nil || count != 0 || view.Head.PinnedCount != 0 || view.Receipt == nil || view.Receipt.Pinned {
+		t.Fatalf("successful changed-disposition ACK left an earlier pin: pending=%d view=%+v errors=%v %v", count, view, err, readErr)
+	}
+}
+
+func TestConfigurationApplyCommitsSevenIntentsAtomically(t *testing.T) {
+	changeAt := c.Now()
+	stateProjection := lifecycle.StateEvent(c.Change[c.Lifecycle]{Subject: c.Ref{Namespace: "calls", ID: "timestamped"}, AfterRevision: 1, After: c.Lifecycle{State: c.Created}, At: changeAt}, c.Event{})
+	if !stateProjection.OccurredAt.Equal(changeAt) {
+		t.Fatalf("StateEvent lost the transition timestamp: got %s want %s", stateProjection.OccurredAt, changeAt)
+	}
+	sub := c.Subscription{ID: "atomic-sub", Source: c.Ref{Namespace: "nodes", ID: "source"}, Event: "event", Target: c.Ref{Namespace: "nodes", ID: "target"}, Operation: "run"}
+	change := lifecycle.Create(c.Ref{Namespace: "subscriptions", ID: sub.ID}, sub, "subscription.created")
+	change.At = changeAt
+	root := memory.NewRoot(memory.Limits{Subscriptions: 1, Queue: 9000})
+	if _, err := lifecycle.Commit(root.Subscriptions(), change); err != nil {
+		t.Fatal(err)
+	}
+	deliveries, err := root.Executions().PendingDeliveries(16)
+	if err != nil || len(deliveries) != 7 {
+		t.Fatalf("configuration Apply did not commit all seven intents: count=%d err=%v", len(deliveries), err)
+	}
+	for _, delivery := range deliveries {
+		if delivery.Kind != c.DeliveryJournal || delivery.Event == nil || !delivery.Event.OccurredAt.Equal(changeAt) {
+			t.Fatalf("configuration intent lost its typed kind or original time: %+v", delivery)
+		}
+	}
+	_, setRevision, err := root.Admissions().ReadSubscriptions()
+	if err != nil || setRevision != 1 {
+		t.Fatalf("successful subscription Apply did not advance set revision once: %d %v", setRevision, err)
+	}
+	if _, err = lifecycle.Commit(root.Subscriptions(), change); err == nil || c.AsFault(err).Code != "conflict" {
+		t.Fatalf("stale configuration Apply was not rejected: %v", err)
+	}
+	pendingAfterStale, countErr := root.Executions().PendingDeliveryCount()
+	_, revisionAfterStale, revisionErr := root.Admissions().ReadSubscriptions()
+	if countErr != nil || revisionErr != nil || pendingAfterStale != 7 || revisionAfterStale != setRevision {
+		t.Fatalf("stale configuration Apply partially committed: pending=%d setrev=%d/%d errors=%v %v", pendingAfterStale, setRevision, revisionAfterStale, countErr, revisionErr)
+	}
+	standalone := memory.NewStore[c.Subscription](1)
+	if _, err = lifecycle.Commit(standalone, change); err == nil || c.AsFault(err).Code != "invalid_input" {
+		t.Fatalf("non-root Store accepted atomic delivery intents: %v", err)
+	}
+	standaloneItems, listErr := standalone.List()
+	if listErr != nil || len(standaloneItems) != 0 {
+		t.Fatalf("non-root Store partially applied an intent-bearing change: %d %v", len(standaloneItems), listErr)
+	}
+	registrationRoot := memory.NewRoot(memory.Limits{Nodes: 1, Queue: 16})
+	connector := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{}}}
+	catalogue := catalog.New(registrationRoot.Nodes(), map[string]c.Connector{"fake": connector}, schema.New())
+	registeredAfterApply := false
+	catalogue.OnRegistered = func(node c.Node) {
+		stored, getErr := registrationRoot.Nodes().Get(c.Ref{Namespace: "nodes", ID: node.ID})
+		pending, countErr := registrationRoot.Executions().PendingDeliveryCount()
+		registeredAfterApply = getErr == nil && countErr == nil && stored.Value.ID == node.ID && pending == 7
+	}
+	if _, err := catalogue.Register(context.Background(), c.Registration{ID: "registered-after-apply", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil || !registeredAfterApply {
+		t.Fatalf("OnRegistered ran before the configuration transaction committed: callback=%v err=%v", registeredAfterApply, err)
+	}
+
+	capacityRoot := memory.NewRoot(memory.Limits{Subscriptions: 0, Queue: 9000})
+	_, beforeRevision, err := capacityRoot.Admissions().ReadSubscriptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = lifecycle.Commit(capacityRoot.Subscriptions(), change); err == nil || c.AsFault(err).Code != "busy" {
+		t.Fatalf("capacity failure was not returned: %v", err)
+	}
+	items, err := capacityRoot.Subscriptions().List()
+	pendingCount, countErr := capacityRoot.Executions().PendingDeliveryCount()
+	_, afterRevision, revisionErr := capacityRoot.Admissions().ReadSubscriptions()
+	if err != nil || countErr != nil || revisionErr != nil || len(items) != 0 || pendingCount != 0 || afterRevision != beforeRevision {
+		t.Fatalf("capacity failure partially applied: items=%d outbox=%d setrev=%d/%d errors=%v %v %v", len(items), pendingCount, beforeRevision, afterRevision, err, countErr, revisionErr)
+	}
+
+	outboxRoot := memory.NewRoot(memory.Limits{Subscriptions: 1, Queue: 9000})
+	filler := make([]c.Delivery, 8186)
+	for i := range filler {
+		event := c.Event{ID: c.ID("atomic-fill", fmt.Sprint(i)), Name: "fill", Category: "observation", Payload: c.Data{}}
+		filler[i] = c.Delivery{ID: event.ID, Kind: c.DeliveryJournal, Event: &event}
+	}
+	if err = outboxRoot.Executions().CommitBatch(nil, filler...); err != nil {
+		t.Fatal(err)
+	}
+	_, beforeRevision, err = outboxRoot.Admissions().ReadSubscriptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = lifecycle.Commit(outboxRoot.Subscriptions(), change); err == nil || c.AsFault(err).Code != "busy" {
+		t.Fatalf("outbox failure was not returned: %v", err)
+	}
+	items, err = outboxRoot.Subscriptions().List()
+	pendingCount, countErr = outboxRoot.Executions().PendingDeliveryCount()
+	_, afterRevision, revisionErr = outboxRoot.Admissions().ReadSubscriptions()
+	if err != nil || countErr != nil || revisionErr != nil || len(items) != 0 || pendingCount != len(filler) || afterRevision != beforeRevision {
+		t.Fatalf("outbox failure partially applied: items=%d outbox=%d setrev=%d/%d errors=%v %v %v", len(items), pendingCount, beforeRevision, afterRevision, err, countErr, revisionErr)
+	}
+}
 func call(id string) c.Call {
 	return c.Call{ID: id, Target: c.Ref{Namespace: "nodes", ID: "node"}, Operation: "run", Input: c.Data{"text": "hello"}}
 }
@@ -550,8 +983,9 @@ func TestHostShutdownUsesInstanceCapabilityWithoutAbortGrant(t *testing.T) {
 	if f.descriptor.Operations == nil {
 		f.descriptor = c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}`), OutputSchema: json.RawMessage(`{"type":"object"}`), Capabilities: c.Capabilities{Abort: true, Inspect: true}}}}
 	}
-	journal := observation.New(100)
-	cat := catalog.New(memory.NewStore[c.Node](8), map[string]c.Connector{"fake": f}, schema.New(), journal)
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
+	journal := newJournal(t, root, 100)
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
@@ -559,7 +993,7 @@ func TestHostShutdownUsesInstanceCapabilityWithoutAbortGrant(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := memory.NewExecutions(8, 8)
+	store := root.Executions()
 	calls := invocation.New(store, cat, journal, policy)
 	if _, err := calls.SubmitBatch(directOrigin(), []c.Call{call("shutdown-queued")}); err != nil {
 		t.Fatal(err)
@@ -1003,12 +1437,13 @@ func TestPendingTerminalWinsAndRetryDoesNotDeleteReplacement(t *testing.T) {
 			return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{"answer": "inspected"}}
 		},
 	}
-	journal := observation.New(100)
-	cat := catalog.New(memory.NewStore[c.Node](8), map[string]c.Connector{"fake": f}, schema.New(), journal)
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
+	journal := newJournal(t, root, 100)
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
-	base := memory.NewExecutions(8, 8)
+	base := root.Executions()
 	store := &interceptExecutionStore{ExecutionStore: base, failures: map[c.State]int{c.Unknown: 1}, afterNextState: map[c.State]func(){}}
 	auth := fixtureAuthority(t)
 	s := invocation.New(store, cat, journal, auth)
@@ -1077,12 +1512,13 @@ func TestConfirmedWaitingPendingReplacesUnknownResult(t *testing.T) {
 		},
 		inspect: func(call c.Call) c.Result { return c.Result{CallID: call.ID, State: c.Waiting} },
 	}
-	journal := observation.New(100)
-	cat := catalog.New(memory.NewStore[c.Node](8), map[string]c.Connector{"fake": f}, schema.New(), journal)
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
+	journal := newJournal(t, root, 100)
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
-	store := &interceptExecutionStore{ExecutionStore: memory.NewExecutions(8, 8), failures: map[c.State]int{c.Unknown: 1, c.Waiting: 1}, afterNextState: map[c.State]func(){}}
+	store := &interceptExecutionStore{ExecutionStore: root.Executions(), failures: map[c.State]int{c.Unknown: 1, c.Waiting: 1}, afterNextState: map[c.State]func(){}}
 	auth := fixtureAuthority(t)
 	s := invocation.New(store, cat, journal, auth)
 	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("waiting-priority")}); err != nil {
@@ -1129,7 +1565,7 @@ func TestTerminalSinkCanReadAndFanOutReentrantly(t *testing.T) {
 		return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{"ok": true}}
 	}}
 	cat, s, _, root := fixture(t, f)
-	publisher := event.New(root.Subscriptions(), cat, s, nil, root.Admissions())
+	publisher := event.New(root.Subscriptions(), cat, s, root.Admissions())
 	completed := make(chan error, 1)
 	emission := c.Event{ID: "callback-event", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "complete", Category: "published", OccurredAt: c.Now(), Payload: c.Data{"summary": "done"}}
 	s.OnResult = func(d c.Delivery) error {
@@ -1455,12 +1891,13 @@ func TestNewerInspectionPendingReplacesAndRetriesOnlyItsLineage(t *testing.T) {
 			return c.Result{CallID: call.ID, State: c.Unknown}
 		},
 	}
-	journal := observation.New(100)
-	cat := catalog.New(memory.NewStore[c.Node](8), map[string]c.Connector{"fake": f}, schema.New(), journal)
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
+	journal := newJournal(t, root, 100)
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
-	base := memory.NewExecutions(8, 8)
+	base := root.Executions()
 	store := &interceptExecutionStore{ExecutionStore: base, failures: map[c.State]int{c.Unknown: 2}, afterNextState: map[c.State]func(){}}
 	s := invocation.New(store, cat, journal, fixtureAuthority(t))
 	defer close(releaseInvoke)
@@ -1524,12 +1961,13 @@ func TestInspectionQueryDoesNotReplacePendingWaitingStream(t *testing.T) {
 		},
 		inspect: func(call c.Call) c.Result { return c.Result{CallID: call.ID, State: c.Unknown} },
 	}
-	journal := observation.New(100)
-	cat := catalog.New(memory.NewStore[c.Node](8), map[string]c.Connector{"fake": f}, schema.New(), journal)
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
+	journal := newJournal(t, root, 100)
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
-	store := &interceptExecutionStore{ExecutionStore: memory.NewExecutions(8, 8), failures: map[c.State]int{c.Waiting: 1}, afterNextState: map[c.State]func(){}}
+	store := &interceptExecutionStore{ExecutionStore: root.Executions(), failures: map[c.State]int{c.Waiting: 1}, afterNextState: map[c.State]func(){}}
 	s := invocation.New(store, cat, journal, fixtureAuthority(t))
 	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("stream-query-priority")}); err != nil {
 		t.Fatal(err)
@@ -1570,12 +2008,13 @@ func TestAcceptedInspectionDoesNotClearPendingWaitingStream(t *testing.T) {
 		},
 		inspect: func(call c.Call) c.Result { return c.Result{CallID: call.ID, State: c.Unknown} },
 	}
-	journal := observation.New(100)
-	cat := catalog.New(memory.NewStore[c.Node](8), map[string]c.Connector{"fake": f}, schema.New(), journal)
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 8, Calls: 8, Queue: 8})
+	journal := newJournal(t, root, 100)
+	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
-	store := &interceptExecutionStore{ExecutionStore: memory.NewExecutions(8, 8), failures: map[c.State]int{c.Waiting: 1}, afterNextState: map[c.State]func(){}}
+	store := &interceptExecutionStore{ExecutionStore: root.Executions(), failures: map[c.State]int{c.Waiting: 1}, afterNextState: map[c.State]func(){}}
 	s := invocation.New(store, cat, journal, fixtureAuthority(t))
 	if _, err := s.SubmitBatch(directOrigin(), []c.Call{call("stream-query-clear")}); err != nil {
 		t.Fatal(err)

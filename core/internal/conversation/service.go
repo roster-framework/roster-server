@@ -21,12 +21,11 @@ type Service struct {
 	store   c.Store[c.Conversation]
 	catalog *catalog.Service
 	caller  c.Caller
-	journal c.Journal
 	state   c.AdmissionState
 }
 
-func New(store c.Store[c.Conversation], cat *catalog.Service, caller c.Caller, j c.Journal, state c.AdmissionState) *Service {
-	return &Service{store: store, catalog: cat, caller: caller, journal: j, state: state}
+func New(store c.Store[c.Conversation], cat *catalog.Service, caller c.Caller, state c.AdmissionState) *Service {
+	return &Service{store: store, catalog: cat, caller: caller, state: state}
 }
 func participant(conv c.Conversation, ref c.Ref) (c.Participant, bool) {
 	for _, p := range conv.Participants {
@@ -63,7 +62,7 @@ func (s *Service) Create(conv c.Conversation) (c.Snapshot[c.Conversation], error
 		}
 	}
 	ch := lifecycle.Create(c.Ref{Namespace: "conversations", ID: conv.ID}, conv, "conversation.created")
-	return lifecycle.Commit(s.store, ch, s.journal)
+	return lifecycle.Commit(s.store, ch)
 }
 func (s *Service) Get(id string, after, limit int) (View, error) {
 	s.mu.Lock()
@@ -260,7 +259,7 @@ func (s *Service) Close(id string, revision uint64) (c.Change[c.Conversation], e
 	next := old.Value
 	next.Closed = true
 	ch := lifecycle.Replace(old, next, "conversation.closed")
-	_, err = lifecycle.Commit(s.store, ch, s.journal)
+	_, err = lifecycle.Commit(s.store, ch)
 	return ch, err
 }
 func (s *Service) List() ([]c.Snapshot[c.Conversation], error) {

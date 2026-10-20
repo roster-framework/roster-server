@@ -70,7 +70,7 @@ type Observation struct {
 
 // StateEvent is the single stable public projection for lifecycle changes.
 func StateEvent(ch c.Change[c.Lifecycle], context c.Event) c.Event {
-	e := c.Event{ID: c.ID(ch.Subject.Key(), strconv.FormatUint(ch.AfterRevision, 10), "state.changed"), Source: ch.Subject, Name: "state.changed", Category: "observation", Payload: c.Data{"before_revision": ch.BeforeRevision, "after_revision": ch.AfterRevision, "state": ch.After.State, "reason": ch.Reason}}
+	e := c.Event{ID: c.ID(ch.Subject.Key(), strconv.FormatUint(ch.AfterRevision, 10), "state.changed"), Source: ch.Subject, Name: "state.changed", Category: "observation", OccurredAt: ch.At, Payload: c.Data{"before_revision": ch.BeforeRevision, "after_revision": ch.AfterRevision, "state": ch.After.State, "reason": ch.Reason}}
 	if context.Source.Valid() {
 		e.Source = context.Source
 	}

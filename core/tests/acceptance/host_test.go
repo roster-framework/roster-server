@@ -30,6 +30,90 @@ type cancellationSuccessConnector struct {
 	once    sync.Once
 }
 
+type sourceFailureConnector struct {
+	connector
+	started  chan struct{}
+	panicRun bool
+	once     sync.Once
+}
+
+type sourceObservationFailStore struct {
+	observation.Store
+	failed chan struct{}
+	once   sync.Once
+}
+
+type closeRacePanicSource struct {
+	connector
+	started chan struct{}
+	release chan struct{}
+}
+
+type closeRaceExecutionStore struct {
+	c.ExecutionStore
+	listed chan struct{}
+	once   sync.Once
+}
+
+func (s *closeRacePanicSource) Watch(ctx c.Context, _ json.RawMessage, _ func(c.SourceEvent) error) error {
+	close(s.started)
+	<-ctx.Done()
+	<-s.release
+	panic("source deferred panic during Close")
+}
+
+func (s *closeRaceExecutionStore) List() ([]c.Snapshot[c.Execution], error) {
+	s.once.Do(func() { close(s.listed) })
+	return s.ExecutionStore.List()
+}
+
+type startupJournalFailStore struct {
+	observation.Store
+	loadErr   error
+	appendErr error
+}
+
+func (s *startupJournalFailStore) Load() (observation.StoredState, error) {
+	if s.loadErr != nil {
+		return observation.StoredState{}, s.loadErr
+	}
+	return s.Store.Load()
+}
+func (s *startupJournalFailStore) Commit(m observation.JournalMutation) error {
+	if len(m.Append) > 0 && s.appendErr != nil {
+		return s.appendErr
+	}
+	return s.Store.Commit(m)
+}
+
+func (s *sourceObservationFailStore) Commit(m observation.JournalMutation) error {
+	if len(m.Append) > 0 && m.Append[0].Event.Name == "source.stopped" {
+		s.once.Do(func() { close(s.failed) })
+		return c.Err("internal", "simulated source observation persistence failure")
+	}
+	return s.Store.Commit(m)
+}
+
+func (d *sourceFailureConnector) Describe(ctx c.Context, binding json.RawMessage) (c.Descriptor, error) {
+	return d.connector.Describe(ctx, binding)
+}
+func (d *sourceFailureConnector) Invoke(ctx c.Context, binding json.RawMessage, call c.Call, report c.ReportSink) c.Result {
+	return d.connector.Invoke(ctx, binding, call, report)
+}
+func (d *sourceFailureConnector) Inspect(ctx c.Context, binding json.RawMessage, call c.Call) c.Result {
+	return d.connector.Inspect(ctx, binding, call)
+}
+func (d *sourceFailureConnector) Abort(ctx c.Context, binding json.RawMessage, call c.Call) (c.AbortObservation, error) {
+	return d.connector.Abort(ctx, binding, call)
+}
+func (d *sourceFailureConnector) Watch(c.Context, json.RawMessage, func(c.SourceEvent) error) error {
+	d.once.Do(func() { close(d.started) })
+	if d.panicRun {
+		panic("simulated source panic")
+	}
+	return c.Err("internal", "simulated source failure")
+}
+
 type faultExecutionStore struct {
 	c.ExecutionStore
 	mu           sync.Mutex
@@ -266,7 +350,7 @@ func TestStorageReadFailuresReachStatusReadyAndClose(t *testing.T) {
 	store := &faultExecutionStore{ExecutionStore: root.Executions()}
 	core, err := host.New(context.Background(), host.Options{
 		Connectors: map[string]c.Connector{"fake": connector{}}, Workers: 1,
-		Storage: &host.Storage{Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: store, Admissions: root.Admissions()},
+		Storage: &host.Storage{Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: store, Admissions: root.Admissions(), Journal: root.Journal()},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -326,6 +410,156 @@ func TestStorageReadFailuresReachStatusReadyAndClose(t *testing.T) {
 	status := readStatus(t, core)
 	if status.Lifecycle.Value.State == c.Succeeded || !status.LocalStopped {
 		t.Fatalf("unreadable shutdown was marked successful: %+v", status)
+	}
+}
+
+func TestSourceObservationPersistenceFailureReachesStatusAndClose(t *testing.T) {
+	for _, panicRun := range []bool{false, true} {
+		name := "watch_error"
+		if panicRun {
+			name = "watch_panic"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := memory.NewRoot(memory.Limits{Nodes: 2, Subscriptions: 2, Conversations: 2, Calls: 2, Queue: 8})
+			journalStore := &sourceObservationFailStore{Store: root.Journal(), failed: make(chan struct{})}
+			source := &sourceFailureConnector{started: make(chan struct{}), panicRun: panicRun}
+			core, err := host.New(context.Background(), host.Options{
+				Connectors: map[string]c.Connector{"source": source},
+				Workers:    1,
+				Storage: &host.Storage{
+					Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(),
+					Executions: root.Executions(), Admissions: root.Admissions(), Journal: journalStore,
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = core.Catalog.Register(context.Background(), c.Registration{ID: "source-node", ConnectorID: "source", Binding: json.RawMessage(`{}`)}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-source.started:
+			case <-time.After(time.Second):
+				t.Fatal("source watcher did not start")
+			}
+			select {
+			case <-journalStore.failed:
+			case <-time.After(time.Second):
+				t.Fatal("source observation persistence was not attempted")
+			}
+			deadline := time.Now().Add(time.Second)
+			for {
+				_, err = core.Status()
+				if err != nil || time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if err == nil || c.AsFault(err).Code != "internal" {
+				t.Fatalf("Status hid the source observation error: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err = core.Close(ctx); err == nil || c.AsFault(err).Code != "internal" {
+				t.Fatalf("Close did not preserve the first source observation error: %v", err)
+			}
+		})
+	}
+}
+
+func TestSourceObservationFailureDuringCloseIsPreserved(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Nodes: 2, Subscriptions: 2, Conversations: 2, Calls: 2, Queue: 8})
+	journalStore := &sourceObservationFailStore{Store: root.Journal(), failed: make(chan struct{})}
+	executionStore := &closeRaceExecutionStore{ExecutionStore: root.Executions(), listed: make(chan struct{})}
+	source := &closeRacePanicSource{started: make(chan struct{}), release: make(chan struct{})}
+	core, err := host.New(context.Background(), host.Options{
+		Connectors: map[string]c.Connector{"source": source},
+		Workers:    1,
+		Storage: &host.Storage{
+			Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(),
+			Executions: executionStore, Admissions: root.Admissions(), Journal: journalStore,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = core.Catalog.Register(context.Background(), c.Registration{ID: "source-node", ConnectorID: "source", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-source.started:
+	case <-time.After(time.Second):
+		t.Fatal("source watcher did not start")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- core.Close(ctx) }()
+	select {
+	case <-executionStore.listed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not enter its call-list phase")
+	}
+	close(source.release)
+	select {
+	case <-journalStore.failed:
+	case <-time.After(time.Second):
+		t.Fatal("source panic did not attempt its failure observation")
+	}
+	var statusErr error
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		_, statusErr = core.Status()
+		if statusErr != nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if statusErr == nil || c.AsFault(statusErr).Code != "internal" {
+		t.Fatalf("Status hid the source observation failure: %v", statusErr)
+	}
+	select {
+	case closeErr := <-closeResult:
+		if closeErr == nil || c.AsFault(closeErr).Code != c.AsFault(statusErr).Code || c.AsFault(closeErr).Message != c.AsFault(statusErr).Message {
+			t.Fatalf("Close did not preserve the source observation failure: close=%v status=%v", closeErr, statusErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after the source watcher stopped")
+	}
+}
+
+func TestStartupJournalFailuresReturnBeforeCoreStarts(t *testing.T) {
+	for _, mode := range []string{"load", "initial_projection"} {
+		t.Run(mode, func(t *testing.T) {
+			root := memory.NewRoot(memory.Limits{Nodes: 2, Subscriptions: 2, Conversations: 2, Calls: 2, Queue: 8})
+			failure := c.Err("internal", "simulated startup Journal failure")
+			store := &startupJournalFailStore{Store: root.Journal()}
+			if mode == "load" {
+				store.loadErr = failure
+			} else {
+				store.appendErr = failure
+			}
+			source := &sourceFailureConnector{started: make(chan struct{})}
+			core, err := host.New(context.Background(), host.Options{
+				Connectors: map[string]c.Connector{"source": source}, Workers: 1,
+				Storage: &host.Storage{
+					Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(),
+					Executions: root.Executions(), Admissions: root.Admissions(), Journal: store,
+				},
+			})
+			if core != nil || err == nil || c.AsFault(err).Code != c.AsFault(failure).Code || c.AsFault(err).Message != c.AsFault(failure).Message {
+				t.Fatalf("startup Journal failure returned a live core or was hidden: core=%v err=%v", core, err)
+			}
+			select {
+			case <-source.started:
+				t.Fatal("source watcher started after startup failed")
+			default:
+			}
+			pending, countErr := root.Executions().PendingDeliveryCount()
+			if countErr != nil || pending != 0 {
+				t.Fatalf("startup failure left workers/deliveries behind: pending=%d err=%v", pending, countErr)
+			}
+		})
 	}
 }
 
@@ -557,7 +791,7 @@ func TestCloseDeadlineWithUncooperativeConnectorIsBounded(t *testing.T) {
 			store := &faultExecutionStore{ExecutionStore: root.Executions(), listFailures: make(chan struct{}, 1)}
 			core, err := host.New(context.Background(), host.Options{
 				Connectors: map[string]c.Connector{"fake": drain}, Workers: 1, Authority: testAuthority(t, "A"),
-				Storage: &host.Storage{Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: store, Admissions: root.Admissions()},
+				Storage: &host.Storage{Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: store, Admissions: root.Admissions(), Journal: root.Journal()},
 			})
 			if err != nil {
 				t.Fatal(err)

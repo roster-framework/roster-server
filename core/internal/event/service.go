@@ -21,14 +21,13 @@ type Service struct {
 	store   c.Store[c.Subscription]
 	catalog *catalog.Service
 	caller  c.Caller
-	journal c.Journal
 	state   c.AdmissionState
 }
 
 var _ c.Publisher = (*Service)(nil)
 
-func New(store c.Store[c.Subscription], cat *catalog.Service, caller c.Caller, j c.Journal, state c.AdmissionState) *Service {
-	return &Service{store: store, catalog: cat, caller: caller, journal: j, state: state}
+func New(store c.Store[c.Subscription], cat *catalog.Service, caller c.Caller, state c.AdmissionState) *Service {
+	return &Service{store: store, catalog: cat, caller: caller, state: state}
 }
 func (s *Service) Create(sub c.Subscription) (c.Snapshot[c.Subscription], error) {
 	s.mu.Lock()
@@ -57,7 +56,7 @@ func (s *Service) Create(sub c.Subscription) (c.Snapshot[c.Subscription], error)
 		return c.Snapshot[c.Subscription]{}, c.Err("invalid_input", "Target operation not declared")
 	}
 	ch := lifecycle.Create(c.Ref{Namespace: "subscriptions", ID: sub.ID}, sub, "subscription.created")
-	out, err := lifecycle.Commit(s.store, ch, s.journal)
+	out, err := lifecycle.Commit(s.store, ch)
 	return out, err
 }
 func (s *Service) List() ([]c.Snapshot[c.Subscription], error) {
@@ -92,7 +91,7 @@ func (s *Service) Remove(id string, revision uint64) (c.Change[c.Subscription], 
 	next := old.Value
 	next.Removed = true
 	ch := lifecycle.Replace(old, next, "subscription.removed")
-	_, err = lifecycle.Commit(s.store, ch, s.journal)
+	_, err = lifecycle.Commit(s.store, ch)
 	return ch, err
 }
 func (s *Service) Publish(e c.Event, origin c.AdmissionOrigin) ([]string, error) {
@@ -203,7 +202,7 @@ func (s *Service) Drain(outbox c.Outbox, recorder c.EventRecorder, complete func
 			return nil
 		}
 		for _, d := range batch {
-			var releaseID string
+		releaseIDs := []string{}
 			kind := d.Kind
 			if kind == "" {
 				if d.Execution != nil {
@@ -219,10 +218,10 @@ func (s *Service) Drain(outbox c.Outbox, recorder c.EventRecorder, complete func
 				if d.Event == nil {
 					return c.Err("invalid_input", "Journal delivery has no event")
 				}
-				if err = recorder.Record(*d.Event); err != nil {
+				if err = recorder.Record(*d.Event, d.ID); err != nil {
 					return err
 				}
-				releaseID = d.Event.ID
+				releaseIDs = append(releaseIDs, d.Event.ID)
 			case c.DeliveryPublish:
 				if d.Event == nil || d.Event.Category != "published" {
 					return c.Err("invalid_input", "Publish delivery has invalid payload")
@@ -241,10 +240,10 @@ func (s *Service) Drain(outbox c.Outbox, recorder c.EventRecorder, complete func
 						return err
 					}
 					rejected := c.Event{ID: c.ID(d.Event.ID, "event.rejected", fault.Code), Source: d.Event.Source, Name: "event.rejected", Category: "observation", OccurredAt: d.Event.OccurredAt, CorrelationID: d.Event.CorrelationID, CausationID: d.Event.ID, CallID: d.Event.CallID, ConversationID: d.Event.ConversationID, Payload: c.Data{"event_id": d.Event.ID, "code": fault.Code}}
-					if e := observation.Project(recorder, rejected); e != nil {
+					if e := observation.Project(recorder, rejected, d.ID); e != nil {
 						return e
 					}
-					releaseID = rejected.ID
+					releaseIDs = append(releaseIDs, rejected.ID)
 					err = nil
 				}
 			case c.DeliveryCompletion:
@@ -260,11 +259,8 @@ func (s *Service) Drain(outbox c.Outbox, recorder c.EventRecorder, complete func
 			default:
 				return c.Err("invalid_input", "Unknown outbox delivery")
 			}
-			if err = outbox.AckDelivery(d.ID); err != nil {
+			if err = outbox.AckDelivery(d.ID, releaseIDs...); err != nil {
 				return err
-			}
-			if releaseID != "" {
-				recorder.Release(releaseID)
 			}
 		}
 	}

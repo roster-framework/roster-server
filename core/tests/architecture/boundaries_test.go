@@ -37,7 +37,7 @@ func TestProductionImportBoundaries(t *testing.T) {
 				forbidden = strings.Contains(name, ".") && name != prefix+"contracts" && name != prefix+"observation"
 			case "invocation":
 				forbidden = strings.HasPrefix(name, prefix) && (local == "event" || local == "conversation" || strings.HasPrefix(local, "adapters/") || strings.HasPrefix(local, "interfaces/"))
-			case "event", "conversation":
+			case "event", "conversation", "catalog", "observation":
 				forbidden = strings.HasPrefix(name, prefix) && (strings.HasPrefix(local, "adapters/") || strings.HasPrefix(local, "interfaces/"))
 			}
 			if forbidden {

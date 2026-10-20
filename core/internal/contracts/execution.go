@@ -84,7 +84,7 @@ type Connector interface {
 type Store[T any] interface {
 	Get(Ref) (Snapshot[T], error)
 	List() ([]Snapshot[T], error)
-	Apply(Change[T]) (Snapshot[T], error)
+	Apply(Change[T], ...Delivery) (Snapshot[T], error)
 }
 type Validator interface {
 	Check(Schema) error
@@ -174,14 +174,14 @@ type ExecutionMutation struct {
 }
 type Outbox interface {
 	PendingDeliveries(limit int) ([]Delivery, error)
-	AckDelivery(id string) error
+	AckDelivery(id string, releaseEventIDs ...string) error
 	PendingDeliveryCount() (int, error)
 }
 type EventRecorder interface {
-	Record(Event) error
-	Release(id string)
+	Record(Event, string) error
+	Release(id string) error
 }
 type Publisher interface {
 	Publish(Event, AdmissionOrigin) ([]string, error)
 }
-type Journal interface{ Append(Event) }
+type Journal interface{ Append(Event) error }
