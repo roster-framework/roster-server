@@ -63,13 +63,17 @@ func (s *Service) Get(id string) (c.Node, error) {
 	v, err := s.store.Get(c.Ref{Namespace: "nodes", ID: id})
 	return v.Value, err
 }
-func (s *Service) List() []c.Node {
+func (s *Service) List() ([]c.Node, error) {
 	out := []c.Node{}
-	for _, v := range s.store.List() {
+	items, err := s.store.List()
+	if err != nil {
+		return nil, err
+	}
+	for _, v := range items {
 		out = append(out, Public(v.Value))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out
+	return out, nil
 }
 func (s *Service) Connector(id string) c.Connector { return s.connectors[id] }
 func (s *Service) Validate(target c.Ref, operation string, input c.Data) (c.Node, c.Operation, error) {

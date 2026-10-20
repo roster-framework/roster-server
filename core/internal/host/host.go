@@ -214,16 +214,19 @@ func (s *Core) deliveryLoop(ctx context.Context) {
 	defer ticker.Stop()
 	for {
 		s.Calls.RetryPending()
-		err := s.Events.Drain(s.Calls.Outbox(), s.Journal, func(delivery c.Delivery) error {
+		drainErr := s.Events.Drain(s.Calls.Outbox(), s.Journal, func(delivery c.Delivery) error {
 			if s.Calls.OnResult != nil {
 				return s.Calls.OnResult(delivery)
 			}
 			return c.Err("internal", "Terminal delivery sink is not configured")
 		})
+		pending, countErr := s.Calls.Outbox().PendingDeliveryCount()
 		s.mu.Lock()
-		if err != nil {
-			s.lastDeliveryError = c.AsFault(err)
-		} else if s.Calls.Outbox().PendingDeliveryCount() == 0 {
+		if countErr != nil {
+			s.lastDeliveryError = c.AsFault(countErr)
+		} else if drainErr != nil {
+			s.lastDeliveryError = c.AsFault(drainErr)
+		} else if pending == 0 {
 			s.lastDeliveryError = nil
 		}
 		s.mu.Unlock()

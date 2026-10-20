@@ -13,6 +13,7 @@ import (
 	"time"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/roster-framework/roster-server/core/internal/adapters/memory"
 	"github.com/roster-framework/roster-server/core/internal/authority"
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
 	"github.com/roster-framework/roster-server/core/internal/conversation"
@@ -23,6 +24,79 @@ import (
 
 type connector struct{}
 
+type cancellationSuccessConnector struct {
+	connector
+	entered chan struct{}
+	once    sync.Once
+}
+
+type faultExecutionStore struct {
+	c.ExecutionStore
+	mu           sync.Mutex
+	listErr      error
+	countErr     error
+	listErrOnce  bool
+	listFailures chan struct{}
+}
+
+func (s *faultExecutionStore) SetErrors(listErr, countErr error) {
+	s.mu.Lock()
+	s.listErr, s.countErr = listErr, countErr
+	s.listErrOnce = false
+	s.mu.Unlock()
+}
+
+func (s *faultExecutionStore) SetListErrorOnce(err error) {
+	s.mu.Lock()
+	s.listErr, s.listErrOnce = err, err != nil
+	s.mu.Unlock()
+}
+
+func (s *faultExecutionStore) List() ([]c.Snapshot[c.Execution], error) {
+	s.mu.Lock()
+	err := s.listErr
+	if err != nil && s.listErrOnce {
+		s.listErr, s.listErrOnce = nil, false
+	}
+	s.mu.Unlock()
+	if err != nil {
+		select {
+		case s.listFailures <- struct{}{}:
+		default:
+		}
+		return nil, err
+	}
+	return s.ExecutionStore.List()
+}
+
+func (s *faultExecutionStore) PendingDeliveryCount() (int, error) {
+	s.mu.Lock()
+	err := s.countErr
+	s.mu.Unlock()
+	if err != nil {
+		return 0, err
+	}
+	return s.ExecutionStore.PendingDeliveryCount()
+}
+
+func readStatus(t *testing.T, core *host.Core) host.Status {
+	t.Helper()
+	status, err := core.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return status
+}
+
+func readCalls(t *testing.T, core *host.Core) []c.Snapshot[c.Execution] {
+	t.Helper()
+	calls, err := core.Calls.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return calls
+}
+
 func (connector) Describe(c.Context, json.RawMessage) (c.Descriptor, error) {
 	return c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{"complete": json.RawMessage(`{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}`)}}, nil
 }
@@ -32,6 +106,11 @@ func (connector) Invoke(_ c.Context, _ json.RawMessage, call c.Call, _ c.ReportS
 		result.Emissions = []c.Emission{{Name: "complete", Payload: c.Data{"summary": "from A"}}}
 	}
 	return result
+}
+func (d *cancellationSuccessConnector) Invoke(ctx c.Context, _ json.RawMessage, call c.Call, _ c.ReportSink) c.Result {
+	d.once.Do(func() { close(d.entered) })
+	<-ctx.Done()
+	return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{"answer": "finished"}}
 }
 func (connector) Inspect(_ c.Context, _ json.RawMessage, call c.Call) c.Result {
 	return c.Result{CallID: call.ID, State: c.Unknown}
@@ -128,7 +207,7 @@ func TestIdleCoreCloseIsIdempotentAndObservable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	before := core.Status()
+	before := readStatus(t, core)
 	if !before.Ready || before.Lifecycle.Value.State != c.Running || before.LocalStopped {
 		t.Fatalf("unexpected initial status: %+v", before)
 	}
@@ -148,7 +227,7 @@ func TestIdleCoreCloseIsIdempotentAndObservable(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	after := core.Status()
+	after := readStatus(t, core)
 	if after.Ready || !after.LocalStopped || after.Lifecycle.Value.State != c.Succeeded {
 		t.Fatalf("unexpected closed status: %+v", after)
 	}
@@ -179,6 +258,96 @@ func TestIdleCoreCloseIsIdempotentAndObservable(t *testing.T) {
 	cancelExpired()
 	if err := core.Close(expired); err != nil {
 		t.Fatalf("completed outcome should beat caller cancellation: %v", err)
+	}
+}
+
+func TestStorageReadFailuresReachStatusReadyAndClose(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 4, Calls: 8, Queue: 8})
+	store := &faultExecutionStore{ExecutionStore: root.Executions()}
+	core, err := host.New(context.Background(), host.Options{
+		Connectors: map[string]c.Connector{"fake": connector{}}, Workers: 1,
+		Storage: &host.Storage{Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: store, Admissions: root.Admissions()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			store.SetErrors(nil, nil)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if closeErr := core.Close(ctx); closeErr != nil {
+				t.Error(closeErr)
+			}
+		}
+	}()
+
+	readErr := c.Err("storage_read", "injected call-list failure")
+	store.SetErrors(readErr, nil)
+	if _, err := core.Status(); err != readErr {
+		t.Fatalf("Status error=%v, want original list error %v", err, readErr)
+	}
+	if _, err := core.Commands.Execute(context.Background(), "core.status", json.RawMessage(`{}`)); err != readErr {
+		t.Fatalf("core.status error=%v, want original list error %v", err, readErr)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/commands/core.status", strings.NewReader(`{}`))
+	request.Host = "127.0.0.1:7350"
+	request.RemoteAddr = "127.0.0.1:12345"
+	response := httptest.NewRecorder()
+	core.Handler().ServeHTTP(response, request)
+	var publicFault c.Fault
+	if response.Code != http.StatusInternalServerError || json.Unmarshal(response.Body.Bytes(), &publicFault) != nil || publicFault.Code != "storage_read" {
+		t.Fatalf("core.status HTTP response status=%d body=%s, want safe 500 storage_read fault", response.Code, response.Body.String())
+	}
+	checkReadyFailure(t, core, "storage_read")
+
+	countErr := c.Err("storage_read", "injected delivery-count failure")
+	store.SetErrors(nil, countErr)
+	if _, err := core.Status(); err != countErr {
+		t.Fatalf("Status count error=%v, want original count error %v", err, countErr)
+	}
+	if _, err := core.Commands.Execute(context.Background(), "core.status", json.RawMessage(`{}`)); err != countErr {
+		t.Fatalf("core.status count error=%v, want original count error %v", err, countErr)
+	}
+	checkReadyFailure(t, core, "storage_read")
+
+	store.SetListErrorOnce(readErr)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := core.Close(ctx); err != readErr {
+		t.Fatalf("Close error=%v, want original read error %v", err, readErr)
+	}
+	closed = true
+	if !core.Calls.LocalStopped() {
+		t.Fatal("storage read failure prevented invocation workers from stopping")
+	}
+	store.SetErrors(nil, nil)
+	status := readStatus(t, core)
+	if status.Lifecycle.Value.State == c.Succeeded || !status.LocalStopped {
+		t.Fatalf("unreadable shutdown was marked successful: %+v", status)
+	}
+}
+
+func checkReadyFailure(t *testing.T, core *host.Core, code string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/ready", nil)
+	req.Host = "127.0.0.1:7350"
+	req.RemoteAddr = "127.0.0.1:12345"
+	response := httptest.NewRecorder()
+	core.Handler().ServeHTTP(response, req)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("/ready status=%d, want 503", response.Code)
+	}
+	var body struct {
+		Ready bool     `json:"ready"`
+		Error *c.Fault `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Ready || body.Error == nil || body.Error.Code != code {
+		t.Fatalf("/ready did not expose a safe failure: %+v", body)
 	}
 }
 
@@ -219,11 +388,11 @@ func TestAbortExpectedInstanceMismatchRejectsBeforeConnector(t *testing.T) {
 	if c.AsFault(err).Code != "conflict" {
 		t.Fatalf("expected instance conflict, got %v", err)
 	}
-	_, err = core.Commands.Execute(context.Background(), "calls.abort", json.RawMessage(`{"id":"fenced-call","reason":"operator_intervention","expected_revision":9007199254740992,"expected_instance_id":"`+core.Status().InstanceID+`"}`))
+	_, err = core.Commands.Execute(context.Background(), "calls.abort", json.RawMessage(`{"id":"fenced-call","reason":"operator_intervention","expected_revision":9007199254740992,"expected_instance_id":"`+readStatus(t, core).InstanceID+`"}`))
 	if c.AsFault(err).Code != "invalid" {
 		t.Fatalf("unsafe JavaScript revision must be rejected before connector Abort, got %v", err)
 	}
-	_, err = core.Commands.Execute(context.Background(), "calls.abort", json.RawMessage(`{"id":"fenced-call","reason":"operator_intervention","expected_revision":0,"expected_instance_id":"`+core.Status().InstanceID+`"}`))
+	_, err = core.Commands.Execute(context.Background(), "calls.abort", json.RawMessage(`{"id":"fenced-call","reason":"operator_intervention","expected_revision":0,"expected_instance_id":"`+readStatus(t, core).InstanceID+`"}`))
 	if c.AsFault(err).Code != "invalid" {
 		t.Fatalf("zero expected revision must be rejected before connector Abort, got %v", err)
 	}
@@ -251,7 +420,7 @@ func TestParentCancellationClosesAndManualCloseReturnsCachedOutcome(t *testing.T
 	if err := core.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	status := core.Status()
+	status := readStatus(t, core)
 	if !status.LocalStopped || status.Lifecycle.Value.State != c.Succeeded {
 		t.Fatalf("parent cancellation did not finish core: %+v", status)
 	}
@@ -301,8 +470,8 @@ func TestDrainCompletesAcceptedConversationWithoutNewFanout(t *testing.T) {
 	if err != nil || len(view.Messages) != 2 || view.Messages[1].Result == nil || view.Messages[1].Result.State != c.Succeeded {
 		t.Fatalf("accepted reply was not retained: %+v %v", view, err)
 	}
-	if len(message.CallIDs) != 1 || len(core.Calls.List()) != 1 {
-		t.Fatalf("drain created a fanout call: message=%+v calls=%d", message, len(core.Calls.List()))
+	if len(message.CallIDs) != 1 || len(readCalls(t, core)) != 1 {
+		t.Fatalf("drain created a fanout call: message=%+v calls=%d", message, len(readCalls(t, core)))
 	}
 }
 
@@ -360,7 +529,7 @@ func TestDrainPreservesWaitingAndUnknownCallEvidence(t *testing.T) {
 			if err == nil || c.AsFault(err).Code != "shutdown_incomplete" {
 				t.Fatalf("want shutdown_incomplete, got %v", err)
 			}
-			status := core.Status()
+			status := readStatus(t, core)
 			if status.Lifecycle.Value.State != c.Unknown || len(status.UnresolvedCallIDs) != 1 || status.UnresolvedCallIDs[0] != call.Value.Call.ID || !status.LocalStopped {
 				t.Fatalf("unresolved evidence lost: %+v", status)
 			}
@@ -369,51 +538,90 @@ func TestDrainPreservesWaitingAndUnknownCallEvidence(t *testing.T) {
 }
 
 func TestCloseDeadlineWithUncooperativeConnectorIsBounded(t *testing.T) {
-	release := make(chan struct{})
-	t.Cleanup(func() {
-		select {
-		case <-release:
-		default:
-			close(release)
+	for _, injectReadError := range []bool{false, true} {
+		name := "without_read_error"
+		if injectReadError {
+			name = "preserves_first_read_error"
 		}
-	})
-	drain := &drainConnector{entered: make(chan struct{}), release: release}
-	core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": drain}, Workers: 1, Authority: testAuthority(t, "A")})
-	if err != nil {
-		t.Fatal(err)
+		t.Run(name, func(t *testing.T) {
+			release := make(chan struct{})
+			t.Cleanup(func() {
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+			})
+			drain := &drainConnector{entered: make(chan struct{}), release: release}
+			root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 4, Calls: 8, Queue: 8})
+			store := &faultExecutionStore{ExecutionStore: root.Executions(), listFailures: make(chan struct{}, 1)}
+			core, err := host.New(context.Background(), host.Options{
+				Connectors: map[string]c.Connector{"fake": drain}, Workers: 1, Authority: testAuthority(t, "A"),
+				Storage: &host.Storage{Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: store, Admissions: root.Admissions()},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := core.Catalog.Register(context.Background(), c.Registration{ID: "A", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+				t.Fatal(err)
+			}
+			call := execute[c.Snapshot[c.Execution]](t, core, "calls.submit", c.Call{ID: "slow", Target: node("A"), Operation: "run", Input: c.Data{"text": "slow"}})
+			select {
+			case <-drain.entered:
+			case <-time.After(time.Second):
+				t.Fatal("call did not enter connector")
+			}
+			queued := execute[c.Snapshot[c.Execution]](t, core, "calls.submit", c.Call{ID: "queued", Target: node("A"), Operation: "run", Input: c.Data{"text": "queued"}})
+			if queued.Value.Lifecycle.State != c.Queued {
+				t.Fatalf("expected second call to remain queued: %+v", queued)
+			}
+			started := time.Now()
+			ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+			var closeErr error
+			if injectReadError {
+				readErr := c.Err("storage_read", "injected one-shot call-list failure")
+				store.SetListErrorOnce(readErr)
+				closeResult := make(chan error, 1)
+				go func() { closeResult <- core.Close(ctx) }()
+				select {
+				case <-store.listFailures:
+				case <-time.After(time.Second):
+					t.Fatal("Close did not observe the injected list failure")
+				}
+				closeErr = <-closeResult
+				if closeErr != readErr {
+					t.Fatalf("Close error=%v, want first list error %v despite the later deadline", closeErr, readErr)
+				}
+			} else {
+				closeErr = core.Close(ctx)
+				if closeErr == nil || c.AsFault(closeErr).Code != "shutdown_timeout" {
+					t.Fatalf("want shutdown_timeout, got %v", closeErr)
+				}
+			}
+			cancel()
+			if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+				t.Fatalf("close exceeded bounded deadline: %s", elapsed)
+			}
+			status := readStatus(t, core)
+			if status.Lifecycle.Value.State != c.Unknown || status.LocalStopped {
+				t.Fatalf("timeout facts were not preserved: %+v", status)
+			}
+			unresolvedSlow := false
+			for _, id := range status.UnresolvedCallIDs {
+				unresolvedSlow = unresolvedSlow || id == call.Value.Call.ID
+			}
+			if !unresolvedSlow {
+				t.Fatalf("active call disappeared from unresolved evidence: %+v", status.UnresolvedCallIDs)
+			}
+			if !injectReadError {
+				queuedAfter, err := core.Calls.Get(queued.Value.Call.ID)
+				if err != nil || queuedAfter.Value.Lifecycle.State != c.Cancelled {
+					t.Fatalf("queued call was not locally cancelled: %+v %v", queuedAfter, err)
+				}
+			}
+			close(release)
+		})
 	}
-	if _, err := core.Catalog.Register(context.Background(), c.Registration{ID: "A", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
-		t.Fatal(err)
-	}
-	call := execute[c.Snapshot[c.Execution]](t, core, "calls.submit", c.Call{ID: "slow", Target: node("A"), Operation: "run", Input: c.Data{"text": "slow"}})
-	select {
-	case <-drain.entered:
-	case <-time.After(time.Second):
-		t.Fatal("call did not enter connector")
-	}
-	queued := execute[c.Snapshot[c.Execution]](t, core, "calls.submit", c.Call{ID: "queued", Target: node("A"), Operation: "run", Input: c.Data{"text": "queued"}})
-	if queued.Value.Lifecycle.State != c.Queued {
-		t.Fatalf("expected second call to remain queued: %+v", queued)
-	}
-	started := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
-	err = core.Close(ctx)
-	cancel()
-	if err == nil || c.AsFault(err).Code != "shutdown_timeout" {
-		t.Fatalf("want shutdown_timeout, got %v", err)
-	}
-	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
-		t.Fatalf("close exceeded bounded deadline: %s", elapsed)
-	}
-	status := core.Status()
-	if status.Lifecycle.Value.State != c.Unknown || status.LocalStopped || len(status.UnresolvedCallIDs) != 1 || status.UnresolvedCallIDs[0] != call.Value.Call.ID {
-		t.Fatalf("timeout facts were not preserved: %+v", status)
-	}
-	queuedAfter, err := core.Calls.Get(queued.Value.Call.ID)
-	if err != nil || queuedAfter.Value.Lifecycle.State != c.Cancelled {
-		t.Fatalf("queued call was not locally cancelled: %+v %v", queuedAfter, err)
-	}
-	close(release)
 }
 
 func TestSecondCloseCallerDeadlineOnlyEndsItsWait(t *testing.T) {
@@ -469,8 +677,34 @@ func TestSecondCloseCallerDeadlineOnlyEndsItsWait(t *testing.T) {
 		t.Fatal("owner Close did not finish after connector release")
 	}
 	ownerCancel()
-	if status := core.Status(); status.Lifecycle.Value.State != c.Succeeded || !status.LocalStopped {
+	if status := readStatus(t, core); status.Lifecycle.Value.State != c.Succeeded || !status.LocalStopped {
 		t.Fatalf("owner's cached outcome was not retained: %+v", status)
+	}
+}
+
+func TestCloseIgnoresBestEffortUnsupportedAbortWhenInvokeCompletes(t *testing.T) {
+	d := &cancellationSuccessConnector{entered: make(chan struct{})}
+	core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": d}, Workers: 1, Authority: testAuthority(t, "A")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.Catalog.Register(context.Background(), c.Registration{ID: "A", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	execute[c.Snapshot[c.Execution]](t, core, "calls.submit", c.Call{ID: "close-success", Target: node("A"), Operation: "run", Input: c.Data{"text": "ok"}})
+	select {
+	case <-d.entered:
+	case <-time.After(time.Second):
+		t.Fatal("call did not enter connector")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	if err := core.Close(ctx); err != nil {
+		t.Fatalf("best-effort unsupported Abort changed completed shutdown: %v", err)
+	}
+	snap, err := core.Calls.Get("close-success")
+	if err != nil || snap.Value.Lifecycle.State != c.Succeeded {
+		t.Fatalf("expected actual terminal success, got %+v %v", snap, err)
 	}
 }
 func execute[T any](t *testing.T, core *host.Core, name string, input any) T {
@@ -547,7 +781,7 @@ func TestNodeEventUsesCommonQueueAndJournal(t *testing.T) {
 	if !seenA || !seenB || !published {
 		t.Fatalf("shared journal missing A=%v B=%v published=%v", seenA, seenB, published)
 	}
-	if len(core.Calls.List()) != 2 {
+	if len(readCalls(t, core)) != 2 {
 		t.Fatal("unexpected event loop")
 	}
 }
@@ -583,7 +817,7 @@ func TestConversationOneToOneAndMeetingExport(t *testing.T) {
 			}
 		}
 	}
-	if len(core.Calls.List()) != 3 {
+	if len(readCalls(t, core)) != 3 {
 		t.Fatal("conversation replies triggered extra calls")
 	}
 }

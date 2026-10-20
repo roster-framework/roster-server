@@ -83,7 +83,7 @@ type Connector interface {
 
 type Store[T any] interface {
 	Get(Ref) (Snapshot[T], error)
-	List() []Snapshot[T]
+	List() ([]Snapshot[T], error)
 	Apply(Change[T]) (Snapshot[T], error)
 }
 type Validator interface {
@@ -175,7 +175,7 @@ type ExecutionMutation struct {
 type Outbox interface {
 	PendingDeliveries(limit int) ([]Delivery, error)
 	AckDelivery(id string) error
-	PendingDeliveryCount() int
+	PendingDeliveryCount() (int, error)
 }
 type EventRecorder interface {
 	Record(Event) error

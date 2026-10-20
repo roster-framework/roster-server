@@ -100,7 +100,7 @@ func (o *orderedOutbox) AckDelivery(id string) error {
 	}
 	return c.Err("not_found", "delivery missing")
 }
-func (o *orderedOutbox) PendingDeliveryCount() int { return len(o.deliveries) }
+func (o *orderedOutbox) PendingDeliveryCount() (int, error) { return len(o.deliveries), nil }
 
 func (o *flakyAckOutbox) PendingDeliveries(limit int) ([]c.Delivery, error) {
 	if o.acked || limit < 1 {
@@ -116,11 +116,11 @@ func (o *flakyAckOutbox) AckDelivery(string) error {
 	o.acked = true
 	return nil
 }
-func (o *flakyAckOutbox) PendingDeliveryCount() int {
+func (o *flakyAckOutbox) PendingDeliveryCount() (int, error) {
 	if o.acked {
-		return 0
+		return 0, nil
 	}
-	return 1
+	return 1, nil
 }
 
 func TestDrainReplayAfterAckLossAndJournalRingEviction(t *testing.T) {
@@ -128,11 +128,11 @@ func TestDrainReplayAfterAckLossAndJournalRingEviction(t *testing.T) {
 	ev := c.Event{ID: "stable-log", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "log", Category: "observation", Payload: c.Data{"text": "same"}}
 	outbox := &flakyAckOutbox{delivery: c.Delivery{ID: ev.ID, Event: &ev}}
 	drain := event.New(nil, nil, nil, j, nil)
-	if err := drain.Drain(outbox, j, nil); err == nil || outbox.PendingDeliveryCount() != 1 {
+	if err := drain.Drain(outbox, j, nil); err == nil || mustPendingCount(t, outbox) != 1 {
 		t.Fatal("simulated ACK loss did not retain delivery")
 	}
 	j.Append(c.Event{ID: "evict", Name: "other", Category: "observation", Payload: c.Data{}})
-	if err := drain.Drain(outbox, j, nil); err != nil || outbox.PendingDeliveryCount() != 0 {
+	if err := drain.Drain(outbox, j, nil); err != nil || mustPendingCount(t, outbox) != 0 {
 		t.Fatalf("replay failed: %v", err)
 	}
 	page, err := j.Query(observation.Filter{})
@@ -148,7 +148,7 @@ func TestTerminalCallbackErrorRetainsOriginalEnvelopeForRetry(t *testing.T) {
 	outbox := &orderedOutbox{deliveries: []c.Delivery{d}}
 	drain := event.New(nil, nil, nil, j, nil)
 	callbackErr := errors.New("reply commit failed")
-	if err := drain.Drain(outbox, j, func(c.Delivery) error { return callbackErr }); err != callbackErr || len(outbox.acked) != 0 || outbox.PendingDeliveryCount() != 1 {
+	if err := drain.Drain(outbox, j, func(c.Delivery) error { return callbackErr }); err != callbackErr || len(outbox.acked) != 0 || mustPendingCount(t, outbox) != 1 {
 		t.Fatalf("callback failure ACKed terminal delivery: err=%v acked=%v", err, outbox.acked)
 	}
 	if err := drain.Drain(outbox, j, func(got c.Delivery) error {
@@ -156,7 +156,7 @@ func TestTerminalCallbackErrorRetainsOriginalEnvelopeForRetry(t *testing.T) {
 			return c.Err("conflict", "envelope changed")
 		}
 		return nil
-	}); err != nil || len(outbox.acked) != 1 || outbox.PendingDeliveryCount() != 0 {
+	}); err != nil || len(outbox.acked) != 1 || mustPendingCount(t, outbox) != 0 {
 		t.Fatalf("terminal callback retry failed: err=%v acked=%v", err, outbox.acked)
 	}
 }
@@ -335,7 +335,7 @@ func TestTwentyEmissionsAndReplyDrainWhenGeneralOutboxIsFull(t *testing.T) {
 		default:
 		}
 		view, e := sessions.Get(conv.ID, 0, 100)
-		if e == nil && len(view.Messages) == 2 && root.Executions().PendingDeliveryCount() == 0 {
+		if e == nil && len(view.Messages) == 2 && mustPendingCount(t, root.Executions()) == 0 {
 			close(stopDrain)
 			page, queryErr := j.Query(observation.Filter{ConversationID: conv.ID, Limit: 100})
 			if queryErr != nil {
@@ -368,7 +368,7 @@ func TestTwentyEmissionsAndReplyDrainWhenGeneralOutboxIsFull(t *testing.T) {
 	}
 	close(stopDrain)
 	view, _ = sessions.Get(conv.ID, 0, 100)
-	t.Fatalf("reserved emission/reply intents did not drain: messages=%d pending=%d", len(view.Messages), root.Executions().PendingDeliveryCount())
+	t.Fatalf("reserved emission/reply intents did not drain: messages=%d pending=%d", len(view.Messages), mustPendingCount(t, root.Executions()))
 }
 
 func countGeneralDeliveries(outbox c.Outbox) (int, error) {
@@ -401,14 +401,14 @@ func TestDrainRejectsFanoutDuringShutdownBeforeTerminalReply(t *testing.T) {
 	if err := events.Drain(outbox, j, func(c.Delivery) error { replied++; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if replied != 1 || outbox.PendingDeliveryCount() != 0 || len(outbox.acked) != 2 || outbox.acked[0] != published.ID || outbox.acked[1] != "terminal-reply" {
-		t.Fatalf("shutdown fanout blocked the terminal reply: replies=%d acked=%v pending=%d", replied, outbox.acked, outbox.PendingDeliveryCount())
+	if replied != 1 || mustPendingCount(t, outbox) != 0 || len(outbox.acked) != 2 || outbox.acked[0] != published.ID || outbox.acked[1] != "terminal-reply" {
+		t.Fatalf("shutdown fanout blocked the terminal reply: replies=%d acked=%v pending=%d", replied, outbox.acked, mustPendingCount(t, outbox))
 	}
 	page, err := j.Query(observation.Filter{CallID: "origin"})
 	if err != nil || len(page.Entries) != 1 || page.Entries[0].Event.Name != "event.rejected" || page.Entries[0].Event.Payload["code"] != "busy" {
 		t.Fatalf("draining rejection was not audited: %+v %v", page, err)
 	}
-	if len(calls.List()) != 0 {
+	if len(mustList(t, calls)) != 0 {
 		t.Fatal("draining event created a downstream call")
 	}
 }
@@ -438,7 +438,7 @@ func TestEventAtomicFanoutAndIdempotentSnapshot(t *testing.T) {
 	e := c.Event{ID: "event", Source: sub.Source, Name: "complete", Category: "published", OccurredAt: c.Now(), Payload: c.Data{"summary": "ready"}}
 	_, err = events.Publish(e, sourceOrigin("spoofed-source"))
 	fault(t, err, "forbidden")
-	if len(calls.List()) != 0 {
+	if len(mustList(t, calls)) != 0 {
 		t.Fatal("event payload source replaced the server-derived origin")
 	}
 	ids, err := events.Publish(e, directOrigin())
@@ -456,7 +456,7 @@ func TestEventAtomicFanoutAndIdempotentSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	again, err := events.Publish(e, directOrigin())
-	if err != nil || len(again) != 1 || again[0] != ids[0] || len(calls.List()) != 1 {
+	if err != nil || len(again) != 1 || again[0] != ids[0] || len(mustList(t, calls)) != 1 {
 		t.Fatalf("retry reevaluated subscriptions %v %v", again, err)
 	}
 	_, err = events.Publish(e, sourceOrigin("node"))
@@ -479,14 +479,14 @@ func TestEventAtomicFanoutAndIdempotentSnapshot(t *testing.T) {
 	e.ID = "retry"
 	_, err = events.Publish(e, directOrigin())
 	fault(t, err, "invalid_input")
-	if len(calls.List()) != 1 {
+	if len(mustList(t, calls)) != 1 {
 		t.Fatal("fanout partially submitted")
 	}
 	if _, err = events.Remove(sub.ID, bad.Revision); err != nil {
 		t.Fatal(err)
 	}
 	ids, err = events.Publish(e, directOrigin())
-	if err != nil || len(ids) != 1 || len(calls.List()) != 2 {
+	if err != nil || len(ids) != 1 || len(mustList(t, calls)) != 2 {
 		t.Fatalf("failed event could not retry %v %v", ids, err)
 	}
 	e.ID = "log"
@@ -510,7 +510,7 @@ func TestConversationScopeRetryAndLateReply(t *testing.T) {
 	outsider.Recipients = []c.Ref{{Namespace: "nodes", ID: "outsider"}}
 	_, err = sessions.Send(outsider, directOrigin())
 	fault(t, err, "invalid_input")
-	if len(calls.List()) != 0 {
+	if len(mustList(t, calls)) != 0 {
 		t.Fatal("outsider delivery was submitted")
 	}
 	bad := c.Clone(req)
@@ -522,7 +522,7 @@ func TestConversationScopeRetryAndLateReply(t *testing.T) {
 		t.Fatalf("send %+v %v", message, err)
 	}
 	duplicate, err := sessions.Send(req, directOrigin())
-	if err != nil || duplicate.ID != message.ID || len(calls.List()) != 1 {
+	if err != nil || duplicate.ID != message.ID || len(mustList(t, calls)) != 1 {
 		t.Fatal("duplicate message called recipient again")
 	}
 	conflict := c.Clone(req)
@@ -576,7 +576,7 @@ func TestConversationScopeRetryAndLateReply(t *testing.T) {
 		t.Fatalf("late reply missing/duplicated %+v %v", view, err)
 	}
 	reply := view.Messages[1]
-	if reply.ReplyTo != message.ID || reply.Author != recipient || reply.CallIDs[0] != message.CallIDs[0] || len(calls.List()) != 1 {
+	if reply.ReplyTo != message.ID || reply.Author != recipient || reply.CallIDs[0] != message.CallIDs[0] || len(mustList(t, calls)) != 1 {
 		t.Fatalf("invalid reply %+v", reply)
 	}
 	// A queued cancellation completes independently of closing the session.
