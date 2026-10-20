@@ -61,6 +61,27 @@ Calls use `calls.submit`, `calls.get`, `calls.list`, `calls.inspect`, and `calls
 
 This policy file contains no credentials. A disconnect or timeout can leave a Call `unknown`; inspect the same receipt before deciding what to do. Registering a provider does not prove it is reachable. A subscription declaration configures future event routing but does not prove delivery. Verify the Event receipt and resulting Call evidence in Core logs. Removing a subscription does not cancel existing Calls.
 
+## Configure scheduling
+
+Add this top-level fragment to the Core JSON passed to `serve --config <file>`. The same file's `nodes` must declare a Node with ID `runtime`; replace that ID below if yours differs. This is a scheduling fragment, not a complete Node configuration.
+
+```json
+{
+  "scheduling": {
+    "global_waiting": 128,
+    "global_possible": 16,
+    "aging_after_seconds": 30,
+    "targets": [
+      { "node_id": "runtime", "weight": 2, "waiting": 32, "possible": 4, "active": 2 }
+    ]
+  }
+}
+```
+
+Without overrides, defaults are 256 waiting and 64 possibly executing Calls globally, with aging after 30 seconds; each Node has weight 1, 64 waiting, 4 possible, and 2 active with the default 8 workers. Smaller global or worker limits clamp omitted defaults. Unknown or duplicate target IDs and explicitly invalid values reject startup. Scheduling is validated before work starts and stays fixed until restart.
+
+Core interleaves weighted selection turns across eligible Nodes. Within a Node, aged feasible Calls come first in original admission order; otherwise the earliest deadline comes first. Weights govern selection turns, not provider execution time. `possible` stays occupied for `unknown` Calls and cancellation acknowledgements until termination is confirmed. `active` counts local prepare/Invoke worker assignments until they actually return. Saturated limits can delay dispatch; the scheduler cannot preempt an uncooperative provider. Inspect `core.status` → `scheduling` for waiting/possible/physical counts, oldest wait, and each active target's blocking reasons.
+
 ## Import a community bundle
 
 A community package can declare Nodes and subscriptions for explicit operator import. Install an exact package version in a dedicated provider workspace without running install scripts, then run its provider separately:
@@ -90,7 +111,7 @@ node dashboard/build/src/cli.js deployment apply --file <deployment.json> --expe
 Run module checks from `core/` and `log/` separately in Docker:
 
 ```sh
-docker run --rm -v "$PWD:/src:ro" -w /src golang:1.26 go test ./...
+docker run --rm -v "$PWD:/src:ro" -w /src golang:1.26.10 go test ./...
 ```
 
 Run the dashboard suite from `dashboard/` with `npm test`. To exercise real Runtime and Resource HTTP, subscriptions, one-to-one replies, and a group conversation without a model call, first build `../roster-node-client/runtime`, then run this isolated Docker fixture from the repository root:

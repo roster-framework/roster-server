@@ -156,6 +156,20 @@ func requireJSONEOF(dec *json.Decoder) error {
 	return nil
 }
 
+// StorageFailure marks a storage-boundary failure while retaining the cause
+// for internal errors.Is/errors.As checks. Its cause is not public data.
+type StorageFailure struct {
+	Cause error `json:"-"`
+}
+
+func (*StorageFailure) Error() string { return "Storage operation failed" }
+func (e *StorageFailure) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
 type Fault struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
@@ -164,6 +178,10 @@ type Fault struct {
 func (e *Fault) Error() string       { return e.Code + ": " + e.Message }
 func Err(code, message string) error { return &Fault{code, message} }
 func AsFault(err error) *Fault {
+	var storageFailure *StorageFailure
+	if errors.As(err, &storageFailure) {
+		return &Fault{"storage", "Storage operation failed"}
+	}
 	var f *Fault
 	if errors.As(err, &f) {
 		return f

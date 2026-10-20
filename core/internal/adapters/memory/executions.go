@@ -1,7 +1,6 @@
 package memory
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -27,7 +26,6 @@ type deliveryReceipt struct {
 // Executions owns records, queue admission and delivery intent under the same locks.
 type Executions struct {
 	records          *Store[c.Execution]
-	queue            *Queue
 	outboxMu         sync.Mutex
 	pending          []c.Delivery
 	pendingSlots     map[string]c.PendingObservation
@@ -41,18 +39,18 @@ type Executions struct {
 	root             *Root
 }
 
-func NewExecutions(records, queue int) *Executions {
-	return newExecutions(newStore[c.Execution](records, c.CopyExecution), queue, nil)
+func NewExecutions(records int) *Executions {
+	return NewRoot(Limits{Calls: records}).executions
 }
-func newExecutions(store *Store[c.Execution], queue int, root *Root) *Executions {
+func newExecutions(store *Store[c.Execution], root *Root) *Executions {
 	storeID, err := newStoreID()
 	if err != nil {
 		panic("generate memory store identity: " + err.Error())
 	}
-	return newExecutionsWithID(store, queue, root, storeID)
+	return newExecutionsWithID(store, root, storeID)
 }
-func newExecutionsWithID(store *Store[c.Execution], queue int, root *Root, storeID string) *Executions {
-	return &Executions{records: store, queue: NewQueue(queue), pending: []c.Delivery{}, pendingSlots: map[string]c.PendingObservation{}, receipts: map[string]deliveryReceipt{}, terminalReceipts: map[string]deliveryReceipt{}, reserved: map[string]int{}, deliverySequence: map[string]uint64{}, storeID: storeID, root: root}
+func newExecutionsWithID(store *Store[c.Execution], root *Root, storeID string) *Executions {
+	return &Executions{records: store, pending: []c.Delivery{}, pendingSlots: map[string]c.PendingObservation{}, receipts: map[string]deliveryReceipt{}, terminalReceipts: map[string]deliveryReceipt{}, reserved: map[string]int{}, deliverySequence: map[string]uint64{}, storeID: storeID, root: root}
 }
 func newStoreID() (string, error) {
 	var entropy [32]byte
@@ -61,10 +59,38 @@ func newStoreID() (string, error) {
 	}
 	return c.ID("memory-store/1", hex.EncodeToString(entropy[:])), nil
 }
-func (s *Executions) Claim(ctx context.Context) (string, error) { return s.queue.Claim(ctx) }
+func (s *Executions) ReadScheduling() (c.SchedulingView, <-chan struct{}, error) {
+	if s.root == nil {
+		return c.SchedulingView{}, nil, c.Err("internal", "Scheduling root is unavailable")
+	}
+	return s.root.ReadScheduling()
+}
+
+func (s *Executions) ReadQueueFacts() ([]c.QueueFact, uint64, uint64, error) {
+	if s.root == nil {
+		return nil, 0, 0, c.Err("invalid_input", "Queue recovery requires a shared Root")
+	}
+	return s.root.ReadQueueFacts()
+}
 
 func (s *Executions) Get(ref c.Ref) (c.Snapshot[c.Execution], error) { return s.records.Get(ref) }
 func (s *Executions) List() ([]c.Snapshot[c.Execution], error)       { return s.records.List() }
+func (s *Executions) ReadSummaries() ([]c.ExecutionSummary, error) {
+	s.records.mu.RLock()
+	defer s.records.mu.RUnlock()
+	if len(s.records.entries) > 1000 {
+		return nil, c.Err("internal", "Execution summary capacity exceeded")
+	}
+	out := make([]c.ExecutionSummary, 0, len(s.records.entries))
+	for _, snap := range s.records.entries {
+		out = append(out, c.ExecutionSummary{
+			Call:  c.RevisionRef{Subject: snap.Subject, Revision: snap.Revision},
+			State: snap.Value.Lifecycle.State,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Call.Subject.Key() < out[j].Call.Subject.Key() })
+	return out, nil
+}
 func (s *Executions) CommitAdmission(admission c.AdmissionCommit) error {
 	if admission.Effect != nil {
 		staged, err := copyAdmissionEffect(*admission.Effect)
@@ -84,8 +110,6 @@ func (s *Executions) CommitAdmission(admission c.AdmissionCommit) error {
 	}
 	s.records.mu.Lock()
 	defer s.records.mu.Unlock()
-	s.queue.mu.Lock()
-	defer s.queue.mu.Unlock()
 	s.outboxMu.Lock()
 	defer s.outboxMu.Unlock()
 	staged := map[string]c.Snapshot[c.Execution]{}
@@ -118,13 +142,8 @@ func (s *Executions) CommitAdmission(admission c.AdmissionCommit) error {
 		}
 		staged[key] = c.Snapshot[c.Execution]{Subject: ch.Subject, Revision: ch.AfterRevision, Value: c.CopyExecution(ch.After)}
 	}
-	if len(s.records.entries)+len(staged) > s.records.capacity || len(ids) > cap(s.queue.pending)-len(s.queue.pending) {
-		return c.Err("busy", "Call record or queue capacity exhausted")
-	}
-	for _, v := range staged {
-		if v.Value.Lifecycle.State != c.Queued {
-			return c.Err("invalid_input", "Batch must end at queued")
-		}
+	if len(s.records.entries)+len(staged) > s.records.capacity {
+		return c.Err("busy", "Call record capacity exhausted")
 	}
 	if admission.Effect != nil {
 		if s.records.root == nil {
@@ -133,6 +152,17 @@ func (s *Executions) CommitAdmission(admission c.AdmissionCommit) error {
 		if err := s.records.root.validateEffectLocked(admission.Effect, newCalls); err != nil {
 			return err
 		}
+	}
+	if s.records.root != nil {
+		if len(newCalls) > 0 {
+			if err := s.records.root.validateAdmissionQueueLocked(changes, admission.Queue, newCalls, admission.Scheduling); err != nil {
+				return err
+			}
+		} else if len(admission.Queue) != 0 || admission.Scheduling != nil {
+			return c.Err("invalid_input", "Queue metadata requires admitted calls")
+		}
+	} else if len(admission.Queue) != 0 || len(newCalls) != 0 {
+		return c.Err("internal", "Admission scheduling root is unavailable")
 	}
 	if err := s.checkDeliveriesLocked(allDeliveries, newCalls); err != nil {
 		return err
@@ -144,11 +174,11 @@ func (s *Executions) CommitAdmission(admission c.AdmissionCommit) error {
 		s.reserved[id] = terminalDeliveryReservation
 	}
 	s.appendDeliveriesLocked(allDeliveries, newCalls)
+	if len(newCalls) > 0 {
+		s.records.root.applyAdmissionQueueLocked(admission.Queue)
+	}
 	if admission.Effect != nil {
 		s.records.root.commitEffectLocked(admission.Effect)
-	}
-	for _, id := range ids {
-		s.queue.pending <- id
 	}
 	return nil
 }
@@ -193,10 +223,22 @@ func (s *Executions) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], err
 		return c.Snapshot[c.Execution]{}, c.Err("invalid_input", "Node revision requires a dispatch change")
 	}
 	if len(m.Changes) == 0 {
+		queueChanged := false
+		if m.Queue != nil || m.Scheduling != nil {
+			if s.records.root == nil {
+				return c.Snapshot[c.Execution]{}, c.Err("internal", "Scheduling root is unavailable")
+			}
+			var queueErr error
+			queueChanged, queueErr = s.records.root.validateExecutionQueueLocked(m.Subject, old.Value, old.Value, m.Queue, m.Scheduling)
+			if queueErr != nil {
+				return c.Snapshot[c.Execution]{}, queueErr
+			}
+		}
 		if err := s.checkDeliveriesLocked(deliveries, nil); err != nil {
 			return c.Snapshot[c.Execution]{}, err
 		}
 		s.appendDeliveriesLocked(deliveries, nil)
+		s.records.root.applyExecutionQueueLocked(m.Queue, m.Scheduling, queueChanged)
 		if m.Pending != nil {
 			s.applyPendingLocked(*m.Pending)
 		}
@@ -226,11 +268,26 @@ func (s *Executions) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execution], err
 		}
 		current = c.Snapshot[c.Execution]{Subject: ch.Subject, Revision: ch.AfterRevision, Value: c.CopyExecution(ch.After)}
 	}
+	if m.NodeRevision != nil && m.Queue != nil && (m.Queue.CallID != m.Subject.ID || m.Queue.Present || !m.Queue.SlotHeld) {
+		return c.Snapshot[c.Execution]{}, c.Err("invalid_input", "Dispatch commit has an invalid possible slot fact")
+	}
+	queueChanged := false
+	if m.Queue != nil || m.Scheduling != nil {
+		if s.records.root == nil {
+			return c.Snapshot[c.Execution]{}, c.Err("internal", "Scheduling root is unavailable")
+		}
+		var queueErr error
+		queueChanged, queueErr = s.records.root.validateExecutionQueueLocked(m.Subject, old.Value, current.Value, m.Queue, m.Scheduling)
+		if queueErr != nil {
+			return c.Snapshot[c.Execution]{}, queueErr
+		}
+	}
 	if err := s.checkDeliveriesLocked(deliveries, nil); err != nil {
 		return c.Snapshot[c.Execution]{}, err
 	}
 	s.records.entries[m.Subject.Key()] = s.records.copy(current)
 	s.appendDeliveriesLocked(deliveries, nil)
+	s.records.root.applyExecutionQueueLocked(m.Queue, m.Scheduling, queueChanged)
 	if m.Pending != nil {
 		s.applyPendingLocked(*m.Pending)
 	}
@@ -242,6 +299,10 @@ func (s *Executions) validateDispatchLocked(before, after c.Execution, carrier c
 	callSame, callErr := canonicalCallEqual(before.Call, after.Call)
 	if s.records.root == nil || dispatch == nil || before.Dispatch != nil || callErr != nil || !callSame || before.Origin != after.Origin {
 		return c.Err("invalid_input", "Dispatch identity is not a new immutable execution identity")
+	}
+	queue, ok := s.records.root.queueFacts[after.Call.ID]
+	if !ok || queue.present || !queue.slotHeld {
+		return c.Err("conflict", "Dispatch possible slot is not held")
 	}
 	target := after.Call.Target
 	if carrier.Subject.Namespace != "nodes" || carrier.Subject != target || carrier.Subject.ID != dispatch.NodeID || dispatch.NodeRevision != carrier.Revision || dispatch.ConnectorID == "" || dispatch.BindingDigest == "" || dispatch.RemoteID != after.Call.ID {

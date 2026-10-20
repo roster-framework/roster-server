@@ -66,7 +66,14 @@ func run() (runErr error) {
 			return errors.New("invalid authority policy")
 		}
 	}
-	core, err := host.New(context.Background(), host.Options{Authority: authPolicy})
+	var initialConfig *host.Config
+	if *config != "" {
+		initialConfig, err = readInitialConfig(*config)
+		if err != nil {
+			return err
+		}
+	}
+	core, err := host.New(ctx, host.Options{Authority: authPolicy, InitialConfig: initialConfig})
 	if err != nil {
 		return err
 	}
@@ -79,35 +86,6 @@ func run() (runErr error) {
 		defer cancel()
 		runErr = errors.Join(runErr, core.Close(shutdown))
 	}()
-	if *config != "" {
-		file, err := os.Open(*config)
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-		raw, readErr := io.ReadAll(io.LimitReader(file, 65537))
-		if readErr != nil || len(raw) > 65536 {
-			return errors.New("configuration exceeds 64 KiB")
-		}
-		if c.CheckJSONNumbers(raw) != nil {
-			return errors.New("configuration contains an unsupported JSON number")
-		}
-		decoder := json.NewDecoder(bytes.NewReader(raw))
-		decoder.UseNumber()
-		decoder.DisallowUnknownFields()
-		var initial host.Config
-		if err = decoder.Decode(&initial); err != nil {
-			return err
-		}
-		if err = decoder.Decode(new(any)); err != io.EOF {
-			return errors.New("configuration must contain one JSON object")
-		}
-		setup, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		if err = core.Configure(setup, initial); err != nil {
-			return err
-		}
-	}
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return err
@@ -134,4 +112,37 @@ func run() (runErr error) {
 		}
 		return errors.Join(closeErr, shutdownErr)
 	}
+}
+
+func readInitialConfig(path string) (*host.Config, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	raw, readErr := io.ReadAll(io.LimitReader(file, 65537))
+	if readErr != nil {
+		return nil, errors.New("could not read configuration")
+	}
+	if len(raw) > 65536 {
+		return nil, errors.New("configuration exceeds 64 KiB")
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, errors.New("configuration must contain one JSON object")
+	}
+	if c.CheckJSONNumbers(raw) != nil {
+		return nil, errors.New("configuration contains an unsupported JSON number")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	decoder.DisallowUnknownFields()
+	var initial host.Config
+	if err := decoder.Decode(&initial); err != nil {
+		return nil, err
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return nil, errors.New("configuration must contain one JSON object")
+	}
+	return &initial, nil
 }

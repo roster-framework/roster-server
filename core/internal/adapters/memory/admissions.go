@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"sort"
 	"sync"
 
 	c "github.com/roster-framework/roster-server/core/internal/contracts"
@@ -21,25 +22,36 @@ type Root struct {
 	replyReceipts           map[string]string
 	messageOrder            map[string][]string
 	reserved                map[string]int
+	queueFacts              map[string]queueFact
+	queueSequence           uint64
+	schedulingRevision      uint64
+	schedulingCursor        c.SchedulingCursor
+	schedulingWake          chan struct{}
 	subscriptionSetRevision uint64
 	journal                 journalState
 	journalStore            *JournalStore
 }
 
-type Limits struct{ Nodes, Subscriptions, Conversations, Calls, Queue int }
+type queueFact struct {
+	present  bool
+	slotHeld bool
+	metadata c.QueueMetadata
+}
+
+type Limits struct{ Nodes, Subscriptions, Conversations, Calls int }
 
 func NewRoot(l Limits) *Root {
 	storeID, err := newStoreID()
 	if err != nil {
 		panic("generate memory store identity: " + err.Error())
 	}
-	r := &Root{storeID: storeID, published: map[string]c.PublishedAdmission{}, messages: map[string]c.MessageAdmission{}, pending: map[string]c.PendingReply{}, replyReceipts: map[string]string{}, messageOrder: map[string][]string{}, reserved: map[string]int{}}
+	r := &Root{storeID: storeID, published: map[string]c.PublishedAdmission{}, messages: map[string]c.MessageAdmission{}, pending: map[string]c.PendingReply{}, replyReceipts: map[string]string{}, messageOrder: map[string][]string{}, reserved: map[string]int{}, queueFacts: map[string]queueFact{}, schedulingWake: make(chan struct{})}
 	r.journal = journalState{entries: []observation.Entry{}, receipts: map[string]observation.StoredReceipt{}, ownerIndex: map[string]map[string]bool{}}
 	r.journalStore = &JournalStore{root: r}
 	r.nodes = rootStore[c.Node](l.Nodes, r, nil)
 	r.subscriptions = rootStore[c.Subscription](l.Subscriptions, r, func(c.Change[c.Subscription]) { r.subscriptionSetRevision++ })
 	r.conversations = rootStore[c.Conversation](l.Conversations, r, nil)
-	r.executions = newExecutionsWithID(rootStore[c.Execution](l.Calls, r, nil, c.CopyExecution), l.Queue, r, r.storeID)
+	r.executions = newExecutionsWithID(rootStore[c.Execution](l.Calls, r, nil, c.CopyExecution), r, r.storeID)
 	return r
 }
 func rootStore[T any](capacity int, root *Root, applied func(c.Change[T]), copyValue ...func(T) T) *Store[T] {
@@ -55,6 +67,191 @@ func (r *Root) Conversations() c.Store[c.Conversation] { return r.conversations 
 func (r *Root) Executions() c.ExecutionStore           { return r.executions }
 func (r *Root) Admissions() c.AdmissionState           { return r }
 func (r *Root) Journal() observation.Store             { return r.journalStore }
+
+func (r *Root) ReadScheduling() (c.SchedulingView, <-chan struct{}, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.executions.records.entries) > 1000 {
+		return c.SchedulingView{}, nil, c.Err("busy", "Scheduling view exceeds the retained execution limit")
+	}
+	view := c.SchedulingView{Revision: r.schedulingRevision, Cursor: r.schedulingCursor, Eligible: []c.QueueCandidate{}, Held: []c.TargetCount{}}
+	held := map[string]c.TargetCount{}
+	for id, fact := range r.queueFacts {
+		snapshot, ok := r.executions.records.entries[c.Ref{Namespace: "calls", ID: id}.Key()]
+		if !ok {
+			return c.SchedulingView{}, nil, c.Err("internal", "Queue fact references a missing call")
+		}
+		if fact.slotHeld {
+			target := snapshot.Value.Call.Target
+			key := target.Key()
+			if item, ok := held[key]; ok {
+				item.Count++
+				held[key] = item
+			} else {
+				held[key] = c.TargetCount{Target: target, Count: 1}
+			}
+		}
+		if !fact.present {
+			continue
+		}
+		view.Eligible = append(view.Eligible, c.QueueCandidate{Call: c.RevisionRef{Subject: snapshot.Subject, Revision: snapshot.Revision}, Target: snapshot.Value.Call.Target, Sequence: fact.metadata.Sequence, EnqueuedAt: fact.metadata.At, Deadline: snapshot.Value.Call.Deadline})
+	}
+	sort.Slice(view.Eligible, func(i, j int) bool {
+		if view.Eligible[i].Target.Key() != view.Eligible[j].Target.Key() {
+			return view.Eligible[i].Target.Key() < view.Eligible[j].Target.Key()
+		}
+		return view.Eligible[i].Sequence < view.Eligible[j].Sequence
+	})
+	for _, target := range held {
+		view.Held = append(view.Held, target)
+	}
+	sort.Slice(view.Held, func(i, j int) bool { return view.Held[i].Target.Key() < view.Held[j].Target.Key() })
+	return view, r.schedulingWake, nil
+}
+
+// ReadQueueFacts returns one payload-free fact for each retained execution
+// under the same Root snapshot as the count and scheduling revision.
+func (r *Root) ReadQueueFacts() ([]c.QueueFact, uint64, uint64, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	entries := r.executions.records.entries
+	if len(entries) > 1000 {
+		return nil, uint64(len(entries)), r.schedulingRevision, c.Err("busy", "Queue recovery view exceeds the retained execution limit")
+	}
+	facts := make([]c.QueueFact, 0, len(entries))
+	seen := make(map[string]bool, len(entries))
+	for key, snapshot := range entries {
+		id := snapshot.Subject.ID
+		fact := c.QueueFact{Call: c.RevisionRef{Subject: snapshot.Subject, Revision: snapshot.Revision}}
+		if stored, ok := r.queueFacts[id]; ok {
+			fact.Present, fact.SlotHeld = stored.present, stored.slotHeld
+			metadata := stored.metadata
+			fact.Metadata = &metadata
+		}
+		facts = append(facts, fact)
+		seen[key] = true
+	}
+	for id := range r.queueFacts {
+		if !seen[(c.Ref{Namespace: "calls", ID: id}).Key()] {
+			return nil, uint64(len(entries)), r.schedulingRevision, c.Err("internal", "Queue fact references a missing execution")
+		}
+	}
+	sort.Slice(facts, func(i, j int) bool { return facts[i].Call.Subject.Key() < facts[j].Call.Subject.Key() })
+	return facts, uint64(len(entries)), r.schedulingRevision, nil
+}
+
+func (r *Root) signalSchedulingLocked() {
+	close(r.schedulingWake)
+	r.schedulingWake = make(chan struct{})
+	r.schedulingRevision++
+}
+
+func (r *Root) validateAdmissionQueueLocked(changes []c.Change[c.Execution], queues []c.QueueMutation, newCalls map[string]bool, scheduling *c.SchedulingMutation) error {
+	if len(queues) != len(newCalls) {
+		return c.Err("invalid_input", "Admission queue facts must match new calls")
+	}
+	if scheduling == nil || scheduling.ExpectedRevision != r.schedulingRevision || scheduling.Cursor != nil {
+		return c.Err("conflict", "Scheduling revision changed during admission")
+	}
+	if uint64(len(queues)) > ^uint64(0)-r.queueSequence || r.schedulingRevision == ^uint64(0) {
+		return c.Err("internal", "Scheduling sequence is exhausted")
+	}
+	final := map[string]c.Change[c.Execution]{}
+	for _, change := range changes {
+		final[change.Subject.ID] = change
+	}
+	seen := map[string]bool{}
+	for _, mutation := range queues {
+		change, ok := final[mutation.CallID]
+		if !ok || !newCalls[mutation.CallID] || seen[mutation.CallID] || !mutation.Present || mutation.SlotHeld || mutation.Metadata == nil {
+			return c.Err("invalid_input", "Admission queue fact is invalid")
+		}
+		metadata := mutation.Metadata
+		if metadata.Admission.Subject != change.Subject || metadata.Admission.Revision != change.AfterRevision || metadata.At.IsZero() || !metadata.At.Equal(change.At) || metadata.Sequence != 0 || change.After.Dispatch != nil {
+			return c.Err("invalid_input", "Admission queue metadata does not match the final call")
+		}
+		if _, exists := r.queueFacts[mutation.CallID]; exists {
+			return c.Err("conflict", "Queue metadata already exists")
+		}
+		seen[mutation.CallID] = true
+	}
+	return nil
+}
+
+func (r *Root) applyAdmissionQueueLocked(queues []c.QueueMutation) {
+	for _, mutation := range queues {
+		r.queueSequence++
+		metadata := *mutation.Metadata
+		metadata.Sequence = r.queueSequence
+		r.queueFacts[mutation.CallID] = queueFact{present: true, metadata: metadata}
+	}
+	if len(queues) > 0 {
+		r.signalSchedulingLocked()
+	}
+}
+
+func (r *Root) validateExecutionQueueLocked(subject c.Ref, current, after c.Execution, mutation *c.QueueMutation, scheduling *c.SchedulingMutation) (bool, error) {
+	if mutation == nil {
+		if scheduling != nil {
+			return false, c.Err("invalid_input", "Scheduling cursor change requires a queue fact")
+		}
+		return false, nil
+	}
+	if mutation.CallID != subject.ID || mutation.Metadata != nil || mutation.Present && mutation.SlotHeld {
+		return false, c.Err("invalid_input", "Queue mutation identity or flags are invalid")
+	}
+	prior, exists := r.queueFacts[mutation.CallID]
+	cursorChanged := false
+	if scheduling != nil {
+		if scheduling.ExpectedRevision != r.schedulingRevision {
+			return false, c.Err("conflict", "Scheduling revision changed")
+		}
+		if scheduling.Cursor != nil {
+			cursor := scheduling.Cursor
+			if cursor.Round == 0 || cursor.Round > 16 || !cursor.AfterTarget.Valid() || cursor.AfterTarget.Namespace != "nodes" || cursor.AfterTarget != after.Call.Target {
+				return false, c.Err("invalid_input", "Scheduling cursor reference is invalid")
+			}
+			if _, ok := r.nodes.entries[cursor.AfterTarget.Key()]; !ok {
+				return false, c.Err("invalid_input", "Scheduling cursor target does not exist")
+			}
+			cursorChanged = *cursor != r.schedulingCursor
+		}
+	}
+	if !exists {
+		// Archived terminal executions may have no scheduling row. A captured
+		// cursor-only no-op is valid, but cannot manufacture queue metadata.
+		if mutation.Present || mutation.SlotHeld || scheduling != nil && scheduling.Cursor != nil {
+			return false, c.Err("conflict", "Queue metadata is unavailable")
+		}
+		return false, nil
+	}
+	changed := prior.present != mutation.Present || prior.slotHeld != mutation.SlotHeld
+	if (changed || cursorChanged) && r.schedulingRevision == ^uint64(0) {
+		return false, c.Err("internal", "Scheduling revision is exhausted")
+	}
+	if !prior.slotHeld && mutation.SlotHeld && scheduling == nil {
+		return false, c.Err("invalid_input", "Possible slot acquisition requires a scheduling revision")
+	}
+	_ = current // State/eligibility policy is invocation-owned.
+	return changed, nil
+}
+
+func (r *Root) applyExecutionQueueLocked(mutation *c.QueueMutation, scheduling *c.SchedulingMutation, changed bool) {
+	if mutation == nil {
+		return
+	}
+	if prior, exists := r.queueFacts[mutation.CallID]; exists {
+		prior.present, prior.slotHeld = mutation.Present, mutation.SlotHeld
+		r.queueFacts[mutation.CallID] = prior
+	}
+	cursorChanged := scheduling != nil && scheduling.Cursor != nil && *scheduling.Cursor != r.schedulingCursor
+	if cursorChanged {
+		r.schedulingCursor = *scheduling.Cursor
+	}
+	if changed || cursorChanged {
+		r.signalSchedulingLocked()
+	}
+}
 
 func copyAdmissionEffect(effect c.AdmissionEffect) (c.AdmissionEffect, error) {
 	out, err := c.CloneJSON(effect)

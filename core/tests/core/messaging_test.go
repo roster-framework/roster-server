@@ -28,8 +28,8 @@ type flakyAckOutbox struct {
 }
 
 func TestPrivateDeliveryDigestPreservesAndProtectsEmissions(t *testing.T) {
-	store := memory.NewExecutions(2, 2)
-	if err := store.CommitAdmission(c.AdmissionCommit{Changes: queued("emission-copy"), Deliveries: nil}); err != nil {
+	store := memory.NewExecutions(2)
+	if err := store.CommitAdmission(admissionFor(store, queued("emission-copy"), nil)); err != nil {
 		t.Fatal(err)
 	}
 	old, err := store.Get(c.Ref{Namespace: "calls", ID: "emission-copy"})
@@ -239,7 +239,7 @@ func TestDrainBusyItemsAdvanceAndPreserveIndependentProgress(t *testing.T) {
 }
 
 func TestBusyPublishBlocksOnlyItsSourceForTheCurrentPass(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Calls: 4, Queue: 1})
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Calls: 4})
 	fake := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{"complete": json.RawMessage(`{"type":"object"}`)}}}
 	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": fake}, schema.New())
 	for _, id := range []string{"source-a", "source-b", "target"} {
@@ -247,7 +247,10 @@ func TestBusyPublishBlocksOnlyItsSourceForTheCurrentPass(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: queued("queue-occupant"), Deliveries: nil}); err != nil {
+	occupants := append(queued("queue-occupant-1"), queued("queue-occupant-2")...)
+	occupants = append(occupants, queued("queue-occupant-3")...)
+	occupants = append(occupants, queued("queue-occupant-4")...)
+	if err := root.Executions().CommitAdmission(admissionFor(root.Executions(), occupants, nil)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := root.Subscriptions().Apply(c.Change[c.Subscription]{ID: "sub-create", Subject: c.Ref{Namespace: "subscriptions", ID: "sub"}, AfterRevision: 1, After: c.Subscription{ID: "sub", Source: c.Ref{Namespace: "nodes", ID: "source-a"}, Event: "complete", Target: c.Ref{Namespace: "nodes", ID: "target"}, Operation: "run", Input: c.InputTemplate{}}}); err != nil {
@@ -343,7 +346,7 @@ func TestBusyPublishBlocksOnlyItsSourceForTheCurrentPass(t *testing.T) {
 }
 
 func TestOutboxScanUsesFixedThroughAndResumesAcrossAckHoles(t *testing.T) {
-	store := memory.NewExecutions(2, 2)
+	store := memory.NewExecutions(2)
 	deliveries := make([]c.Delivery, 70)
 	for i := range deliveries {
 		id := fmt.Sprintf("scan-%02d", i)
@@ -420,7 +423,7 @@ func TestDrainBudgetResumesActualTailAndReentrantDrainIsNonblocking(t *testing.T
 func ptrOrigin(origin c.AdmissionOrigin) *c.AdmissionOrigin { return &origin }
 
 func TestDrainReplayAfterAckLossAndJournalRingEviction(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Calls: 2, Queue: 2})
+	root := memory.NewRoot(memory.Limits{Calls: 2})
 	j := newJournal(t, root, 1)
 	ev := c.Event{ID: "stable-log", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "log", Category: "observation", Payload: c.Data{"text": "same"}}
 	if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{c.Delivery{ID: ev.ID, Kind: c.DeliveryJournal, Event: &ev}}}); err != nil {
@@ -444,7 +447,7 @@ func TestDrainReplayAfterAckLossAndJournalRingEviction(t *testing.T) {
 }
 
 func TestJournalFacadeProducersSerializeWithDrainAndChangedPublishRetry(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Calls: 4, Queue: 128})
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Calls: 4})
 	producerJournal := newJournal(t, root, 256)
 	drainJournal := producerJournal
 	f := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{"complete": json.RawMessage(`{"type":"object"}`)}}}
@@ -549,13 +552,20 @@ func TestJournalFacadeProducersSerializeWithDrainAndChangedPublishRetry(t *testi
 	for err := range producerErrors {
 		t.Errorf("concurrent Journal producer failed: %v", err)
 	}
-	// The first Drain has a fixed Through boundary. Finish deliveries appended
-	// by the concurrent producers on the following pass.
-	if err := drainer.Drain(outbox, drainJournal, nil); err != nil {
-		t.Fatalf("follow-up pass for arrivals beyond Through failed: %v", err)
-	}
-	if pending := mustPendingCount(t, outbox); pending != 0 {
-		t.Fatalf("single Drain left deliveries pending: %d", pending)
+	// A successful Publish retry can append a Journal delivery beyond that
+	// Drain's fixed Through boundary; the concurrent producers write only to
+	// the Journal façade and do not add outbox intents.
+	followupDeadline := time.Now().Add(10 * time.Second)
+	for {
+		if pending := mustPendingCount(t, outbox); pending == 0 {
+			break
+		}
+		if !time.Now().Before(followupDeadline) {
+			t.Fatalf("bounded follow-up Drain loop left deliveries pending: %d", mustPendingCount(t, outbox))
+		}
+		if err := drainer.Drain(outbox, drainJournal, nil); err != nil {
+			t.Fatalf("follow-up pass for arrivals beyond Through failed: %v", err)
+		}
 	}
 	for _, id := range []string{firstRejectionID, priorRejection.ID, priorRejectionTwo.ID} {
 		view, err := root.Journal().ReadRecord(id)
@@ -566,7 +576,7 @@ func TestJournalFacadeProducersSerializeWithDrainAndChangedPublishRetry(t *testi
 }
 
 func TestTerminalCallbackErrorRetainsOriginalEnvelopeForRetry(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Calls: 2, Queue: 2})
+	root := memory.NewRoot(memory.Limits{Calls: 2})
 	j := newJournal(t, root, 10)
 	terminal := execution(c.Succeeded)
 	d := c.Delivery{ID: "terminal-callback-error", Kind: c.DeliveryCompletion, Execution: &terminal}
@@ -610,7 +620,7 @@ func TestTwentyEmissionsAndReplyDrainWhenGeneralOutboxIsFull(t *testing.T) {
 		return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{}, Emissions: emissions}
 	}
 	f.inspect = func(call c.Call) c.Result { return c.Result{CallID: call.ID, State: c.Running} }
-	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
 	j := newJournal(t, root, 10000)
 	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
@@ -639,7 +649,9 @@ func TestTwentyEmissionsAndReplyDrainWhenGeneralOutboxIsFull(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	calls.Start(ctx, 1)
+	if err := calls.Start(ctx, 1, func(error) {}); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case <-entered:
 	case <-time.After(10 * time.Second):
@@ -812,7 +824,7 @@ func countGeneralDeliveries(outbox c.Outbox) (int, error) {
 
 func TestDrainRejectsFanoutDuringShutdownBeforeTerminalReply(t *testing.T) {
 	f := &fakeConnector{descriptor: c.Descriptor{Operations: map[string]c.Operation{"run": {Name: "run", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`)}}, Events: map[string]c.Schema{"complete": json.RawMessage(`{"type":"object"}`)}}}
-	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
 	j := newJournal(t, root, 100)
 	cat := catalog.New(root.Nodes(), map[string]c.Connector{"fake": f}, schema.New())
 	if _, err := cat.Register(context.Background(), c.Registration{ID: "node", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
@@ -855,7 +867,7 @@ func TestDrainRejectsFanoutDuringShutdownBeforeTerminalReply(t *testing.T) {
 }
 
 func TestDrainRejectsPublishedDeliveryWithoutServerOrigin(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Calls: 2, Queue: 2})
+	root := memory.NewRoot(memory.Limits{Calls: 2})
 	j := newJournal(t, root, 10)
 	events := event.New(nil, nil, nil, nil)
 	published := c.Event{ID: "missing-origin", Source: c.Ref{Namespace: "nodes", ID: "node"}, Name: "complete", Category: "published", OccurredAt: c.Now(), Payload: c.Data{}}

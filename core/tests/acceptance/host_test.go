@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,12 +38,69 @@ type sourceFailureConnector struct {
 	started  chan struct{}
 	panicRun bool
 	once     sync.Once
+	invokeMu sync.Mutex
+	invokes  int
 }
 
 type sourceObservationFailStore struct {
 	observation.Store
 	failed chan struct{}
 	once   sync.Once
+}
+
+type runningJournalBarrierStore struct {
+	observation.Store
+	entered chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+type activationExecutionStore struct {
+	c.ExecutionStore
+	mu    sync.Mutex
+	scans int
+}
+
+type setupNodeStore struct {
+	c.Store[c.Node]
+	listCalls int
+}
+
+type setupLifetimeConnector struct {
+	connector
+	describeContexts chan c.Context
+	watchContexts    chan c.Context
+	invokeEntered    chan string
+	invokeRelease    <-chan struct{}
+}
+
+func (s *setupNodeStore) List() ([]c.Snapshot[c.Node], error) {
+	s.listCalls++
+	return s.Store.List()
+}
+
+func (s *setupLifetimeConnector) Describe(ctx c.Context, binding json.RawMessage) (c.Descriptor, error) {
+	s.describeContexts <- ctx
+	return s.connector.Describe(ctx, binding)
+}
+
+func (s *setupLifetimeConnector) Watch(ctx c.Context, _ json.RawMessage, _ func(c.SourceEvent) error) error {
+	s.watchContexts <- ctx
+	<-ctx.Done()
+	return nil
+}
+
+func (s *setupLifetimeConnector) Invoke(_ c.Context, _ json.RawMessage, call c.Call, _ c.ReportSink) c.Result {
+	s.invokeEntered <- call.ID
+	<-s.invokeRelease
+	return c.Result{CallID: call.ID, State: c.Succeeded, Output: c.Data{"answer": "setup-context"}}
+}
+
+func (s *activationExecutionStore) ScanPending(cursor c.OutboxCursor, limit int) ([]c.PendingDelivery, c.OutboxCursor, error) {
+	s.mu.Lock()
+	s.scans++
+	s.mu.Unlock()
+	return s.ExecutionStore.ScanPending(cursor, limit)
 }
 
 type closeRacePanicSource struct {
@@ -67,6 +125,11 @@ func (s *closeRacePanicSource) Watch(ctx c.Context, _ json.RawMessage, _ func(c.
 func (s *closeRaceExecutionStore) List() ([]c.Snapshot[c.Execution], error) {
 	s.once.Do(func() { close(s.listed) })
 	return s.ExecutionStore.List()
+}
+
+func (s *closeRaceExecutionStore) ReadSummaries() ([]c.ExecutionSummary, error) {
+	s.once.Do(func() { close(s.listed) })
+	return s.ExecutionStore.ReadSummaries()
 }
 
 type startupJournalFailStore struct {
@@ -96,10 +159,26 @@ func (s *sourceObservationFailStore) Commit(m observation.JournalMutation) error
 	return s.Store.Commit(m)
 }
 
+func (s *runningJournalBarrierStore) Commit(m observation.JournalMutation) error {
+	for _, entry := range m.Append {
+		if entry.Event.Name == "core.state" && entry.Event.Payload["reason"] == "workers_ready" {
+			s.once.Do(func() {
+				close(s.entered)
+				<-s.release
+			})
+			break
+		}
+	}
+	return s.Store.Commit(m)
+}
+
 func (d *sourceFailureConnector) Describe(ctx c.Context, binding json.RawMessage) (c.Descriptor, error) {
 	return d.connector.Describe(ctx, binding)
 }
 func (d *sourceFailureConnector) Invoke(ctx c.Context, binding json.RawMessage, call c.Call, report c.ReportSink) c.Result {
+	d.invokeMu.Lock()
+	d.invokes++
+	d.invokeMu.Unlock()
 	return d.connector.Invoke(ctx, binding, call, report)
 }
 func (d *sourceFailureConnector) Inspect(ctx c.Context, binding json.RawMessage, call c.Call) c.Result {
@@ -121,6 +200,7 @@ type faultExecutionStore struct {
 	mu                   sync.Mutex
 	listErr              error
 	countErr             error
+	listCalls            int
 	countErrOnce         bool
 	countFailures        chan struct{}
 	listErrOnce          bool
@@ -135,6 +215,7 @@ type faultExecutionStore struct {
 	commitErrState       c.State
 	commitErr            error
 	commitErrOnce        bool
+	commitErrRemaining   int
 	commitFailures       chan struct{}
 	getErr               error
 	getErrOnce           bool
@@ -142,6 +223,7 @@ type faultExecutionStore struct {
 	rejectedBusy         chan struct{}
 	rejectedCommitted    chan string
 	pauseOnRejectedBusy  bool
+	rejectedBusySkip     int
 	pauseAfterCommit     bool
 	pendingListPaused    chan struct{}
 	resumePendingList    chan struct{}
@@ -261,6 +343,7 @@ func (s *faultExecutionStore) PendingObservations() ([]c.PendingObservation, err
 
 func (s *faultExecutionStore) List() ([]c.Snapshot[c.Execution], error) {
 	s.mu.Lock()
+	s.listCalls++
 	err := s.listErr
 	if err != nil && s.listErrOnce {
 		s.listErr, s.listErrOnce = nil, false
@@ -274,6 +357,29 @@ func (s *faultExecutionStore) List() ([]c.Snapshot[c.Execution], error) {
 		return nil, err
 	}
 	return s.ExecutionStore.List()
+}
+
+func (s *faultExecutionStore) fullListCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listCalls
+}
+
+func (s *faultExecutionStore) ReadSummaries() ([]c.ExecutionSummary, error) {
+	s.mu.Lock()
+	err := s.listErr
+	if err != nil && s.listErrOnce {
+		s.listErr, s.listErrOnce = nil, false
+	}
+	s.mu.Unlock()
+	if err != nil {
+		select {
+		case s.listFailures <- struct{}{}:
+		default:
+		}
+		return nil, err
+	}
+	return s.ExecutionStore.ReadSummaries()
 }
 
 func (s *faultExecutionStore) PendingDeliveryCount() (int, error) {
@@ -306,7 +412,13 @@ func (s *faultExecutionStore) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execut
 	}
 	s.mu.Lock()
 	err := s.commitErr
-	if err != nil && s.commitErrOnce && state == s.commitErrState {
+	if err != nil && s.commitErrRemaining > 0 && state == s.commitErrState {
+		s.commitErrRemaining--
+		if s.commitErrRemaining == 0 {
+			s.commitErr = nil
+			s.pauseAfterCommit = true
+		}
+	} else if err != nil && s.commitErrOnce && state == s.commitErrState {
 		s.commitErr, s.commitErrOnce = nil, false
 		s.pauseAfterCommit = true
 	} else if state != s.commitErrState {
@@ -333,7 +445,12 @@ func (s *faultExecutionStore) Commit(m c.ExecutionMutation) (c.Snapshot[c.Execut
 	if hasRejected && commitErr != nil && c.AsFault(commitErr).Code == "busy" {
 		s.mu.Lock()
 		pause := s.pauseOnRejectedBusy
-		s.pauseOnRejectedBusy = false
+		if pause && s.rejectedBusySkip > 0 {
+			s.rejectedBusySkip--
+			pause = false
+		} else if pause {
+			s.pauseOnRejectedBusy = false
+		}
 		if pause {
 			s.pauseAfterCommit = true
 		}
@@ -372,8 +489,19 @@ func readStatus(t *testing.T, core *host.Core) host.Status {
 
 func prepareDispatchingCall(t *testing.T, store *memory.Root, id string) c.Snapshot[c.Execution] {
 	t.Helper()
+	nodeRef := c.Ref{Namespace: "nodes", ID: c.ID(id, "test-node")}
+	node := c.Node{ID: nodeRef.ID, ConnectorID: "fake", Binding: json.RawMessage(`{"target":"test"}`)}
+	nodeChange := lifecycle.Create(nodeRef, node, "registered")
+	nodeSnap, err := store.Nodes().Apply(nodeChange)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindingDigest, err := c.CanonicalJSONDigest(node.Binding)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ref := c.Ref{Namespace: "calls", ID: id}
-	value := c.Execution{Call: c.Call{ID: id}, Lifecycle: c.Lifecycle{State: c.Created}}
+	value := c.Execution{Call: c.Call{ID: id, Target: nodeRef, Operation: "run", Input: c.Data{}}, Lifecycle: c.Lifecycle{State: c.Created}}
 	first := lifecycle.Create(ref, value, "received")
 	changes := []c.Change[c.Execution]{first}
 	current := c.Snapshot[c.Execution]{Subject: ref, Revision: first.AfterRevision, Value: first.After}
@@ -385,25 +513,41 @@ func prepareDispatchingCall(t *testing.T, store *memory.Root, id string) c.Snaps
 		changes = append(changes, change)
 		current = c.Snapshot[c.Execution]{Subject: ref, Revision: change.AfterRevision, Value: change.After}
 	}
-	if err := store.Executions().CommitAdmission(c.AdmissionCommit{Changes: changes, Deliveries: nil}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.Executions().Claim(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	current, err := store.Executions().Get(ref)
+	view, _, err := store.Executions().ReadScheduling()
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, state := range []c.State{c.Preparing, c.Dispatching} {
-		change, moveErr := lifecycle.Move(current, c.Transition{Subject: ref, ExpectedRevision: current.Revision, From: current.Value.Lifecycle.State, To: state, Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}})
-		if moveErr != nil {
-			t.Fatal(moveErr)
-		}
-		current, err = store.Executions().Commit(c.ExecutionMutation{Subject: ref, ExpectedRevision: current.Revision, Changes: []c.Change[c.Execution]{change}})
-		if err != nil {
-			t.Fatal(err)
-		}
+	metadata := c.QueueMetadata{Admission: c.RevisionRef{Subject: current.Subject, Revision: current.Revision}, At: changes[len(changes)-1].At}
+	commit := c.AdmissionCommit{Changes: changes, Queue: []c.QueueMutation{{CallID: id, Present: true, Metadata: &metadata}}, Scheduling: &c.SchedulingMutation{ExpectedRevision: view.Revision}}
+	if err := store.Executions().CommitAdmission(commit); err != nil {
+		t.Fatal(err)
+	}
+	current, err = store.Executions().Get(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, _, err = store.Executions().ReadScheduling()
+	if err != nil {
+		t.Fatal(err)
+	}
+	change, moveErr := lifecycle.Move(current, c.Transition{Subject: ref, ExpectedRevision: current.Revision, From: current.Value.Lifecycle.State, To: c.Preparing, Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true}})
+	if moveErr != nil {
+		t.Fatal(moveErr)
+	}
+	queue := c.QueueMutation{CallID: id, Present: false, SlotHeld: true}
+	current, err = store.Executions().Commit(c.ExecutionMutation{Subject: ref, ExpectedRevision: current.Revision, Changes: []c.Change[c.Execution]{change}, Queue: &queue, Scheduling: &c.SchedulingMutation{ExpectedRevision: view.Revision}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch := c.DispatchIdentity{NodeID: node.ID, NodeRevision: nodeSnap.Revision, ConnectorID: node.ConnectorID, BindingDigest: bindingDigest, RemoteID: id}
+	change, moveErr = lifecycle.Dispatch(current, dispatch)
+	if moveErr != nil {
+		t.Fatal(moveErr)
+	}
+	carrier := c.RevisionRef{Subject: nodeRef, Revision: nodeSnap.Revision}
+	current, err = store.Executions().Commit(c.ExecutionMutation{Subject: ref, ExpectedRevision: current.Revision, Changes: []c.Change[c.Execution]{change}, NodeRevision: &carrier})
+	if err != nil {
+		t.Fatal(err)
 	}
 	return current
 }
@@ -620,7 +764,7 @@ func TestConfigureGuardsNumbersBeforeRegistrationAndPreservesExactBinding(t *tes
 }
 
 func TestStorageReadFailuresReachStatusReadyAndClose(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 4, Calls: 8, Queue: 8})
+	root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 4, Calls: 8})
 	store := &faultExecutionStore{ExecutionStore: root.Executions()}
 	core, err := host.New(context.Background(), host.Options{
 		Connectors: map[string]c.Connector{"fake": connector{}}, Workers: 1,
@@ -643,11 +787,11 @@ func TestStorageReadFailuresReachStatusReadyAndClose(t *testing.T) {
 
 	readErr := c.Err("storage_read", "injected call-list failure")
 	store.SetErrors(readErr, nil)
-	if _, err := core.Status(); err != readErr {
-		t.Fatalf("Status error=%v, want original list error %v", err, readErr)
+	if _, err := core.Status(); !errors.Is(err, readErr) {
+		t.Fatalf("Status error=%v, want wrapped original summary error %v", err, readErr)
 	}
-	if _, err := core.Commands.Execute(context.Background(), "core.status", json.RawMessage(`{}`)); err != readErr {
-		t.Fatalf("core.status error=%v, want original list error %v", err, readErr)
+	if _, err := core.Commands.Execute(context.Background(), "core.status", json.RawMessage(`{}`)); !errors.Is(err, readErr) {
+		t.Fatalf("core.status error=%v, want wrapped original summary error %v", err, readErr)
 	}
 	request := httptest.NewRequest(http.MethodPost, "/api/commands/core.status", strings.NewReader(`{}`))
 	request.Host = "127.0.0.1:7350"
@@ -655,17 +799,20 @@ func TestStorageReadFailuresReachStatusReadyAndClose(t *testing.T) {
 	response := httptest.NewRecorder()
 	core.Handler().ServeHTTP(response, request)
 	var publicFault c.Fault
-	if response.Code != http.StatusInternalServerError || json.Unmarshal(response.Body.Bytes(), &publicFault) != nil || publicFault.Code != "storage_read" {
-		t.Fatalf("core.status HTTP response status=%d body=%s, want safe 500 storage_read fault", response.Code, response.Body.String())
+	if response.Code != http.StatusInternalServerError || json.Unmarshal(response.Body.Bytes(), &publicFault) != nil || publicFault.Code != "storage" {
+		t.Fatalf("core.status HTTP response status=%d body=%s, want safe 500 storage fault", response.Code, response.Body.String())
 	}
-	checkReadyFailure(t, core, "storage_read")
+	checkReadyFailure(t, core, "storage")
+	if got := store.fullListCalls(); got != 0 {
+		t.Fatalf("operational status performed %d full execution list reads", got)
+	}
 
 	countErr := c.Err("storage_read", "injected delivery-count failure")
 	store.SetErrors(nil, countErr)
-	if _, err := core.Status(); err != countErr {
+	if _, err := core.Status(); !errors.Is(err, countErr) {
 		t.Fatalf("Status count error=%v, want original count error %v", err, countErr)
 	}
-	if _, err := core.Commands.Execute(context.Background(), "core.status", json.RawMessage(`{}`)); err != countErr {
+	if _, err := core.Commands.Execute(context.Background(), "core.status", json.RawMessage(`{}`)); !errors.Is(err, countErr) {
 		t.Fatalf("core.status count error=%v, want original count error %v", err, countErr)
 	}
 	checkReadyFailure(t, core, "storage_read")
@@ -673,12 +820,15 @@ func TestStorageReadFailuresReachStatusReadyAndClose(t *testing.T) {
 	store.SetListErrorOnce(readErr)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := core.Close(ctx); err != readErr {
-		t.Fatalf("Close error=%v, want original read error %v", err, readErr)
+	if err := core.Close(ctx); !errors.Is(err, readErr) {
+		t.Fatalf("Close error=%v, want wrapped original summary error %v", err, readErr)
 	}
 	closed = true
 	if !core.Calls.LocalStopped() {
 		t.Fatal("storage read failure prevented invocation workers from stopping")
+	}
+	if got := store.fullListCalls(); got != 0 {
+		t.Fatalf("shutdown performed %d full execution list reads", got)
 	}
 	store.SetErrors(nil, nil)
 	status := readStatus(t, core)
@@ -688,7 +838,7 @@ func TestStorageReadFailuresReachStatusReadyAndClose(t *testing.T) {
 }
 
 func TestClosingPreservesBackgroundPendingReadFailureAfterRecovery(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
 	store := &faultExecutionStore{ExecutionStore: root.Executions(), pendingFailures: make(chan struct{}, 1), pendingSuccesses: make(chan struct{}, 1)}
 	core, err := host.New(context.Background(), host.Options{
 		Connectors: map[string]c.Connector{"fake": connector{}}, Workers: 1,
@@ -729,7 +879,7 @@ drainedPendingReads:
 }
 
 func TestPendingReadFailureStopsOutboxDrain(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
 	preloaded := c.Event{ID: "must-wait-for-pending-read", Name: "observation", Category: "observation", Payload: c.Data{}}
 	if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{c.Delivery{ID: "preloaded-journal", Kind: c.DeliveryJournal, Event: &preloaded}}}); err != nil {
 		t.Fatal(err)
@@ -741,15 +891,9 @@ func TestPendingReadFailureStopsOutboxDrain(t *testing.T) {
 		Connectors: map[string]c.Connector{"fake": connector{}}, Workers: 1,
 		Storage: &host.Storage{Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: store, Admissions: root.Admissions(), Journal: root.Journal()},
 	})
-	if err != nil {
-		t.Fatal(err)
+	if core != nil || err != readErr {
+		t.Fatalf("host startup error=%v core=%v, want fail-closed original pending read error %v", err, core, readErr)
 	}
-	select {
-	case <-store.pendingFailures:
-	case <-time.After(time.Second):
-		t.Fatal("delivery loop did not observe pending-list failure")
-	}
-	time.Sleep(150 * time.Millisecond)
 	pending, err := root.Executions().PendingDeliveries(100)
 	if err != nil {
 		t.Fatal(err)
@@ -759,17 +903,12 @@ func TestPendingReadFailureStopsOutboxDrain(t *testing.T) {
 		found = found || delivery.ID == "preloaded-journal"
 	}
 	if !found {
-		t.Fatal("outbox was drained after pending-list read failed")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := core.Close(ctx); err == nil || err != readErr {
-		t.Fatalf("Close error=%v, want persistent pending read error %v", err, readErr)
+		t.Fatal("startup read failure changed the preloaded outbox")
 	}
 }
 
 func TestTransientPendingBusyDrainsAndClosesAfterRetry(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
 	current := prepareDispatchingCall(t, root, "pending-busy-close")
 	report := c.Report{Evidence: c.Evidence{CallID: current.Value.Call.ID, RemoteID: current.Value.Call.ID, ReportID: "pending-failed-result", Confirmed: true}, State: c.Failed, Result: &c.Result{CallID: current.Value.Call.ID, State: c.Failed, Error: &c.Fault{Code: "remote_failed", Message: "injected terminal result"}}}
 	pending := c.PendingObservation{CallID: current.Value.Call.ID, Revision: 1, Identity: "pending-busy-close-slot", Origin: current.Value.Origin, Report: report}
@@ -781,13 +920,13 @@ func TestTransientPendingBusyDrainsAndClosesAfterRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := &faultExecutionStore{
-		ExecutionStore:    root.Executions(),
-		commitErrState:    c.Failed,
-		commitErr:         c.Err("busy", "one transient terminal commit failure"),
-		commitErrOnce:     true,
-		commitFailures:    make(chan struct{}, 1),
-		pendingListPaused: make(chan struct{}, 1),
-		resumePendingList: make(chan struct{}),
+		ExecutionStore:     root.Executions(),
+		commitErrState:     c.Failed,
+		commitErr:          c.Err("busy", "one transient terminal commit failure"),
+		commitErrRemaining: 2,
+		commitFailures:     make(chan struct{}, 1),
+		pendingListPaused:  make(chan struct{}, 1),
+		resumePendingList:  make(chan struct{}),
 	}
 	core, err := host.New(context.Background(), host.Options{
 		Connectors: map[string]c.Connector{"fake": connector{}}, Workers: 1,
@@ -808,8 +947,8 @@ func TestTransientPendingBusyDrainsAndClosesAfterRetry(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("delivery loop did not reach the post-Drain retry barrier")
 	}
-	if count, err := root.Executions().PendingDeliveryCount(); err != nil || count != 0 {
-		t.Fatalf("independent Drain did not ACK its delivery while pending retry was still held: count=%d err=%v", count, err)
+	if _, err := root.Journal().ReadRecord(filler.ID); err != nil {
+		t.Fatalf("independent Drain did not journal its delivery while pending retry was still held: %v", err)
 	}
 	if items, err := root.Executions().PendingObservations(); err != nil || len(items) != 1 {
 		t.Fatalf("pending report was consumed before the independent delivery drained: count=%d err=%v", len(items), err)
@@ -829,7 +968,7 @@ func TestTransientPendingBusyDrainsAndClosesAfterRetry(t *testing.T) {
 }
 
 func TestPendingRejectedAuditRecoversAfterRealOutboxCapacityBusy(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4, Queue: 4})
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 4})
 	current := prepareDispatchingCall(t, root, "capacity-rejected-pending")
 	prior := c.Report{Evidence: c.Evidence{CallID: current.Value.Call.ID, RemoteID: current.Value.Call.ID, ReportID: "duplicate-running-receipt", Confirmed: true}, State: c.Running, Payload: c.Data{"version": "accepted"}}
 	accepted := lifecycle.Observe(current, prior)
@@ -845,7 +984,7 @@ func TestPendingRejectedAuditRecoversAfterRealOutboxCapacityBusy(t *testing.T) {
 	if terminal.Err != nil {
 		t.Fatal(terminal.Err)
 	}
-	current, err = root.Executions().Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: terminal.Changes, Deliveries: terminal.Deliveries})
+	current, err = root.Executions().Commit(c.ExecutionMutation{Subject: current.Subject, ExpectedRevision: current.Revision, Changes: terminal.Changes, Deliveries: terminal.Deliveries, Queue: &c.QueueMutation{CallID: current.Value.Call.ID, Present: false, SlotHeld: false}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -872,7 +1011,7 @@ func TestPendingRejectedAuditRecoversAfterRealOutboxCapacityBusy(t *testing.T) {
 		t.Fatalf("general outbox did not reach its actual capacity: count=%d err=%v", count, err)
 	}
 	store := &faultExecutionStore{
-		ExecutionStore: root.Executions(), pauseOnRejectedBusy: true,
+		ExecutionStore: root.Executions(), pauseOnRejectedBusy: true, rejectedBusySkip: 1,
 		rejectedBusy: make(chan struct{}, 1), rejectedCommitted: make(chan string, 1),
 		pendingListPaused: make(chan struct{}, 1), resumePendingList: make(chan struct{}),
 	}
@@ -945,7 +1084,7 @@ func mustPendingDeliveries(t *testing.T, outbox interface {
 }
 
 func TestPostDrainCountFailureKeepsPriorAckAndPublicFaultBounded(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Nodes: 2, Subscriptions: 2, Conversations: 2, Calls: 2, Queue: 2})
+	root := memory.NewRoot(memory.Limits{Nodes: 2, Subscriptions: 2, Conversations: 2, Calls: 2})
 	event := c.Event{ID: "count-failure-after-ack", Source: c.Ref{Namespace: "calls", ID: "count-failure-call"}, CallID: "count-failure-call", Name: "count_check", Category: "observation", Payload: c.Data{}}
 	if err := root.Executions().CommitAdmission(c.AdmissionCommit{Changes: nil, Deliveries: []c.Delivery{c.Delivery{ID: event.ID, Kind: c.DeliveryJournal, Event: &event}}}); err != nil {
 		t.Fatal(err)
@@ -1016,7 +1155,7 @@ func TestSourceObservationPersistenceFailureReachesStatusAndClose(t *testing.T) 
 			name = "watch_panic"
 		}
 		t.Run(name, func(t *testing.T) {
-			root := memory.NewRoot(memory.Limits{Nodes: 2, Subscriptions: 2, Conversations: 2, Calls: 2, Queue: 8})
+			root := memory.NewRoot(memory.Limits{Nodes: 2, Subscriptions: 2, Conversations: 2, Calls: 2})
 			journalStore := &sourceObservationFailStore{Store: root.Journal(), failed: make(chan struct{})}
 			source := &sourceFailureConnector{started: make(chan struct{}), panicRun: panicRun}
 			core, err := host.New(context.Background(), host.Options{
@@ -1054,6 +1193,12 @@ func TestSourceObservationPersistenceFailureReachesStatusAndClose(t *testing.T) 
 			if err == nil || c.AsFault(err).Code != "internal" {
 				t.Fatalf("Status hid the source observation error: %v", err)
 			}
+			if configureErr := core.Configure(context.Background(), host.Config{Nodes: []c.Registration{{ID: "blocked-after-worker-failure", ConnectorID: "source", Binding: json.RawMessage(`{}`)}}}); configureErr == nil || c.AsFault(configureErr).Code != c.AsFault(err).Code {
+				t.Fatalf("worker/lifecycle failure did not fence new mutation ingress: %v", configureErr)
+			}
+			if _, getErr := root.Nodes().Get(c.Ref{Namespace: "nodes", ID: "blocked-after-worker-failure"}); getErr == nil {
+				t.Fatal("failed host accepted a new Node mutation")
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			if err = core.Close(ctx); err == nil || c.AsFault(err).Code != "internal" {
@@ -1064,7 +1209,7 @@ func TestSourceObservationPersistenceFailureReachesStatusAndClose(t *testing.T) 
 }
 
 func TestSourceObservationFailureDuringCloseIsPreserved(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Nodes: 2, Subscriptions: 2, Conversations: 2, Calls: 2, Queue: 8})
+	root := memory.NewRoot(memory.Limits{Nodes: 2, Subscriptions: 2, Conversations: 2, Calls: 2})
 	journalStore := &sourceObservationFailStore{Store: root.Journal(), failed: make(chan struct{})}
 	executionStore := &closeRaceExecutionStore{ExecutionStore: root.Executions(), listed: make(chan struct{})}
 	source := &closeRacePanicSource{started: make(chan struct{}), release: make(chan struct{})}
@@ -1127,7 +1272,8 @@ func TestSourceObservationFailureDuringCloseIsPreserved(t *testing.T) {
 func TestStartupJournalFailuresReturnBeforeCoreStarts(t *testing.T) {
 	for _, mode := range []string{"load", "initial_projection"} {
 		t.Run(mode, func(t *testing.T) {
-			root := memory.NewRoot(memory.Limits{Nodes: 2, Subscriptions: 2, Conversations: 2, Calls: 2, Queue: 8})
+			root := memory.NewRoot(memory.Limits{Nodes: 2, Subscriptions: 2, Conversations: 2, Calls: 2})
+			seedStartupQueuedCall(t, root.Executions(), "startup-queued", "startup-node")
 			failure := c.Err("internal", "simulated startup Journal failure")
 			store := &startupJournalFailStore{Store: root.Journal()}
 			if mode == "load" {
@@ -1136,11 +1282,12 @@ func TestStartupJournalFailuresReturnBeforeCoreStarts(t *testing.T) {
 				store.appendErr = failure
 			}
 			source := &sourceFailureConnector{started: make(chan struct{})}
+			executions := &activationExecutionStore{ExecutionStore: root.Executions()}
 			core, err := host.New(context.Background(), host.Options{
 				Connectors: map[string]c.Connector{"source": source}, Workers: 1,
 				Storage: &host.Storage{
 					Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(),
-					Executions: root.Executions(), Admissions: root.Admissions(), Journal: store,
+					Executions: executions, Admissions: root.Admissions(), Journal: store,
 				},
 			})
 			if core != nil || err == nil || c.AsFault(err).Code != c.AsFault(failure).Code || c.AsFault(err).Message != c.AsFault(failure).Message {
@@ -1152,10 +1299,214 @@ func TestStartupJournalFailuresReturnBeforeCoreStarts(t *testing.T) {
 			default:
 			}
 			pending, countErr := root.Executions().PendingDeliveryCount()
-			if countErr != nil || pending != 0 {
+			view, _, viewErr := root.Executions().ReadScheduling()
+			snapshot, getErr := root.Executions().Get(c.Ref{Namespace: "calls", ID: "startup-queued"})
+			executions.mu.Lock()
+			scans := executions.scans
+			executions.mu.Unlock()
+			if countErr != nil || viewErr != nil || getErr != nil || pending != 0 || len(view.Eligible) != 1 || snapshot.Value.Lifecycle.State != c.Queued || scans != 0 {
 				t.Fatalf("startup failure left workers/deliveries behind: pending=%d err=%v", pending, countErr)
 			}
 		})
+	}
+}
+
+func seedStartupQueuedCall(t *testing.T, store c.ExecutionStore, id, targetID string) {
+	t.Helper()
+	ref := c.Ref{Namespace: "calls", ID: id}
+	local := c.Ref{Namespace: "operators", ID: "local"}
+	origin := c.AdmissionOrigin{Root: local, Actor: local, Kind: c.OriginDirect}
+	value := c.Execution{
+		Call: c.Call{ID: id, Target: c.Ref{Namespace: "nodes", ID: targetID}, Operation: "run", Input: c.Data{}, Deadline: time.Now().Add(time.Minute)},
+		Origin: origin, Lifecycle: c.Lifecycle{State: c.Created, UpdatedAt: time.Now()},
+	}
+	created := lifecycle.Create(ref, value, "received")
+	changes := []c.Change[c.Execution]{created}
+	current := c.Snapshot[c.Execution]{Subject: ref, Revision: created.AfterRevision, Value: created.After}
+	for _, state := range []c.State{c.Validating, c.Queued} {
+		change, err := lifecycle.Move(current, c.Transition{
+			Subject: ref, ExpectedRevision: current.Revision, From: current.Value.Lifecycle.State, To: state,
+			Reason: "startup_seed", Evidence: c.Evidence{CallID: id, Local: true, Confirmed: true},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		changes = append(changes, change)
+		current = c.Snapshot[c.Execution]{Subject: ref, Revision: change.AfterRevision, Value: change.After}
+	}
+	view, _, err := store.ReadScheduling()
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := c.QueueMetadata{Admission: c.RevisionRef{Subject: ref, Revision: current.Revision}, At: changes[len(changes)-1].At}
+	if err := store.CommitAdmission(c.AdmissionCommit{
+		Changes: changes, Queue: []c.QueueMutation{{CallID: id, Present: true, Metadata: &metadata}},
+		Scheduling: &c.SchedulingMutation{ExpectedRevision: view.Revision},
+	}); err != nil {
+		t.Fatalf("seed already-queued startup call: %v", err)
+	}
+}
+
+func TestCancellationDuringRunningJournalAppendPreventsActivation(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Nodes: 2, Subscriptions: 2, Conversations: 2, Calls: 2})
+	seedStartupQueuedCall(t, root.Executions(), "startup-queued", "startup-source")
+	executions := &activationExecutionStore{ExecutionStore: root.Executions()}
+	release := make(chan struct{})
+	journalStore := &runningJournalBarrierStore{Store: root.Journal(), entered: make(chan struct{}), release: release}
+	source := &sourceFailureConnector{started: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := host.New(ctx, host.Options{
+			Connectors: map[string]c.Connector{"source": source}, Workers: 1, Authority: testAuthority(t, "startup-source"),
+			Storage: &host.Storage{
+				Nodes: root.Nodes(), Subscriptions: root.Subscriptions(), Conversations: root.Conversations(),
+				Executions: executions, Admissions: root.Admissions(), Journal: journalStore,
+			},
+			InitialConfig: &host.Config{Nodes: []c.Registration{{ID: "startup-source", ConnectorID: "source", Binding: json.RawMessage(`{}`)}}},
+		})
+		result <- err
+	}()
+	select {
+	case <-journalStore.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("startup did not reach the final Running Journal append")
+	}
+	seeded, getErr := root.Executions().Get(c.Ref{Namespace: "calls", ID: "startup-queued"})
+	view, _, viewErr := root.Executions().ReadScheduling()
+	if getErr != nil || viewErr != nil || seeded.Value.Lifecycle.State != c.Queued || len(view.Eligible) != 1 || len(view.Held) != 0 {
+		t.Fatalf("queued call was not eligible for real activation at the Running barrier: call=%+v view=%+v err=%v/%v", seeded, view, getErr, viewErr)
+	}
+	cancel()
+	close(release)
+	select {
+	case err := <-result:
+		if err == nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("startup ignored cancellation during the Running append: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("startup remained blocked after releasing the Running append")
+	}
+	select {
+	case <-source.started:
+		t.Fatal("cancelled startup activated an event source")
+	default:
+	}
+	executions.mu.Lock()
+	scans := executions.scans
+	executions.mu.Unlock()
+	if scans != 0 {
+		t.Fatalf("cancelled startup started outbox draining %d times", scans)
+	}
+	source.invokeMu.Lock()
+	invokes := source.invokes
+	source.invokeMu.Unlock()
+	if invokes != 0 {
+		t.Fatalf("cancelled startup invoked an already-queued call %d times", invokes)
+	}
+}
+
+func TestInitialConfigPreflightIsolationAndSetupLifetime(t *testing.T) {
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 8})
+	badNodes := &setupNodeStore{Store: root.Nodes()}
+	badConnector := &setupLifetimeConnector{
+		describeContexts: make(chan c.Context, 2), watchContexts: make(chan c.Context, 2),
+		invokeEntered: make(chan string, 2), invokeRelease: make(chan struct{}),
+	}
+	globalPossible, active := uint32(2), uint8(2)
+	invalid := &host.Config{
+		Nodes:      []c.Registration{{ID: "A", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}},
+		Scheduling: &host.SchedulingConfig{GlobalPossible: &globalPossible, Targets: []host.TargetSchedulingConfig{{NodeID: "A", Active: &active}}},
+	}
+	invalidCore, invalidErr := host.New(context.Background(), host.Options{
+		Connectors: map[string]c.Connector{"fake": badConnector}, Workers: 3,
+		Storage:       &host.Storage{Nodes: badNodes, Subscriptions: root.Subscriptions(), Conversations: root.Conversations(), Executions: root.Executions(), Admissions: root.Admissions(), Journal: root.Journal()},
+		InitialConfig: invalid,
+	})
+	if invalidCore != nil || invalidErr == nil || c.AsFault(invalidErr).Code != "invalid_input" || badNodes.listCalls != 0 {
+		t.Fatalf("invalid startup policy was not rejected before storage read: core=%v err=%v listCalls=%d", invalidCore, invalidErr, badNodes.listCalls)
+	}
+	select {
+	case <-badConnector.describeContexts:
+		t.Fatal("invalid startup policy reached connector Describe")
+	default:
+	}
+
+	releaseInvoke := make(chan struct{})
+	connector := &setupLifetimeConnector{
+		describeContexts: make(chan c.Context, 2), watchContexts: make(chan c.Context, 2),
+		invokeEntered: make(chan string, 2), invokeRelease: releaseInvoke,
+	}
+	weight := uint8(2)
+	const originalBinding = `{"number":9007199254740993}`
+	initial := &host.Config{
+		Nodes:      []c.Registration{{ID: "A", ConnectorID: "fake", Binding: json.RawMessage(originalBinding)}},
+		Scheduling: &host.SchedulingConfig{GlobalPossible: &globalPossible, Targets: []host.TargetSchedulingConfig{{NodeID: "A", Weight: &weight}}},
+	}
+	core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": connector}, Workers: 3, Authority: testAuthority(t, "A"), InitialConfig: initial})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		select {
+		case <-releaseInvoke:
+		default:
+			close(releaseInvoke)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if closeErr := core.Close(ctx); closeErr != nil {
+			t.Errorf("Close: %v", closeErr)
+		}
+	})
+	var describeCtx, watchCtx c.Context
+	select {
+	case describeCtx = <-connector.describeContexts:
+	case <-time.After(time.Second):
+		t.Fatal("initial topology did not Describe its Node")
+	}
+	select {
+	case watchCtx = <-connector.watchContexts:
+	case <-time.After(time.Second):
+		t.Fatal("initial Watch was not activated")
+	}
+	if describeCtx.Err() == nil || watchCtx.Err() != nil {
+		t.Fatalf("setup and runtime lifetimes were not separated: setup=%v watch=%v", describeCtx.Err(), watchCtx.Err())
+	}
+	initial.Nodes[0].Binding[len(initial.Nodes[0].Binding)-2] = '4'
+	storedNode, err := core.Catalog.Get("A")
+	if err != nil || string(storedNode.Binding) != originalBinding {
+		t.Fatalf("startup configuration was not copied before use: binding=%s err=%v", storedNode.Binding, err)
+	}
+	if err := core.Configure(context.Background(), host.Config{Scheduling: &host.SchedulingConfig{GlobalPossible: &globalPossible}}); err == nil || c.AsFault(err).Code != "invalid_input" {
+		t.Fatalf("runtime Configure changed the startup scheduling policy: %v", err)
+	}
+	local := c.Ref{Namespace: "operators", ID: "local"}
+	if _, err := core.Calls.SubmitBatch(c.AdmissionOrigin{Root: local, Actor: local, Kind: c.OriginDirect}, []c.Call{
+		{ID: "setup-active", Target: node("A"), Operation: "run", Input: c.Data{"text": "active"}},
+		{ID: "setup-waiting", Target: node("A"), Operation: "run", Input: c.Data{"text": "waiting"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-connector.invokeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("initially configured call did not invoke")
+	}
+	status, err := core.Status()
+	if err != nil || len(status.Scheduling.Targets) != 1 {
+		t.Fatalf("initial scheduling status: %+v err=%v", status.Scheduling, err)
+	}
+	target := status.Scheduling.Targets[0]
+	if target.Ref != node("A") || target.Waiting != 1 || target.Possible != 1 || target.Physical != 1 {
+		t.Fatalf("omitted per-target limits did not clamp to the global possible limit: %+v", target)
+	}
+	close(releaseInvoke)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := core.Close(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1240,26 +1591,63 @@ func TestAbortExpectedInstanceMismatchRejectsBeforeConnector(t *testing.T) {
 
 func TestParentCancellationClosesAndManualCloseReturnsCachedOutcome(t *testing.T) {
 	parent, cancelParent := context.WithCancel(context.Background())
-	core, err := host.New(parent, host.Options{Workers: 1})
+	release := make(chan struct{})
+	connector := &drainConnector{entered: make(chan struct{}), release: release}
+	core, err := host.New(parent, host.Options{Connectors: map[string]c.Connector{"fake": connector}, Workers: 1, Authority: testAuthority(t, "A")})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		ctx, stop := context.WithTimeout(context.Background(), time.Second)
+		defer stop()
+		_ = core.Close(ctx)
+	})
+	if _, err := core.Catalog.Register(context.Background(), c.Registration{ID: "A", ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	local := c.Ref{Namespace: "operators", ID: "local"}
+	if _, err := core.Calls.SubmitBatch(c.AdmissionOrigin{Root: local, Actor: local, Kind: c.OriginDirect}, []c.Call{{ID: "parent-grace-call", Target: node("A"), Operation: "run", Input: c.Data{"text": "grace"}}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-connector.entered:
+	case <-time.After(time.Second):
+		t.Fatal("accepted call did not enter connector")
+	}
 	cancelParent()
+	// Parent cancellation starts the existing close grace; it does not cancel
+	// a worker that already owns an accepted remote invocation.
+	eventually(t, func() bool {
+		status, statusErr := core.Status()
+		return statusErr == nil && status.Lifecycle.Value.State == c.Cancelling
+	})
+	close(release)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := core.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
 	status := readStatus(t, core)
-	if !status.LocalStopped || status.Lifecycle.Value.State != c.Succeeded {
-		t.Fatalf("parent cancellation did not finish core: %+v", status)
+	callStatus, callErr := core.Calls.Get("parent-grace-call")
+	if !status.LocalStopped || status.Lifecycle.Value.State != c.Succeeded || callErr != nil || callStatus.Value.Lifecycle.State != c.Succeeded || status.PendingDeliveryCount != 0 || status.PendingObservationCount != 0 {
+		t.Fatalf("parent cancellation did not preserve accepted-call grace and delivery ACK: status=%+v call=%+v err=%v", status, callStatus, callErr)
 	}
 }
 
 func TestDrainCompletesAcceptedConversationWithoutNewFanout(t *testing.T) {
 	release := make(chan struct{})
 	drain := &drainConnector{entered: make(chan struct{}), release: release}
-	core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": drain}, Workers: 1, Authority: testAuthority(t, "A", "B")})
+	one := uint32(1)
+	initial := &host.Config{Nodes: []c.Registration{
+		{ID: "A", ConnectorID: "fake", Binding: json.RawMessage(`{}`)},
+		{ID: "B", ConnectorID: "fake", Binding: json.RawMessage(`{}`)},
+	}, Scheduling: &host.SchedulingConfig{GlobalPossible: &one}}
+	core, err := host.New(context.Background(), host.Options{Connectors: map[string]c.Connector{"fake": drain}, Workers: 1, Authority: testAuthority(t, "A", "B"), InitialConfig: initial})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1275,11 +1663,6 @@ func TestDrainCompletesAcceptedConversationWithoutNewFanout(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	for _, id := range []string{"A", "B"} {
-		if _, err := core.Catalog.Register(context.Background(), c.Registration{ID: id, ConnectorID: "fake", Binding: json.RawMessage(`{}`)}); err != nil {
-			t.Fatal(err)
-		}
-	}
 	execute[c.Snapshot[c.Subscription]](t, core, "subscriptions.create", c.Subscription{ID: "drain-sub", Source: node("A"), Event: "complete", Target: node("B"), Operation: "run", Input: c.InputTemplate{Values: c.Data{}, Pointers: map[string]string{"text": "/summary"}}})
 	author := c.Ref{Namespace: "users", ID: "author"}
 	execute[c.Snapshot[c.Conversation]](t, core, "conversations.create", c.Conversation{ID: "drain-chat", Title: "Drain", Participants: []c.Participant{{Ref: author}, {Ref: node("A"), Receiver: &c.Receiver{Target: node("A"), Operation: "run", Input: c.InputTemplate{Values: c.Data{}, Pointers: map[string]string{"text": "/text"}}}}}})
@@ -1288,6 +1671,38 @@ func TestDrainCompletesAcceptedConversationWithoutNewFanout(t *testing.T) {
 	case <-drain.entered:
 	case <-time.After(time.Second):
 		t.Fatal("accepted call did not enter connector")
+	}
+	activeStatus, err := core.Status()
+	if err != nil || len(activeStatus.Scheduling.Targets) != 1 {
+		t.Fatalf("scheduling activity union omitted a held/physical-only target: status=%+v err=%v", activeStatus.Scheduling, err)
+	}
+	activeTarget := activeStatus.Scheduling.Targets[0]
+	if activeTarget.Ref != node("A") || activeTarget.Waiting != 0 || activeTarget.Possible != 1 || activeTarget.Physical != 1 || activeTarget.BlockedReasons == nil || len(activeTarget.BlockedReasons) != 0 {
+		t.Fatalf("active-only target projection is incorrect: %+v", activeTarget)
+	}
+	execute[c.Snapshot[c.Execution]](t, core, "calls.submit", c.Call{ID: "status-waiting-call", Target: node("A"), Operation: "run", Input: c.Data{"text": "queued"}})
+	backlogged, err := core.Status()
+	if err != nil || !backlogged.Ready || backlogged.PendingDeliveryCount == 0 {
+		t.Fatalf("ready should reflect recovered/open health while delivery backlog is pending: status=%+v err=%v", backlogged, err)
+	}
+	if len(backlogged.Scheduling.Targets) != 1 {
+		t.Fatalf("scheduling projection omitted active target: %+v", backlogged.Scheduling)
+	}
+	target := backlogged.Scheduling.Targets[0]
+	if target.Ref != node("A") || target.Waiting != 1 || target.Possible != 1 || target.Physical != 1 || len(target.BlockedReasons) != 4 || target.BlockedReasons[0] != "global_possible_limit" || target.BlockedReasons[1] != "target_possible_limit" || target.BlockedReasons[2] != "global_worker_limit" || target.BlockedReasons[3] != "target_active_limit" {
+		t.Fatalf("scheduling projection did not report current scoped limits: %+v", target)
+	}
+	if backlogged.Scheduling.Targets == nil || target.BlockedReasons == nil || backlogged.Scheduling.Waiting != 1 || backlogged.Scheduling.Possible != 1 || backlogged.Scheduling.Physical != 1 {
+		t.Fatalf("scheduling projection has invalid aggregate counts: %+v", backlogged.Scheduling)
+	}
+	expired := c.Call{ID: "status-expired-call", Target: node("A"), Operation: "run", Input: c.Data{"text": "expired"}, Deadline: c.Now().Add(-time.Second)}
+	execute[c.Snapshot[c.Execution]](t, core, "calls.submit", expired)
+	withExpired, err := core.Status()
+	if err != nil || len(withExpired.Scheduling.Targets) != 1 {
+		t.Fatalf("scheduling status with an expired alternative failed: %+v err=%v", withExpired.Scheduling, err)
+	}
+	if got := withExpired.Scheduling.Targets[0]; got.Waiting != 2 || len(got.BlockedReasons) != 1 || got.BlockedReasons[0] != "global_worker_limit" {
+		t.Fatalf("expired alternative should report only its global worker blocker: %+v", got)
 	}
 	core.BeginDrain()
 	close(release)
@@ -1300,7 +1715,7 @@ func TestDrainCompletesAcceptedConversationWithoutNewFanout(t *testing.T) {
 	if err != nil || len(view.Messages) != 2 || view.Messages[1].Result == nil || view.Messages[1].Result.State != c.Succeeded {
 		t.Fatalf("accepted reply was not retained: %+v %v", view, err)
 	}
-	if len(message.CallIDs) != 1 || len(readCalls(t, core)) != 1 {
+	if len(message.CallIDs) != 1 || len(readCalls(t, core)) != 3 {
 		t.Fatalf("drain created a fanout call: message=%+v calls=%d", message, len(readCalls(t, core)))
 	}
 }
@@ -1383,7 +1798,7 @@ func TestCloseDeadlineWithUncooperativeConnectorIsBounded(t *testing.T) {
 				}
 			})
 			drain := &drainConnector{entered: make(chan struct{}), release: release}
-			root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 4, Calls: 8, Queue: 8})
+			root := memory.NewRoot(memory.Limits{Nodes: 8, Subscriptions: 8, Conversations: 4, Calls: 8})
 			store := &faultExecutionStore{ExecutionStore: root.Executions(), listFailures: make(chan struct{}, 1)}
 			core, err := host.New(context.Background(), host.Options{
 				Connectors: map[string]c.Connector{"fake": drain}, Workers: 1, Authority: testAuthority(t, "A"),
@@ -1419,7 +1834,7 @@ func TestCloseDeadlineWithUncooperativeConnectorIsBounded(t *testing.T) {
 					t.Fatal("Close did not observe the injected list failure")
 				}
 				closeErr = <-closeResult
-				if closeErr != readErr {
+				if !errors.Is(closeErr, readErr) {
 					t.Fatalf("Close error=%v, want first list error %v despite the later deadline", closeErr, readErr)
 				}
 			} else {
@@ -1539,7 +1954,7 @@ func TestCloseIgnoresBestEffortUnsupportedAbortWhenInvokeCompletes(t *testing.T)
 }
 
 func TestClosePreservesBestEffortAbortStorageReadFailure(t *testing.T) {
-	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 8, Queue: 8})
+	root := memory.NewRoot(memory.Limits{Nodes: 4, Subscriptions: 4, Conversations: 4, Calls: 8})
 	store := &faultExecutionStore{ExecutionStore: root.Executions(), getFailures: make(chan struct{}, 1)}
 	release := make(chan struct{})
 	var releaseOnce sync.Once
