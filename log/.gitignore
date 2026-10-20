@@ -1,0 +1,8 @@
+.roster/
+.env*
+*.db*
+*.exe
+*.test
+*.out
+*.log
+node_modules/
